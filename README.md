@@ -1,0 +1,260 @@
+# Backup Verifier
+
+Verificatore di backup **read-only** per Windows in **C++17 + SDL3** (GUI attiva dalla Fase 2).
+Confronta due alberi di file (es. disco USB o cartella NAS via SMB) per assicurarsi che
+contengano gli stessi dati, **senza mai** copiare, modificare o cancellare nulla.
+
+Stato attuale: **Fasi 1, 2, 3 e 4 completate** (enumerazione Win32, indice, confronto
+presenza/dimensione, CLI, GUI SDL3 con progress e thread pool, SHA-256 per il contenuto,
+**scanner MFT NTFS** con benchmark MFT vs Win32). La Fase 5 è delineata più sotto.
+
+Priorità dichiarata: **correttezza > sicurezza > affidabilità > performance > estetica**.
+
+Nota di encoding: molti file di testo in questo repository erano stati salvati con una
+codifica corrotta; questo README è riscritto in UTF-8 pulito.
+
+---
+
+## 1. Come funziona la scansione MFT
+
+La scansione NTFS via **Master File Table** è implementata (Fase 4) in
+`src/Filesystem/MftEnumerator.cpp`. Il flusso è:
+
+```text
+Volume NTFS
+   |--> MFT (lettura diretta dei $MFT file record)
+   |--> ricostruzione dei percorsi (da $FILE_NAME parent reference)
+   v
+FileIndex
+```
+
+Approccio usato:
+
+- un volume NTFS ha la MFT **frammentata**: `MftStartLcn` identifica solo il primo
+  extent, quindi non si legge mai la MFT come se fosse contigua da lì (restituirebbe
+  record fisici errati). Si legge invece il record 0 (`$MFT`) e dal suo attributo
+  `$DATA` non-residente si decodificano i **data-run** (`ParseDataRuns`); ogni file
+  record viene poi letto fisicamente percorrendo i run in ordine di record.
+- directory/reparse point provengono dai **flag di header del record** (`rec+22`,
+  bit 1 = directory, bit 2 = reparse) perché il campo fileAttributes di `$FILE_NAME`
+  non è sempre impostato.
+- la dimensione del file proviene dall'attributo **`$DATA`** (residente: `contentLen`
+  in header; non-residente: `realSize`) perché il `realSize` di `$FILE_NAME` può essere 0
+  per file materializzati con `SetEndOfFile`.
+- i record non più **"in use"** (flag header bit 0x0001 non impostato) vengono ignorati
+  per escludere record stantii (deleted).
+
+La MFT è **un'ottimizzazione, non una dipendenza**: il programma continua a funzionare
+se il volume non è NTFS, se l'accesso alla MFT non è disponibile, se mancano i privilegi,
+se il volume è remoto. In tutti questi casi si usa il fallback Win32 (punto 4).
+
+## 2. Filesystem supportati
+
+| Origine                             | Scanner                        |
+|-------------------------------------|--------------------------------|
+| Volume locale NTFS                  | MFT (Fase 4) / Win32 fallback  |
+| Volume locale non-NTFS (FAT/exFAT...) | Win32 enumeration            |
+| SMB / NAS (UNC, `\\nas\share`)      | Win32 enumeration (via SMB)    |
+
+Il rilevamento del filesystem avviene automaticamente (`GetVolumeInformationW`);
+il backend è selezionabile anche a mano (`--enum auto|win32|mft` e toggle nella GUI).
+Se l'accesso diretto alla MFT fallisce si passa al fallback sicuro.
+
+## 3. Quando viene usata la MFT
+
+Per impostazione predefinita (`backend=Auto`): origine e destinazione **locali**, volume
+**NTFS**, accesso alla MFT **disponibile** (serve un processo elevato per la lettura raw).
+In ogni altro caso è fallback Win32. Nessun hack non documentato; nessun rischio di
+corrompere il filesystem (tutte le letture sono `GENERIC_READ`).
+
+## 4. Quando viene usato il fallback Win32
+
+`Win32Enumerator` (src/Filesystem/Win32Enumerator.cpp) fa una visita iterativa con
+`FindFirstFileW`/`FindNextFileW`:
+
+- path lunghi via prefisso `\\?\` (aware UNC: `\\?\UNC\...`);
+- file nascosti e di sistema inclusi;
+- **reparse point** di directory (junction/symlink) registrati ma **non seguiti**,
+  il che garantisce l'assenza di loop; i symlink di file sono riportati come entry;
+- errori per singola directory segnalati e la scansione continua.
+
+## 5. Come funziona il confronto
+
+L'identificazione è per **percorso relativo** alla root:
+
+```text
+D:\Backup\Foto\2025\foto001.jpg     ->  Foto\2025\foto001.jpg
+\\NAS\Backup\Foto\2025\foto001.jpg  ->  Foto\2025\foto001.jpg
+```
+
+Pipeline (`ScanController`):
+
+```text
+Enumerazione sorgente -> FileIndex (in memoria)
+Enumerazione destinazione (streaming, non indicizzata) -> FileComparator
+```
+
+- la sorgente viene indicizzata una volta;
+- la destinazione viene scorsa **senza** costruire un secondo indice (limite memoria);
+- ogni entry di destinazione è confrontata per path relativo e cancellata dall'indice
+  man mano (matched); ciò che resta è esattamente l'insieme dei "mancanti".
+
+Modalità:
+- **Presenza**: solo esistenza del path.
+- **Dimensione**: presenza + dimensione (non si legge mai il contenuto).
+- **Contenuto** (Fase 3): ogni file con stesso path **e** stessa dimensione viene
+  hashato (SHA-256) e confrontato.
+
+Risultati classificati: `Identical`, `Missing` (solo sorgente), `Extra` (solo destinazione),
+`SizeMismatch`, `ContentMismatch`, `ReadError`, `AccessDenied`.
+
+Ottimizzazioni memoria/velocità:
+- la destinazione è in streaming (mai un secondo indice);
+- gli entry **identici** sono solo contati; il vettore `problems` contiene solo le voci
+  non identiche (o errori);
+- le **directory** non vuote mancanti/extra non vengono riportate singolarmente
+  (i figli bastano); solo le directory vuote sono segnalate;
+- `unordered_map` per l'indice; chiave = path "folded" (case-insensitive), valore =
+  `FileEntry` con il path originale (per display/export).
+
+### Politica case
+
+Windows/SMB sono case-insensitive. Di default il confronto è **case-insensitive**:
+la chiave è il path convertito in MAIUSCOLO con `LCMapStringEx` (locale invariante).
+Con `--case-sensitive` la chiave è il path esatto.
+
+## 6. Come funziona l'hashing
+
+Fase 3: streaming a blocchi di 1–8 MiB, SHA-256 via Windows CNG (`BCrypt`); un file non
+viene hashato se già riconoscibile come diverso dalla dimensione. Il pool dei worker di
+hash è configurabile (`Auto`, 1, 2, 4, 8, 16) e la scelta automatica dipende dalla classe
+I/O delle due radici (locale-locale, locale-rete, rete-rete).
+
+## 7. Come viene gestita la concorrenza
+
+Thread pool configurabile (vedi `Threading/ThreadPool.{h,cpp}` e `IoClass.h`).
+Nessun thread per file: i worker processano i file da una coda condivisa durante la
+fase di hashing.
+
+## 8. Limiti noti
+
+- Directory reparse (junction/symlink) non seguite e riportate come singola voce;
+  i contenuti a cui puntano non vengono esplorati.
+- Un errore su una directory (es. accesso negato) impedisce di vedere i suoi figli:
+  la directory è segnalata con `ReadError`/`AccessDenied` e i figli non sono contati.
+- La lettura raw della MFT richiede un processo **elevato** (amministratore /
+  `SeBackup`); senza di esso il backend MFT segnala "non disponibile" e si usa Win32.
+- Nessuna cache persistente / snapshot / export CSV/JSON (Fase 5).
+- Test UNC eseguibili solo in presenza di una vera share di rete.
+
+---
+
+## Compilazione
+
+### Con MSYS2 / MinGW-w64 (usato in questo repository)
+
+```powershell
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release `
+    -DCMAKE_CXX_COMPILER=C:/msys64/mingw64/bin/g++.exe
+cmake --build build
+ctest --test-dir build --output-on-failure
+```
+
+Eseguibili prodotti in `build/`:
+- `src/bv_cli.exe` — CLI di verifica
+- `tests/bv_tests.exe` — suite di test
+- `tests/bv_testgen.exe` — generatore di alberi di test
+- `tests/bv_mftbench.exe` — benchmark/correttezza MFT vs Win32
+- `tests/bv_mftprobe.exe` — diagnostica MFT/record NTFS
+
+#### GUI SDL3 (Fase 2)
+
+```powershell
+pacman -S mingw-w64-x86_64-sdl3 mingw-w64-x86_64-sdl3-ttf
+cmake -S . -B build_gui -G Ninja -DCMAKE_BUILD_TYPE=Release `
+    -DCMAKE_CXX_COMPILER=C:/msys64/mingw64/bin/g++.exe `
+    -DCMAKE_PREFIX_PATH=C:/msys64/mingw64 -DBUILD_GUI=ON -DBUILD_TESTS=ON
+cmake --build build_gui
+```
+
+Eseguibile GUI: `build_gui/src/bv_gui.exe`. All'avvio la GUI deve trovare le DLL
+SDL: aggiungere `C:\msys64\mingw64\bin` al PATH oppure copiarle accanto all'`.exe`.
+
+La GUI fa girare la scansione su un thread separato, mostra l'avanzamento, barra di
+progressione, pulsanti AVVIA / INTERROMPI, la lista dei problemi filtrabile (Tutti /
+Identici / Mancanti / Extra / Dimensione / Contenuto / Errori) con scroll, il toggle
+case-sensitive e la scelta del **back-end di enumerazione** (Auto / Win32 / MFT).
+
+### Con Visual Studio / MSVC e CMake (Windows 11)
+
+```bat
+cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+cmake --build build --config Release
+ctest --test-dir build -C Release --output-on-failure
+```
+
+Oppure aprendo la cartella del progetto direttamente in Visual Studio 2022 (CMSIS
+rileva `CMakeLists.txt`). Il codice usa solo C++17 standard + API Win32.
+
+---
+
+## Uso della CLI
+
+```text
+bv_cli --source <percorso> --dest <percorso> [--mode presence|size]
+       [--case-sensitive] [--enum auto|win32|mft] [--list-problems [--limit N]] [--help]
+```
+
+Esempio:
+
+```powershell
+bv_cli --source D:\Backup --dest \\NAS\Backup --mode content --enum auto --list-problems
+```
+
+## Generatore di alberi di test
+
+```text
+bv_testgen <root> [--fixture] [--differing] [--stress N] [--large MB]
+```
+
+- `--fixture`: un albero identico a se stesso;
+- `--differing`: crea `src/` e `dst/` con differenze note;
+- `--stress N`: N file piccoli distribuiti su 100 directory;
+- `--large MB`: file sparse da MB MiB in `src/` e `dst/`.
+
+## Struttura
+
+```text
+src/
+  main_cli.cpp            CLI (Fase 1)
+  main_gui.cpp            entry GUI SDL3 (Fase 2)
+  ScanController.h/.cpp   orchestrazione scansione (sceglie/fallback del backend)
+  UI/AppUI.{h,cpp}        GUI SDL3 (render, input, thread di scan)
+  UI/Utf.{h,cpp}          conversione UTF-8/16 per SDL
+  Threading/ThreadPool.{h,cpp}, IoClass.h
+  Filesystem/
+    FileEntry.h           record di una entry
+    FileIndex.h/.cpp      indice in memoria (policy case)
+    FileEnumerator.h      interfaccia scanner
+    Win32Enumerator.cpp   enumerazione FindFirstFile/Win32
+    MftEnumerator.cpp     enumerazione raw NTFS MFT (Fase 4)
+    PathUtil.h/.cpp       normalizzazione path, prefisso \\?\, case folding
+  Comparison/
+    ScanMode.h            Presence / Size / Content
+    ComparisonResult.h    Status, FileResult, Stats, ResultSet
+    FileComparator.h/.cpp confronto
+  Hashing/Sha256.cpp      SHA-256 CNG/BCrypt (Fase 3)
+tests/
+  TestHarness.h, TestTree.h/.cpp, test_main.cpp
+tools/
+  testgen.cpp, mftbench.cpp, mftprobe.cpp
+```
+
+## Roadmap
+
+- **Fase 2**: GUI SDL3, progress, risultati filtrabili, thread pool, Interrompi. Completata.
+- **Fase 3**: SHA-256 (CNG), verifica contenuti, statistiche velocità MB/s. Completata.
+- **Fase 4**: scanner MFT NTFS + benchmark MFT vs Win32. Completata.
+- **Fase 5**: cache, snapshot indice, export CSV/JSON, gestione avanzata errori.
+
+La struttura dettagliata è anche in `HANDOFF.md`.

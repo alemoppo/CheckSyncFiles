@@ -1,0 +1,26 @@
+# Build output
+/build/
+/build_gui/
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+*.ninja
+.ninja_deps
+.ninja_log
+
+# Compiler artifacts
+*.o
+*.obj
+*.a
+*.lib
+*.exe
+
+# Editor / OS
+.vs/
+.vscode/
+*.user
+Thumbs.db
+Desktop.ini
