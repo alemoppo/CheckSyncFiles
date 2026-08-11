@@ -19,6 +19,7 @@
 
 #include "UI/Utf.h"
 #include "Threading/ThreadPool.h"
+#include "Export/CsvExporter.h"
 
 namespace bv::ui {
 
@@ -46,7 +47,7 @@ struct Layout {
     SDL_FRect sourceField, destField;
     SDL_FRect sourceBrowse, destBrowse;
 
-    SDL_FRect startBtn, stopBtn;
+    SDL_FRect startBtn, stopBtn, snapBtn, exportBtn;
 };
 
 Layout ComputeLayout(int W, int H) {
@@ -83,6 +84,8 @@ Layout ComputeLayout(int W, int H) {
 
     L.startBtn = {static_cast<float>(kMargin), static_cast<float>(L.y5), 120.0f, 30.0f};
     L.stopBtn = {static_cast<float>(kMargin + 130), static_cast<float>(L.y5), 120.0f, 30.0f};
+    L.snapBtn = {static_cast<float>(kMargin + 260), static_cast<float>(L.y5), 120.0f, 30.0f};
+    L.exportBtn = {static_cast<float>(kMargin + 390), static_cast<float>(L.y5), 120.0f, 30.0f};
     return L;
 }
 
@@ -297,6 +300,7 @@ const wchar_t* StatusName(bv::Status st) {
         case bv::Status::ContentMismatch: return L"CONTENUTO_DIVERSO";
         case bv::Status::ReadError: return L"ERRORE_LETTURA";
         case bv::Status::AccessDenied: return L"ACCESSO_NEGATO";
+        case bv::Status::ChangedDuringScan: return L"MODIFICATO_DURANTE_SCAN";
     }
     return L"?";
 }
@@ -308,7 +312,8 @@ RGBA StatusColor(bv::Status st) {
         case bv::Status::ContentMismatch:
         case bv::Status::AccessDenied: return kBad;
         case bv::Status::Extra:
-        case bv::Status::SizeMismatch: return kWarn;
+        case bv::Status::SizeMismatch:
+        case bv::Status::ChangedDuringScan: return kWarn;
         default: return kTextLo;
     }
 }
@@ -327,6 +332,35 @@ bool BrowseFolder(std::wstring& out) {
         DWORD opts = 0;
         pfd->GetOptions(&opts);
         pfd->SetOptions(opts | FOS_PICKFOLDERS | FOS_PATHMUSTEXIST | FOS_FORCEFILESYSTEM);
+        if (SUCCEEDED(pfd->Show(nullptr))) {
+            IShellItem* psi = nullptr;
+            if (SUCCEEDED(pfd->GetResult(&psi))) {
+                PWSTR path = nullptr;
+                if (SUCCEEDED(psi->GetDisplayName(SIGDN_FILESYSPATH, &path))) {
+                    out = path;
+                    CoTaskMemFree(path);
+                    ok = true;
+                }
+                psi->Release();
+            }
+        }
+        pfd->Release();
+    }
+    CoUninitialize();
+    return ok;
+}
+
+// Modal save-file dialog using the modern Windows IFileSaveDialog (COM).
+bool BrowseSaveFile(std::wstring& out, const wchar_t* defName) {
+    HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    if (FAILED(hr) && hr != RPC_E_CHANGED_MODE) return false;
+
+    bool ok = false;
+    IFileSaveDialog* pfd = nullptr;
+    hr = CoCreateInstance(CLSID_FileSaveDialog, nullptr, CLSCTX_INPROC_SERVER,
+                          IID_IFileSaveDialog, reinterpret_cast<void**>(&pfd));
+    if (SUCCEEDED(hr)) {
+        pfd->SetFileName(defName);
         if (SUCCEEDED(pfd->Show(nullptr))) {
             IShellItem* psi = nullptr;
             if (SUCCEEDED(pfd->GetResult(&psi))) {
@@ -571,6 +605,14 @@ void AppUI::OnMouseDown(int mx, int my) {
         stopScan();
         dirty_ = true;
     }
+    if (hit(mx, my, L.snapBtn) && !running) {
+        startSnapshotScan();
+        dirty_ = true;
+    }
+    if (hit(mx, my, L.exportBtn) && !running) {
+        onExportCsv();
+        dirty_ = true;
+    }
 
     // Filters.
     const int fr = 92;
@@ -647,6 +689,10 @@ void AppUI::startScan() {
     progress_ = {};
     running_ = true;
     scroll_ = 0;
+    statusNote_.clear();
+    lastSnapshotWritten_ = false;
+    lastUsedSnapshot_ = false;
+    lastDegraded_ = false;
 
     ScanOptions options;
     options.source = source_;
@@ -661,6 +707,74 @@ void AppUI::startScan() {
         progress_ = p;
     };
     worker_ = std::thread(&AppUI::workerThread, this, std::move(options));
+}
+
+void AppUI::startSnapshotScan() {
+    std::lock_guard<std::mutex> lk(mtx_);
+    if (running_) return;
+    if (source_.empty()) {
+        statusNote_ = L"Specificare la sorgente prima di creare uno snapshot.";
+        dirty_ = true;
+        return;
+    }
+
+    std::wstring file;
+    if (!BrowseSaveFile(file, L"backup_index.bin")) {
+        return; // user cancelled the dialog
+    }
+
+    // The previous run's worker has finished; join before reusing worker_.
+    if (worker_.joinable()) {
+        worker_.join();
+    }
+
+    cancel_.store(false);
+    resultsReady_ = false;
+    results_ = {};
+    progress_ = {};
+    running_ = true;
+    scroll_ = 0;
+    lastSnapshotWritten_ = false;
+    lastUsedSnapshot_ = false;
+    lastDegraded_ = false;
+    lastSnapshotPath_ = file;
+
+    ScanOptions options;
+    options.source = source_;
+    options.destination.clear();
+    options.mode = mode_;
+    options.caseSensitive = caseSensitive_;
+    options.hashThreads = threadToCount();
+    options.backend = backend_;
+    options.snapshotOut = file;
+    options.cancel = &cancel_;
+    options.onProgress = [this](const ScanProgress& p) {
+        std::lock_guard<std::mutex> lk(mtx_);
+        progress_ = p;
+    };
+    worker_ = std::thread(&AppUI::workerThread, this, std::move(options));
+}
+
+void AppUI::onExportCsv() {
+    std::lock_guard<std::mutex> lk(mtx_);
+    if (running_ || !resultsReady_) {
+        statusNote_ = L"Eseguire prima una scansione.";
+        dirty_ = true;
+        return;
+    }
+
+    std::wstring file;
+    if (!BrowseSaveFile(file, L"risultati.csv")) {
+        return; // user cancelled the dialog
+    }
+
+    std::wstring err;
+    if (exporting::WriteCsv(file, results_, err)) {
+        statusNote_ = L"Esportazione salvata: " + file;
+    } else {
+        statusNote_ = L"Esportazione fallita: " + err;
+    }
+    dirty_ = true;
 }
 
 void AppUI::stopScan() {
@@ -686,6 +800,19 @@ void AppUI::workerThread(ScanOptions options) {
     progress_.phase = ScanPhase::Done;
     progress_.files = results_.stats.sourceFiles;
     progress_.dirs = results_.stats.sourceDirs;
+    lastSnapshotWritten_ = report.snapshotWritten;
+    lastUsedSnapshot_ = report.usedSnapshot;
+    lastDegraded_ = report.contentDegradedToSize;
+    if (lastSnapshotWritten_ && !lastSnapshotPath_.empty()) {
+        statusNote_ = L"Snapshot salvato: " + lastSnapshotPath_;
+    } else if (lastDegraded_) {
+        statusNote_ = L"Snapshot senza contenuti: confronto degradato alla dimensione.";
+    } else if (lastUsedSnapshot_) {
+        statusNote_ = L"Sorgente caricata da snapshot (" +
+                      std::to_wstring(results_.stats.sourceFiles) + L" voci).";
+    } else {
+        statusNote_.clear();
+    }
     dirty_ = true;
 }
 
@@ -703,7 +830,8 @@ std::vector<const bv::FileResult*> AppUI::FilteredRows() const {
                 if (p.status == Status::ContentMismatch) rows.push_back(&p);
                 break;
             case kFilterErrors:
-                if (p.status == Status::ReadError || p.status == Status::AccessDenied)
+                if (p.status == Status::ReadError || p.status == Status::AccessDenied ||
+                    p.status == Status::ChangedDuringScan)
                     rows.push_back(&p);
                 break;
             case kFilterIdentical: break; // count only
@@ -722,11 +850,13 @@ void AppUI::render() {
     bool running = false;
     ScanProgress progress;
     unsigned int threadCountUsed = 0;
+    std::wstring statusNote;
     {
         std::lock_guard<std::mutex> lk(mtx_);
         running = running_;
         progress = progress_;
         threadCountUsed = threadCountUsed_;
+        statusNote = statusNote_;
     }
 
     // Title
@@ -816,6 +946,27 @@ void AppUI::render() {
                      static_cast<int>(L.stopBtn.x), static_cast<int>(L.stopBtn.y),
                      static_cast<int>(L.stopBtn.w), static_cast<int>(L.stopBtn.h), kTextHi);
 
+    // ---- Buttons SNAPSHOT / ESPORTA ----
+    const bool overSnap = !running && hit(static_cast<int>(mx), static_cast<int>(my), L.snapBtn);
+    const bool overExport =
+        !running && hit(static_cast<int>(mx), static_cast<int>(my), L.exportBtn);
+    FillRect(renderer_, static_cast<int>(L.snapBtn.x), static_cast<int>(L.snapBtn.y),
+             static_cast<int>(L.snapBtn.w), static_cast<int>(L.snapBtn.h),
+             overSnap ? kAccentHover : kPanel);
+    DrawRect(renderer_, static_cast<int>(L.snapBtn.x), static_cast<int>(L.snapBtn.y),
+             static_cast<int>(L.snapBtn.w), static_cast<int>(L.snapBtn.h), kBorder);
+    DrawTextCenterIn(renderer_, fontBold_, "SNAPSHOT",
+                     static_cast<int>(L.snapBtn.x), static_cast<int>(L.snapBtn.y),
+                     static_cast<int>(L.snapBtn.w), static_cast<int>(L.snapBtn.h), kTextHi);
+    FillRect(renderer_, static_cast<int>(L.exportBtn.x), static_cast<int>(L.exportBtn.y),
+             static_cast<int>(L.exportBtn.w), static_cast<int>(L.exportBtn.h),
+             overExport ? kAccentHover : kPanel);
+    DrawRect(renderer_, static_cast<int>(L.exportBtn.x), static_cast<int>(L.exportBtn.y),
+             static_cast<int>(L.exportBtn.w), static_cast<int>(L.exportBtn.h), kBorder);
+    DrawTextCenterIn(renderer_, fontBold_, "ESPORTA CSV",
+                     static_cast<int>(L.exportBtn.x), static_cast<int>(L.exportBtn.y),
+                     static_cast<int>(L.exportBtn.w), static_cast<int>(L.exportBtn.h), kTextHi);
+
     // ---- Status ----
     std::wstring status = L"Pronto. Specificare sorgente e destinazione.";
     if (running) {
@@ -845,6 +996,10 @@ void AppUI::render() {
     } else if (resultsReady_) {
         status = L"Scansione completata.  Velocita: " +
                  FormatRateW(results_.stats.bytesSource, lastSecondsTotal_);
+    }
+    if (!statusNote.empty()) {
+        status += (status == L"Pronto. Specificare sorgente e destinazione." ? L"" : L"   —  ") +
+                  statusNote;
     }
     DrawText(renderer_, fontBody_, ToUtf8(status), kMargin, L.y6, kTextHi);
 
@@ -927,7 +1082,7 @@ void AppUI::DrawSummary(int summaryY) {
         "   Mancanti " + Group(st.missingFiles) +
         "   Extra " + Group(st.extraFiles) +
         "   Dim.diversa " + Group(st.sizeMismatch) +
-        "   Errori " + Group(st.readErrors + st.accessDenied);
+        "   Errori " + Group(st.readErrors + st.accessDenied + st.changedDuringScan);
     DrawText(renderer_, fontBody_, s, kMargin, summaryY, kTextLo);
 }
 

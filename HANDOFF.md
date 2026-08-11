@@ -5,16 +5,22 @@
 
 ---
 
-## 0. Stato attuale: FASI 1, 2, 3 E 4 COMPLETATE ✅
+## 0. Stato attuale: FASI 1, 2, 3, 4 E 5 COMPLETATE ✅
 
 - **Fase 1** (enumerazione Win32, indice, confronto presenza/dimensione, CLI, test) completa.
 - **Fase 2** (GUI SDL3 + progress + thread pool + Interrompi) completa.
 - **Fase 3** (SHA-256 via CNG/BCrypt, verifica contenuti, velocità MB/s reali) completa.
 - **Fase 4** (scanner NTFS via MFT + benchmark/correttezza MFT vs Win32) completa.
+- **Fase 5** (snapshot binario BVSI + confronto offline, cache SHA-256 persistente,
+  export CSV/JSON, dispositivo scollegato, file modificato durante la scansione) completa.
 
-Build pulita (`-Wall -Wextra`, 0 warning), **30/30 test passati** in modalità normale
-(i 2 test relativi ad access-denied falliscono solo se il processo è elevato, dove il
-deny è simulato male): `ctest` verde. I 2 test **MFT** passano se il processo è **elevato**,
+Il progetto è un **repository git inizializzato** e pushato su `github.com/alemoppo/CheckSyncFiles`
+(branch `main`, commit di base `413c066`); i dir build sono in `.gitignore`. Dopo ogni task:
+`git add -A && git commit -m "..." && git push`.
+
+Build pulita (`-Wall -Wextra`, 0 warning), **38/38 test passati** in modalità normale
+(ctest verde; i 2 test relativi ad access-denied falliscono solo se il processo è elevato,
+dove il deny è simulato male). I 2 test **MFT** passano se il processo è **elevato**,
 altrimenti vengono saltati (fallback Win32).
 
 - Toolchain reale qui: **MinGW-w64 g++ 16.1.0 + CMake 4.3.2 + Ninja** (NON c'è MSVC installato).
@@ -55,6 +61,10 @@ ctest --test-dir build_gui --output-on-failure
 - **(F2) GUI SDL3** (`src/UI/AppUI.{h,cpp}`, `UI/Utf.{h,cpp}`, `main_gui.cpp`): finestra SDL3, font via SDL3_ttf, campi Sorgente/Destinazione a testo, radio modalità, selezione thread (Auto/1/2/4/8/16), toggle **case-sensitive**, scelta **back-end** (Auto/Win32/MFT), bottoni AVVIA/INTERROMPI, riga di stato, barra di avanzamento indeterminata, filtri risultati (Tutti/Identici/Mancanti/Extra/Dimensione/Contenuto/Errori), lista risultati con scroll+a righe alternate, barra riepilogo. Modello di threading: UI sul main thread, scan su worker; progress+risultato copiati sotto mutex. `run()` fa `join()` del worker al close (niente detach → niente use-after-free).
 - **(F3) Hashing**: `Hashing/Sha256.cpp` via Windows CNG (`BCrypt`) in streaming a blocchi; `ScanController`/`FileComparator` accodano i file matched path==path && size==size e li hashano con un pool di `HashWorker`; `Stats` espone byte hashati + timing; velocità MB/s reali.
 - **(F4) MFT scanner** (`Filesystem/MftEnumerator.{h,cpp}`): legge la MFT raw via il record 0 (`$MFT`) decodificandone i **data-run** (la MFT è frammentata, `MftStartLcn` = solo primo extent); directory/reparse dai flag di header record (`rec+22`); dimensione da `$DATA`; record non "in use" scartati. Selezione backend in `ScanController` (Auto/Win32/Mft) con fallback automatico.
+- **(F5) Snapshot binario** (`Filesystem/FileIndexSerializer.{h,cpp}`): format compatto **BVSI** v1 (magic `0x49535642`, little-endian, path UTF-8, per-entry: size/mtime/FILETIME/attributes/fileId/isDirectory + digest SHA-256 opzionale). `--snapshot-out <file>` cattura l'indice sorgente; in modalità Contenuto la sorgente è hashatta PRIMA (i digest riutilizzati dal confronto live, niente doppia lettura) e lo snapshot li incorpora. `--compare <snapshot>` carica l'indice senza toccare il primo device: `FileComparator` in costruttore **offline** (senza sourceRoot) usa solo i digest salvati. Snapshot senza digest → verifica Contenuto **degradata a Dimensione** (`contentDegradedToSize`, `modeUsed` aggiornato).
+- **(F5) Cache hash** (`Hashing/HashCache.{h,cpp}`): chiave `(path assoluto, size, mtime)` separata da `\x01`; file binario magic `0x43485642` v1; chiave ricavata sul file corrente prima del lookup (hit sempre valido); cache corrotta ignorata con messaggio, mai bloccante. `--hash-cache <file>`. I hit sono contati con `std::atomic` nei worker (`ScanReport.hashCacheHits`).
+- **(F5) Export** (`Export/`): `ExportUtil` (token italiani `IDENTICO/MANCANTE/EXTRA/DIM_DIVERSA/CONTENUTO_DIVERSO/ERRORE_LETTURA/ACCESSO_NEGATO/MODIFICATO_DURANTE_SCAN`, `CsvEscape` RFC 4180, `JsonEscape` RFC 8259, `HexDigest`, `InferFormat` da estensione). `CsvExporter`: UTF-8 **con BOM** (Excel), colonne `status,path,size_source,size_destination,hash_source,hash_destination`. `JsonExporter`: array in streaming, nessuna BOM. `--export <file>` + `--export-format csv|json`. GUI: pulsanti **SNAPSHOT** e **ESPORTA CSV** con dialoghi di salvataggio (IFileSaveDialog/COM).
+- **(F5) Errori avanzati**: `Errors.h` → `IsDeviceDisconnectError()` (codici 59/64/67/995/1167/1222/1231/1236), `Win32Enumerator` segnala `ScanError.lostDevice` e **abortisce** l'enumerazione su disconnessione (ACCESS_DENIED SMB escluso). Nuovo `Status::ChangedDuringScan`: `FileComparator::HashOneSide` confronta la stat pre/post hash contro il valore dell'entry e segnala il file modificato tra enumerazione e verifica senza verdetto falso. `ComparisonResult` esteso con `hasHashSource/hasHashDest/hashSource/hashDest` e `Stats.changedDuringScan`; `PathUtil` con `ToUtf8/FromUtf8`.
 - **README.md** completo — da aggiornare a ogni fase.
 
 ## 2. Bug già trovati e risolti (NON ripetere)
@@ -63,6 +73,13 @@ ctest --test-dir build_gui --output-on-failure
 2. `Win32Enumerator` usava `e.relativePath` DOPO `onEntry(std::move(e))` per costruire il path figlio → `e` era moved-from (vuoto) → tutti i figli finivano alla root. **FIX**: calcolare `childRel` prima della callback e usare quello per lo stack.
 3. `destinationOk` era inferito da `problems.front()` — sbagliato (il primo problema poteva essere un errore di root SORGENTE). **FIX**: `FileComparator::run` ritorna direttamente `bool` (root dest accessibile).
 4. `std::filesystem::remove_all` **(MinGW libstdc++) appende con i long path `\\?\`** → hang nella cleanup dei test. **FIX**: `RemoveAllWin()` in `test_main.cpp` fa delete ricorsivo Win32 con prefisso `\\?\` su ogni operazione.
+
+### Bug/diagnosi Fase 5 (NON ripetere)
+9. **`std::ifstream/ofstream` e `std::wstring`**: il costruttore con `std::wstring` **non compila** su MinGW libstdc++ (serve path `char`). **FIX**: passare sempre `pathutil::AddLongPathPrefix(path).c_str()`. Idem nei test (`ReadFileBytes`).
+10. **`CHECK_EQ` su `std::wstring`**: il macro streamma i valori in un `ostringstream` → **errore di compilazione** per wstring. **FIX**: usare `CHECK(a == b)` per i confronti di stringhe wide, `CHECK_EQ` solo per i numerici.
+11. **Cache file dentro la tree scansionata**: nel test di cache con `source==destination==tree`, creare `hash.bin` dentro la tree la fa comparire come file nuovo alla seconda run (identici 201 != 200). **FIX**: cache in una directory temp separata.
+12. **`modeUsed` dopo il degrade**: `report.modeUsed` era fissato a `options.mode` all'inizio; il degrade Content→Size mutava solo la variabile locale `mode`. **FIX**: aggiornare `report.modeUsed = mode` dentro il branch di degrade.
+13. **CSV in Excel**: i path con virgola/quote/a-capo vanno esportati con escaping RFC 4180 (quote doppie dentro campi quotati), altrimenti le righe si spezzano.
 
 ### Bug/diagnosi MFT (Fase 4, NON ripetere)
 5. **MFT frammentata**: leggere `MftStartLcn + rec*segSize` in sequenza restituisce record fisici sbagliati per ogni extent oltre il primo → "record stantii" falsi, albero ricostruito incompleto (66/100 subdir). **FIX**: decodificare i **data-run** dell'attributo `$DATA` del record 0 e leggere ogni record percorrendo i run in ordine di record. `MftStartLcn` identifica SOLO il punto di partenza per leggere il record 0.
@@ -102,10 +119,11 @@ ctest --test-dir build_gui --output-on-failure
 
 ```
 src/
-  main_cli.cpp, main_gui.cpp, ScanController.h/.cpp
-  Filesystem/ FileEntry.h, FileEnumerator.h, Win32Enumerator.h/.cpp, MftEnumerator.h/.cpp, FileIndex.h/.cpp, PathUtil.h/.cpp
+  main_cli.cpp, main_gui.cpp, ScanController.h/.cpp, Errors.h
+  Filesystem/ FileEntry.h, FileEnumerator.h, Win32Enumerator.h/.cpp, MftEnumerator.h/.cpp, FileIndex.h/.cpp, FileIndexSerializer.h/.cpp, PathUtil.h/.cpp
   Comparison/ ScanMode.h, ComparisonResult.h, FileComparator.h/.cpp
-  Hashing/ Sha256.h/.cpp
+  Hashing/ Sha256.h/.cpp, HashCache.h/.cpp
+  Export/ ExportUtil.h/.cpp, CsvExporter.h/.cpp, JsonExporter.h/.cpp
   Threading/ ThreadPool.h/.cpp, IoClass.h
   UI/ AppUI.h/.cpp, Utf.h/.cpp
 tests/ TestHarness.h, TestTree.h/.cpp, test_main.cpp, CMakeLists.txt
@@ -131,12 +149,26 @@ Il progetto va REALIZZATO a fasi (§22 della richiesta originale). Seguire quest
 - Richiede un processo **elevato** per la lettura raw del volume; senza privilegi il backend segnala "non disponibile" e si usa il fallback (mai "Run as Administrator" globale).
 - Gestisce: milioni di file, nomi Unicode, record non "in use" (stantii) scartati, dataset. Tool di validazione: `bv_mftbench --gen N` (deve dare CORRISPONDENZA MFT==Win32) e `bv_mftprobe`.
 
-### FASE 5 — cache, snapshot, export, errori avanzati
-- **Cache** (design già previsto in §14): percorso+dimensione+timestamp+hash; se invariato non ricalcolare hash. Persistente opzionale.
-- **Snapshot indice**: salvare `backup_index.json` o formato binario compatto (per milioni di file il JSON è pesante → binario). Permettere: scansione USB → salva indice → confronto con assenza del secondo dispositivo.
-- **Export CSV/JSON** (`Export/CsvExporter.cpp`, `JsonExporter.cpp`): formato CSV spec §16 (`status,path,size_source,size_destination,hash_source,hash_destination`).
-- **Errori avanzati**: file modificato durante scansione (rilevare → segnalare → possibilità di riverifica), disconnessione NAS/USB.
-- Statistiche complete come da spec (§24 esempio).
+### FASE 5 — cache, snapshot, export, errori avanzati ✅ (COMPLETATA)
+> Completata e validata. Riepilogo di quanto implementato (dettagli in `README.md` §7b):
+> **snapshot binario BVSI** (`Filesystem/FileIndexSerializer`) con `--snapshot-out` e
+> confronto offline `--compare <snapshot> --dest <dest>` (la sorgente non viene letta);
+> in Content lo snapshot incorpora i digest SHA-256 (degraded a Size se assenti).
+> **cache SHA-256** persistente (`Hashing/HashCache`) via `--hash-cache`, hit contati e
+> riportati; **export** CSV (BOM UTF-8, escaping RFC 4180) e JSON (streaming) via
+> `--export`/`--export-format`; GUI con pulsanti SNAPSHOT/ESPORTA CSV e dialoghi
+> IFileSaveDialog; **errori avanzati**: dispositivo scollegato (`Errors.h`,
+> `Win32Enumerator.lostDevice` → abort) e file modificato durante la scansione
+> (`Status::ChangedDuringScan`, stat pre/post hash). Nuovo stato in `ComparisonResult`.
+> Test aggiunti: 8 (escaping CSV/JSON, round-trip snapshot, snapshot corrotto, offline
+> content, degrade a size, cache seconda run, changed-during-scan). **38/38 test verdi.**
+>
+> Possibili migliorie future (non bloccanti): GUI per confronto offline (pulire la
+> sorgente e selezionare uno snapshot), merge di snapshot incrementali, bucket/ordinamento
+> dell'indice per ridurre la memoria sulle tree enormi.
+
+A fine fase: aggiornare `README.md` + `HANDOFF.md` (barrare questa sezione come ✅),
+aggiungere test, tenere il suite verde (30 test), commit+push.
 
 ---
 
@@ -144,7 +176,7 @@ Il progetto va REALIZZATO a fasi (§22 della richiesta originale). Seguire quest
 
 File modificato durante scansione; percorsi UNC reali; NTFS vs non-NTFS; "milioni di entry simulate" (es. `--stress` con N grande e misura tempo/memoria); benchmark MFT vs Win32. Mantenere i test esistenti verdi mentre si refactora.
 
-Già coperti (30 totali): ThreadPool (drain/parallelismo/latch deterministico/0 thread/dtr), IoClass, progress (`onProgress` → file + fase Done), cancel (pre-set ferma subito), ioclasse, **MFT** (`IsSupported` su NTFS + enumerazione MFT == Win32, saltata se non elevato).
+Già coperti (38 totali): ThreadPool (drain/parallelismo/latch deterministico/0 thread/dtr), IoClass, progress (`onProgress` → file + fase Done), cancel (pre-set ferma subito), ioclasse, **MFT** (`IsSupported` su NTFS + enumerazione MFT == Win32, saltata se non elevato), **export CSV/JSON** (escaping, BOM, digest hex), **snapshot** (round-trip con hash + case policy, file corrotto rifiutato), **offline** (content contro snapshot, degrade a Size), **cache hash** (seconda run senza rilettura), **changed-during-scan** (stat pre/post hash).
 
 Nota: eseguire `build\tests\bv_tests.exe` **elevato** fa girare anche i test MFT; senza elevazione risultano "sostanzialmente saltati" (fallback Win32). Con il processo elevato i 2 test "access denied"/"content mode" falliscono solo perché il deny/accesso non viene simulato bene da admin — non è un bug del codice MFT.
 
@@ -155,5 +187,5 @@ Nota: eseguire `build\tests\bv_tests.exe` **elevato** fa girare anche i test MFT
 - L'ambiente ha **solo MinGW**, non MSVC. Per testare il build MSVC bisognerà installare Visual Studio Build Tools, ma i CMake sono già compatibili. Nota MSVC per la GUI: `find_package(SDL3/SDL3_ttf)` richiede che SDL3 sia raggiungibile (vcpkg o percorso manuale).
 - `BUILD_GUI` è `OFF` di default; usa SDL3 + SDL3_ttf già installati in mingw64. Avvio GUI: `build_gui\src\bv_gui.exe` (serve `C:\msys64\mingw64\bin` nel PATH per le DLL SDL).
 - Il testo richiesto in ORIGINALE è in italiano; la UI e i messaggi CLI sono già in italiano.
-- README aggiornato a ogni fase (oggi Fasi 1–4 documentate; Fase 5 solo "prossimi passi").
+- README aggiornato a ogni fase (oggi Fasi 1–5 documentate; Fase 5 in §7b).
 - **Avvio manuale di verifica MFT** dopo ogni modifica a `MftEnumerator.cpp`: `cmake --build build --target bv_mftbench; Start-Process powershell -File <temp>\elev_run.ps1 -Verb RunAs -Wait` poi leggere `mftbench_elev_out.txt` (deve dire `CORRISPONDENZA`). Lo script elevato è in `C:\Users\alemo\AppData\Local\Temp\opencode\`.

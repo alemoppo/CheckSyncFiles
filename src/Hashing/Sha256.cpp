@@ -70,5 +70,23 @@ HashStatus Sha256File(const std::wstring& path, std::array<uint8_t, 32>& digest)
     return result;
 }
 
+bool StatFile(const std::wstring& path, uint64_t& size, uint64_t& lastWriteTime) {
+    const std::wstring win = pathutil::AddLongPathPrefix(path);
+    HANDLE h = CreateFileW(win.c_str(), GENERIC_READ,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+
+    BY_HANDLE_FILE_INFORMATION info{};
+    bool ok = GetFileInformationByHandle(h, &info);
+    if (ok) {
+        size = (static_cast<uint64_t>(info.nFileSizeHigh) << 32) | info.nFileSizeLow;
+        lastWriteTime = (static_cast<uint64_t>(info.ftLastWriteTime.dwHighDateTime) << 32) |
+                        info.ftLastWriteTime.dwLowDateTime;
+    }
+    CloseHandle(h);
+    return ok;
+}
+
 } // namespace hashing
 } // namespace bv

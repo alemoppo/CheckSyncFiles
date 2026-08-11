@@ -15,6 +15,52 @@ constexpr size_t kHashBatch = 256; // pairs hashed per thread-pool batch
 
 namespace {
 
+using Digest = std::array<uint8_t, 32>;
+
+// Hashes one side (source or destination) of a candidate pair, honouring the
+// optional persistent cache and detecting changes between enumeration time
+// (`expectedSize`/`expectedMtime`, captured from the entry) and the moment the
+// file is actually read:
+//   - current stat != expected          -> `changed` (written while we waited)
+//   - file mutated between pre- and post-hash stats -> `changed`
+// A cache hit under the *current* (size, mtime) key is always sound: the cached
+// digest was computed for exactly the current file state.
+void HashOneSide(const std::wstring& absPath, uint64_t expectedSize, uint64_t expectedMtime,
+                 bool& changed, hashing::HashStatus& status, Digest& digest, bool valid,
+                 hashing::HashCache* cache, std::atomic<size_t>& cacheHits) {
+    if (!valid) {
+        status = hashing::HashStatus::ReadError;
+        return;
+    }
+    uint64_t sz = 0;
+    uint64_t mt = 0;
+    if (!hashing::StatFile(absPath, sz, mt)) {
+        status = hashing::HashStatus::NoAccess;
+        return;
+    }
+    changed = (sz != expectedSize) || (mt != expectedMtime);
+
+    if (cache && cache->Lookup(absPath, sz, mt, digest)) {
+        status = hashing::HashStatus::Ok;
+        cacheHits.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+
+    status = hashing::Sha256File(absPath, digest);
+    if (status != hashing::HashStatus::Ok) return;
+
+    uint64_t szAfter = 0;
+    uint64_t mtAfter = 0;
+    if (hashing::StatFile(absPath, szAfter, mtAfter)) {
+        if (szAfter != sz || mtAfter != mt) changed = true;
+    }
+    if (cache) cache->Store(absPath, sz, mt, digest);
+}
+
+} // namespace
+
+namespace {
+
 constexpr uint32_t kWinErrorAccessDenied = 5; // ERROR_ACCESS_DENIED
 
 bool StartsWith(const std::wstring& s, const std::wstring& prefix) {
@@ -168,6 +214,8 @@ void FileComparator::classifyMatched(FileEntry& src, FileEntry& dst, ResultSet& 
                 hp.relativePath = dst.relativePath;
                 hp.sizeSource = src.size;
                 hp.sizeDest = dst.size;
+                hp.srcMtime = src.lastWriteTime; // for change-detection + cache key
+                hp.dstMtime = dst.lastWriteTime;
                 pendingHashes_.push_back(std::move(hp));
             } else {
                 ++out.stats.sizeMismatch;
@@ -185,12 +233,21 @@ void FileComparator::classifyMatched(FileEntry& src, FileEntry& dst, ResultSet& 
 
 void FileComparator::runHashing(
     ThreadPool& pool, ResultSet& out, const std::atomic_bool* cancel,
-    const std::function<void(uint64_t done, uint64_t total)>& onProgress) {
+    const std::function<void(uint64_t done, uint64_t total)>& onProgress,
+    hashing::HashCache* cache) {
     struct Outcome {
         hashing::HashStatus srcStatus = hashing::HashStatus::ReadError;
         hashing::HashStatus dstStatus = hashing::HashStatus::ReadError;
         bool equal = false;
+        bool changed = false;
+        bool hasSrc = false;
+        bool hasDst = false;
+        Digest srcDigest{};
+        Digest dstDigest{};
     };
+
+    cacheHits_.store(0, std::memory_order_relaxed);
+    const bool offline = sourceRoot_.empty(); // digests live in the index
 
     const size_t total = pendingHashes_.size();
     size_t done = 0;
@@ -201,14 +258,25 @@ void FileComparator::runHashing(
         std::vector<Outcome> outcomes(n);
         for (size_t i = 0; i < n; ++i) {
             const HashPair& hp = pendingHashes_[done + i];
-            pool.submit([this, &hp, &o = outcomes[i]] {
-                std::array<uint8_t, 32> da, db;
-                o.srcStatus = hashing::Sha256File(
-                    pathutil::MakeAbsolute(sourceRoot_, hp.relativePath), da);
-                o.dstStatus = hashing::Sha256File(
-                    pathutil::MakeAbsolute(destRoot_, hp.relativePath), db);
+            pool.submit([this, &hp, &o = outcomes[i], cache, offline] {
+                if (offline) {
+                    // Source device absent: use the digest captured in the snapshot.
+                    o.hasSrc = source_.getHash(hp.relativePath, o.srcDigest);
+                    o.srcStatus = o.hasSrc ? hashing::HashStatus::Ok : hashing::HashStatus::ReadError;
+                } else {
+                    HashOneSide(pathutil::MakeAbsolute(sourceRoot_, hp.relativePath),
+                                hp.sizeSource, hp.srcMtime, o.changed, o.srcStatus, o.srcDigest,
+                                true, cache, cacheHits_);
+                    o.hasSrc = (o.srcStatus == hashing::HashStatus::Ok);
+                }
+                bool dstChanged = false;
+                HashOneSide(pathutil::MakeAbsolute(destRoot_, hp.relativePath),
+                            hp.sizeDest, hp.dstMtime, dstChanged, o.dstStatus, o.dstDigest,
+                            true, cache, cacheHits_);
+                o.hasDst = (o.dstStatus == hashing::HashStatus::Ok);
+                o.changed = o.changed || dstChanged;
                 o.equal = (o.srcStatus == hashing::HashStatus::Ok &&
-                           o.dstStatus == hashing::HashStatus::Ok && da == db);
+                           o.dstStatus == hashing::HashStatus::Ok && o.srcDigest == o.dstDigest);
             });
         }
         pool.waitAll();
@@ -216,6 +284,20 @@ void FileComparator::runHashing(
         for (size_t i = 0; i < n; ++i) {
             const HashPair& hp = pendingHashes_[done + i];
             const Outcome& o = outcomes[i];
+
+            if (o.changed) {
+                ++out.stats.changedDuringScan;
+                FileResult r;
+                r.status = Status::ChangedDuringScan;
+                r.relativePath = hp.relativePath;
+                r.sizeSource = hp.sizeSource;
+                r.sizeDest = hp.sizeDest;
+                r.isDirectory = false;
+                r.errorMessage = L"file modificato durante la scansione (riverificare)";
+                out.problems.push_back(std::move(r));
+                continue;
+            }
+
             if (o.srcStatus == hashing::HashStatus::Ok &&
                 o.dstStatus == hashing::HashStatus::Ok) {
                 if (o.equal) {
@@ -228,6 +310,10 @@ void FileComparator::runHashing(
                     r.sizeSource = hp.sizeSource;
                     r.sizeDest = hp.sizeDest;
                     r.isDirectory = false;
+                    r.hasHashSource = true;
+                    r.hasHashDest = true;
+                    r.hashSource = o.srcDigest;
+                    r.hashDest = o.dstDigest;
                     out.problems.push_back(std::move(r));
                 }
             } else {
@@ -244,6 +330,10 @@ void FileComparator::runHashing(
                 r.sizeSource = hp.sizeSource;
                 r.sizeDest = hp.sizeDest;
                 r.isDirectory = false;
+                r.hasHashSource = o.hasSrc;
+                r.hasHashDest = o.hasDst;
+                r.hashSource = o.srcDigest;
+                r.hashDest = o.dstDigest;
                 r.errorMessage = denied ? L"accesso negato durante il calcolo dell'impronta"
                                         : L"errore di lettura durante il calcolo dell'impronta";
                 out.problems.push_back(std::move(r));

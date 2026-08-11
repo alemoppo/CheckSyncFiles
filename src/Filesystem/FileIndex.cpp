@@ -13,6 +13,7 @@ FileIndex::BuildResult FileIndex::build(const std::wstring& root, IFileEnumerato
                                         const std::atomic_bool* cancel) {
     BuildResult result;
     map_.clear();
+    hashes_.clear();
     stats_ = {};
 
     const bool ok = enumerator.enumerate(
@@ -21,13 +22,7 @@ FileIndex::BuildResult FileIndex::build(const std::wstring& root, IFileEnumerato
             if (cancel && cancel->load(std::memory_order_relaxed)) {
                 return false; // stop the enumeration early
             }
-            stats_.files += e.isDirectory ? 0 : 1;
-            stats_.dirs += e.isDirectory ? 1 : 0;
-            stats_.bytes += e.isDirectory ? 0 : e.size;
-            // Compute the key BEFORE moving e (argument evaluation order is
-            // unspecified, and std::move would leave e in a moved-from state).
-            const std::wstring k = key(e.relativePath);
-            map_.emplace(k, std::move(e));
+            addEntry(std::move(e));
             return true;
         },
         [&result](const ScanError& err) { result.errors.push_back(err); },
@@ -36,6 +31,29 @@ FileIndex::BuildResult FileIndex::build(const std::wstring& root, IFileEnumerato
     result.ok = ok;
     result.stats = stats_;
     return result;
+}
+
+void FileIndex::addEntry(FileEntry&& e) {
+    stats_.files += e.isDirectory ? 0 : 1;
+    stats_.dirs += e.isDirectory ? 1 : 0;
+    stats_.bytes += e.isDirectory ? 0 : e.size;
+    // Compute the key BEFORE moving e (argument evaluation order is unspecified,
+    // and std::move would leave e in a moved-from state).
+    const std::wstring k = key(e.relativePath);
+    map_.emplace(k, std::move(e));
+}
+
+void FileIndex::setHash(const std::wstring& relativePath,
+                        const std::array<uint8_t, 32>& digest) {
+    hashes_[key(relativePath)] = digest;
+}
+
+bool FileIndex::getHash(const std::wstring& relativePath,
+                        std::array<uint8_t, 32>& digest) const {
+    const auto it = hashes_.find(key(relativePath));
+    if (it == hashes_.end()) return false;
+    digest = it->second;
+    return true;
 }
 
 bool FileIndex::find(const std::wstring& relativePath, FileEntry& out) const {

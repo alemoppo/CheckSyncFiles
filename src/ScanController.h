@@ -7,6 +7,7 @@
 
 #include "Comparison/ComparisonResult.h"
 #include "Comparison/ScanMode.h"
+#include "Export/ExportUtil.h"
 #include "Filesystem/FileEnumerator.h"
 
 namespace bv {
@@ -45,6 +46,22 @@ struct ScanOptions {
     // Enumeration back-end (default Auto uses MFT with automatic Win32 fallback
     // when both roots are local NTFS volumes).
     EnumeratorBackend backend = EnumeratorBackend::Auto;
+    // Phase 5 ----------------------------------------------------------------
+    // Capture the enumerated source index to this snapshot file. In Content
+    // mode the source files are also hashed first so the snapshot embeds their
+    // digests (later offline verification). Empty = no snapshot.
+    std::wstring snapshotOut;
+    // Load the source index from this snapshot instead of enumerating the
+    // source device (which may not even be connected). Mutually exclusive with
+    // `snapshotOut`.
+    std::wstring compareFrom;
+    // Write the resulting problems (non-identical entries) to this CSV/JSON
+    // file after the run. Empty = no export.
+    std::wstring exportPath;
+    exporting::ExportFormat exportFormat = exporting::ExportFormat::Auto;
+    // Persistent SHA-256 cache (absolute path + size + last-write time). When
+    // set, files whose key is unchanged are not re-read. Empty = disabled.
+    std::wstring hashCacheFile;
     // Called (from the scanning thread) periodically with running totals to
     // drive a progress bar / status line. Optional.
     std::function<void(const ScanProgress&)> onProgress = nullptr;
@@ -63,6 +80,15 @@ struct ScanReport {
     double secondsHashing = 0.0;          // content verification (Phase 3)
     unsigned int hashThreadsUsed = 0;     // hash pool size actually launched (0 = none)
     EnumeratorBackend backendUsed = EnumeratorBackend::Win32; // what actually ran
+
+    // Phase 5 -----------------------------------------------------------------
+    ScanMode modeUsed = ScanMode::Presence; // Content may be degraded to Size
+    bool usedSnapshot = false;              // source side loaded from a snapshot
+    bool contentDegradedToSize = false;     // snapshot had no digests
+    bool snapshotWritten = false;           // `snapshotOut` was produced
+    bool exportWritten = false;             // `exportPath` was produced
+    std::wstring exportError;
+    size_t hashCacheHits = 0;               // files skipped thanks to the cache
 };
 
 // Orchestrates a comparison run:

@@ -1,9 +1,14 @@
 add_library(bv_core STATIC
+  Export/CsvExporter.cpp
+  Export/ExportUtil.cpp
+  Export/JsonExporter.cpp
   Filesystem/FileIndex.cpp
+  Filesystem/FileIndexSerializer.cpp
   Filesystem/MftEnumerator.cpp
   Filesystem/PathUtil.cpp
   Filesystem/Win32Enumerator.cpp
   Comparison/FileComparator.cpp
+  Hashing/HashCache.cpp
   Hashing/Sha256.cpp
   ScanController.cpp
   Threading/ThreadPool.cpp

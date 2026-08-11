@@ -13,6 +13,10 @@ struct ScanError {
     std::wstring path;    // relative path of the failing directory ("" for the root)
     std::wstring message; // human readable (localized) message
     uint32_t winError = 0;
+    // Set when the underlying storage disappeared (NAS/USB disconnected) while
+    // scanning. The enumerator stops afterwards: continuing would only produce
+    // more noise. The caller should surface this and let the user re-attach.
+    bool lostDevice = false;
 };
 
 // Interface implemented by all enumeration back-ends:

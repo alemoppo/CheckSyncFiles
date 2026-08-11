@@ -51,7 +51,9 @@ private:
     void OnTextInput(const char* text);
     bool isPointerOverList(float wx, float wy);
     void startScan();
+    void startSnapshotScan();
     void stopScan();
+    void onExportCsv();
     void workerThread(ScanOptions options);
     unsigned int threadToCount() const; // threadSel_ -> pool size (0 = auto)
 
@@ -91,6 +93,13 @@ private:
     ResultSet results_;
     unsigned int threadCountUsed_ = 0; // hash workers actually launched
     double lastSecondsTotal_ = 0.0;    // duration of the last completed scan
+
+    // Phase 5 ----------------------------------------------------------------
+    bool lastSnapshotWritten_ = false;  // last run saved its source snapshot
+    bool lastDegraded_ = false;         // content degraded to size (no digests)
+    bool lastUsedSnapshot_ = false;     // source side loaded from a snapshot
+    std::wstring lastSnapshotPath_;
+    std::wstring statusNote_;           // transient note (export/snapshot result)
 
     // render-state ----------------------------------------------------------
     bool dirty_ = true;

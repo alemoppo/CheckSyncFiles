@@ -6,7 +6,9 @@
 #include <algorithm>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
+#include <iterator>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -20,10 +22,15 @@
 #include <thread>
 
 #include "Comparison/ScanMode.h"
+#include "Comparison/FileComparator.h"
+#include "Export/CsvExporter.h"
+#include "Export/JsonExporter.h"
 #include "Filesystem/FileIndex.h"
+#include "Filesystem/FileIndexSerializer.h"
 #include "Filesystem/MftEnumerator.h"
 #include "Filesystem/PathUtil.h"
 #include "Filesystem/Win32Enumerator.h"
+#include "Hashing/HashCache.h"
 #include "Hashing/Sha256.h"
 #include "ScanController.h"
 #include "TestHarness.h"
@@ -120,6 +127,40 @@ void RestoreAccess(const std::wstring& dir) {
     _wsystem(cmd.c_str());
     cmd = L"icacls \"" + dir + L"\" /reset /C 2>nul";
     _wsystem(cmd.c_str());
+}
+
+// Writes raw bytes to a file (used to build deterministic content differences).
+bool WriteFileBytes(const std::wstring& path, const char* data, size_t n) {
+    const HANDLE h = CreateFileW(pathutil::AddLongPathPrefix(path).c_str(), GENERIC_WRITE,
+                                 FILE_SHARE_READ, nullptr, CREATE_ALWAYS,
+                                 FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    DWORD written = 0;
+    const BOOL ok = WriteFile(h, data, static_cast<DWORD>(n), &written, nullptr);
+    CloseHandle(h);
+    return ok != FALSE && written == n;
+}
+
+std::string ReadFileBytes(const std::wstring& path) {
+    std::ifstream in(pathutil::AddLongPathPrefix(path).c_str(), std::ios::binary);
+    return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+}
+
+void BumpMtimeMinutes(const std::wstring& path, int minutes) {
+    FILETIME ft{};
+    const HANDLE h = CreateFileW(pathutil::AddLongPathPrefix(path).c_str(),
+                                 FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                 nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+    GetFileTime(h, nullptr, nullptr, &ft);
+    ULARGE_INTEGER ui;
+    ui.LowPart = ft.dwLowDateTime;
+    ui.HighPart = ft.dwHighDateTime;
+    ui.QuadPart += static_cast<ULONGLONG>(minutes) * 60ull * 10'000'000ull; // 100ns units
+    ft.dwLowDateTime = ui.LowPart;
+    ft.dwHighDateTime = ui.HighPart;
+    SetFileTime(h, nullptr, nullptr, &ft);
+    CloseHandle(h);
 }
 
 } // namespace
@@ -590,6 +631,263 @@ TEST("mft: enumeration matches Win32 (needs admin, else skipped)", [] {
         std::sort(a.begin(), a.end());
         std::sort(b.begin(), b.end());
         CHECK(a == b);
+    }
+});
+
+// ---------------------------------------------------------------------------
+// Phase 5: export CSV/JSON, binary snapshot, hash cache, offline compare
+
+TEST("export: csv escaping, BOM and hex digests", [] {
+    using namespace bv::exporting;
+    ResultSet r;
+    {
+        FileResult p;
+        p.status = Status::SizeMismatch;
+        p.relativePath = L"sub,a\"b\nc.txt"; // comma, double quote, newline
+        p.sizeSource = 10;
+        p.sizeDest = 12;
+        r.problems.push_back(p);
+    }
+    {
+        FileResult p;
+        p.status = Status::Extra;
+        p.relativePath = L"p\u00e0\u00e8\u00e9.io"; // accents
+        p.hasHashSource = true;
+        p.hasHashDest = false;
+        for (int i = 0; i < 32; ++i) p.hashSource[i] = static_cast<uint8_t>(i);
+        r.problems.push_back(p);
+    }
+    const std::wstring file = MakeTempDir() + L"\\out.csv";
+    std::wstring err;
+    CHECK(WriteCsv(file, r, err));
+    const std::string bytes = ReadFileBytes(file);
+
+    // UTF-8 BOM first, then the header row.
+    CHECK(bytes.size() > 3 && bytes[0] == '\xEF' && bytes[1] == '\xBB' && bytes[2] == '\xBF');
+    CHECK(bytes.find("status,path,size_source,size_destination,hash_source,hash_destination") !=
+          std::string::npos);
+
+    // RFC 4180: a field with comma/quote/newline is quoted with doubled quotes.
+    CHECK(bytes.find("\"sub,a\"\"b\nc.txt\"") != std::string::npos);
+    CHECK(bytes.find("DIM_DIVERSA,\"sub,a\"\"b\nc.txt\",10,12,") != std::string::npos);
+    // Accented name survives as UTF-8, digest as lowercase hex.
+    CHECK(bytes.find("p\xc3\xa0\xc3\xa8\xc3\xa9.io") != std::string::npos);
+    CHECK(bytes.find("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f") !=
+          std::string::npos);
+});
+
+TEST("export: json escaping and no BOM", [] {
+    using namespace bv::exporting;
+    ResultSet r;
+    {
+        FileResult p;
+        p.status = Status::ContentMismatch;
+        p.relativePath = L"dir\\qu\"ote\\path\tfile.bin";
+        p.sizeSource = 5;
+        p.sizeDest = 5;
+        r.problems.push_back(p);
+    }
+    const std::wstring file = MakeTempDir() + L"\\out.json";
+    std::wstring err;
+    CHECK(WriteJson(file, r, err));
+    const std::string bytes = ReadFileBytes(file);
+
+    CHECK(bytes[0] == '['); // no BOM, streaming array
+    CHECK(bytes.find("CONTENUTO_DIVERSO") != std::string::npos);
+    // JSON escaping: quote, backslash, tab.
+    CHECK(bytes.find("dir\\\\qu\\\"ote\\\\path\\tfile.bin") != std::string::npos);
+    CHECK(bytes.find("\"size_source\":5,\"size_destination\":5") != std::string::npos);
+});
+
+TEST("snapshot: index round-trip preserves entries, hashes and case policy", [] {
+    const auto dir = MakeTempDir();
+    const std::wstring src = dir + L"\\src";
+    fs::create_directories(src);
+    CHECK(WriteFileBytes(src + L"\\a.txt", "hello world", 11));
+    CHECK(WriteFileBytes(src + L"\\beta.bin", "12345", 5));
+
+    FileIndex idx(false);
+    {
+        Win32Enumerator en;
+        const auto br = idx.build(src, en);
+        CHECK(br.ok);
+    }
+    CHECK_EQ(idx.size(), 2ull);
+    idx.setHash(L"a.txt", {42, 43, 44});
+
+    const std::wstring snap = dir + L"\\idx.bin";
+    std::wstring err;
+    CHECK(indexio::WriteSnapshot(snap, idx, src, err));
+    CHECK(fs::exists(snap));
+
+    FileIndex idx2(true); // wrong case policy on purpose: must be overridden
+    std::wstring root;
+    CHECK(indexio::ReadSnapshot(snap, idx2, root, err));
+    CHECK_EQ(idx2.isCaseSensitive(), false);
+    CHECK(root == src);
+    CHECK_EQ(idx2.size(), 2ull);
+    CHECK_EQ(idx2.hashCount(), 1ull);
+
+    // Entries equal (path, size, mtime, attributes, fileId, type).
+    CHECK(idx2.entries().size() == idx.entries().size());
+    for (const auto& [key, e] : idx.entries()) {
+        const auto it = idx2.entries().find(key);
+        CHECK_MSG(it != idx2.entries().end(), "entry present after load");
+        if (it != idx2.entries().end()) {
+            CHECK(it->second.relativePath == e.relativePath);
+            CHECK_EQ(it->second.size, e.size);
+            CHECK_EQ(it->second.lastWriteTime, e.lastWriteTime);
+            CHECK_EQ(it->second.attributes, e.attributes);
+            CHECK_EQ(it->second.fileId, e.fileId);
+            CHECK_EQ(it->second.isDirectory, e.isDirectory);
+        }
+    }
+    CHECK(idx2.hashes() == idx.hashes());
+});
+
+TEST("snapshot: corrupt file is rejected cleanly", [] {
+    const std::string junk = "not a snapshot at all, just some junk bytes";
+    const std::wstring snap = MakeTempDir() + L"\\bad.bin";
+    CHECK(WriteFileBytes(snap, junk.data(), junk.size()));
+
+    FileIndex idx;
+    std::wstring root, err;
+    CHECK(!indexio::ReadSnapshot(snap, idx, root, err));
+    CHECK(!err.empty());
+});
+
+TEST("offline: compareFrom verifies content against snapshot digests", [] {
+    const auto dir = MakeTempDir();
+    const std::wstring src = dir + L"\\src";
+    const std::wstring dst = dir + L"\\dst";
+    fs::create_directories(src);
+    fs::create_directories(dst);
+    CHECK(WriteFileBytes(src + L"\\alpha.txt", "hello world", 11));
+    CHECK(WriteFileBytes(src + L"\\beta.bin", "zebra", 5));
+    fs::copy(src, dst, fs::copy_options::recursive);
+
+    // Capture the source (Content mode embeds digests in the snapshot).
+    ScanOptions cap;
+    cap.source = src;
+    cap.destination = src;
+    cap.mode = ScanMode::Content;
+    cap.hashThreads = 2;
+    cap.snapshotOut = dir + L"\\src.bin";
+    ScanReport r1 = ScanController(false).run(cap);
+    CHECK(r1.snapshotWritten);
+    CHECK_EQ(r1.results.stats.identicalFiles, 2ull);
+
+    // Corrupt the destination's first file (same size, different bytes).
+    CHECK(WriteFileBytes(dst + L"\\alpha.txt", "xxxxx world", 11));
+
+    // Offline comparison: source device absent, digests come from snapshot.
+    ScanOptions off;
+    off.destination = dst;
+    off.mode = ScanMode::Content;
+    off.hashThreads = 2;
+    off.compareFrom = dir + L"\\src.bin";
+    ScanReport r2 = ScanController(false).run(off);
+    CHECK(r2.sourceOk);
+    CHECK(r2.usedSnapshot);
+    CHECK(r2.modeUsed == ScanMode::Content); // digests present, real verification
+    CHECK_EQ(r2.results.stats.sourceFiles, 2ull);
+    CHECK_EQ(r2.results.stats.identicalFiles, 1ull);   // beta.bin
+    CHECK_EQ(r2.results.stats.contentMismatch, 1ull);  // alpha.txt
+    CHECK_EQ(r2.results.stats.missingFiles + r2.results.stats.extraFiles, 0ull);
+});
+
+TEST("offline: snapshot without hashes degrades content to size", [] {
+    const auto dir = MakeTempDir();
+    const std::wstring src = dir + L"\\src";
+    const std::wstring dst = dir + L"\\dst";
+    fs::create_directories(src);
+    fs::create_directories(dst);
+    CHECK(WriteFileBytes(src + L"\\alpha.txt", "hello world", 11));
+    fs::copy(src, dst, fs::copy_options::recursive);
+
+    // Presence-mode snapshot: entries only, no digests.
+    ScanOptions cap;
+    cap.source = src;
+    cap.destination = src;
+    cap.mode = ScanMode::Presence;
+    cap.snapshotOut = dir + L"\\src.bin";
+    CHECK(ScanController(false).run(cap).snapshotWritten);
+
+    ScanOptions off;
+    off.destination = dst;
+    off.mode = ScanMode::Content;
+    off.compareFrom = dir + L"\\src.bin";
+    ScanReport r = ScanController(false).run(off);
+    CHECK(r.usedSnapshot);
+    CHECK(r.contentDegradedToSize);
+    CHECK(r.modeUsed == ScanMode::Size); // degraded: only sizes are verifiable
+    CHECK_EQ(r.results.stats.identicalFiles, 1ull); // same size counts as identical
+});
+
+TEST("cache: second run reuses stored hashes without re-reading", [] {
+    const auto tree = MakeTempDir();
+    testgen::CreateStressTree(tree, 200); // 3 dirs x 100 files? -> 200 files total
+    // The cache file must NOT live inside the scanned tree, or it would appear
+    // as a new file on the second run.
+    const std::wstring cache = MakeTempDir() + L"\\hash.bin";
+
+    ScanOptions base;
+    base.source = tree;
+    base.destination = tree;
+    base.mode = ScanMode::Content;
+    base.hashThreads = 2;
+    base.hashCacheFile = cache;
+
+    ScanReport r1 = ScanController(false).run(base);
+    CHECK_EQ(r1.results.stats.sourceFiles, r1.results.stats.identicalFiles);
+    CHECK(fs::exists(cache)); // cache was written back
+
+    ScanReport r2 = ScanController(false).run(base);
+    CHECK_EQ(r2.results.stats.identicalFiles, r1.results.stats.identicalFiles);
+    CHECK_MSG(r2.hashCacheHits > 0, "unchanged tree should be served from the cache");
+
+    // The persisted file is loadable and carries entries.
+    std::wstring err;
+    hashing::HashCache loaded(cache, err);
+    CHECK_MSG(loaded.size() > 0, "cache reloaded from disk");
+});
+
+TEST("comparator: file changed between enumeration and hash is flagged", [] {
+    const auto dir = MakeTempDir();
+    const std::wstring src = dir + L"\\src";
+    const std::wstring dst = dir + L"\\dst";
+    fs::create_directories(src);
+    fs::create_directories(dst);
+    const std::wstring afile = src + L"\\a.txt";
+    CHECK(WriteFileBytes(afile, "hello world", 11));
+    fs::copy(afile, dst + L"\\a.txt");
+
+    FileIndex srcIdx(false);
+    {
+        Win32Enumerator en;
+        const auto br = srcIdx.build(src, en);
+        CHECK(br.ok);
+    }
+    CHECK_EQ(srcIdx.size(), 1ull);
+
+    // Mutate AFTER the index was built: same size, bumped mtime.
+    CHECK(WriteFileBytes(afile, "xxxxx world", 11));
+    BumpMtimeMinutes(afile, 1);
+
+    FileComparator cmp(srcIdx, ScanMode::Content, src);
+    ResultSet out;
+    {
+        Win32Enumerator en;
+        CHECK(cmp.run(dst, en, out));
+    }
+    ThreadPool pool(2);
+    cmp.runHashing(pool, out, nullptr, {}, nullptr);
+
+    CHECK_EQ(out.stats.changedDuringScan, 1ull);
+    CHECK_EQ(out.problems.size(), 1ull);
+    if (out.problems.size() == 1) {
+        CHECK(out.problems[0].status == Status::ChangedDuringScan);
+        CHECK(out.problems[0].relativePath == L"a.txt");
     }
 });
 

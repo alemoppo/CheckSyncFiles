@@ -3,6 +3,7 @@
 #include <cwchar>
 #include <vector>
 
+#include "Errors.h"
 #include "PathUtil.h"
 
 #define WIN32_LEAN_AND_MEAN
@@ -65,6 +66,17 @@ bool Win32Enumerator::enumerate(const std::wstring& root,
             const DWORD err = GetLastError();
             // ERROR_FILE_NOT_FOUND means an empty directory: not an error.
             if (err != ERROR_FILE_NOT_FOUND) {
+                // The storage is gone: report and abort immediately; walking
+                // further would only produce a flood of identical errors.
+                if (IsDeviceDisconnectError(err)) {
+                    ScanError lost;
+                    lost.path = f.rel;
+                    lost.message = L"dispositivo scollegato durante l'operazione";
+                    lost.winError = err;
+                    lost.lostDevice = true;
+                    onError(lost);
+                    return false;
+                }
                 onError({f.rel, L"Unable to enumerate directory", err});
             }
             if (onProgress) {
@@ -118,6 +130,15 @@ bool Win32Enumerator::enumerate(const std::wstring& root,
         if (abort) return true; // early stop requested by the consumer
 
         if (loopErr != ERROR_NO_MORE_FILES && loopErr != 0) {
+            if (IsDeviceDisconnectError(loopErr)) {
+                ScanError lost;
+                lost.path = f.rel;
+                lost.message = L"dispositivo scollegato durante l'operazione";
+                lost.winError = loopErr;
+                lost.lostDevice = true;
+                onError(lost);
+                return false;
+            }
             onError({f.rel, L"Error while reading directory", loopErr});
         }
         if (onProgress) {

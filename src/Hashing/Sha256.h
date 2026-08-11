@@ -20,5 +20,10 @@ enum class HashStatus : uint8_t {
 // long-path prefix internally, so paths beyond MAX_PATH are handled.
 HashStatus Sha256File(const std::wstring& path, std::array<uint8_t, 32>& digest);
 
+// Opens the file read-only and reports its current size and last-write time
+// (FILETIME ticks). Returns false when the file cannot be opened. Used by the
+// hash cache (path+size+mtime key) and by "changed during scan" detection.
+bool StatFile(const std::wstring& path, uint64_t& size, uint64_t& lastWriteTime);
+
 } // namespace hashing
 } // namespace bv

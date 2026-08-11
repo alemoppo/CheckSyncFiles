@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <string>
@@ -38,6 +39,7 @@ public:
     };
 
     using Map = std::unordered_map<std::wstring, FileEntry>;
+    using HashMap = std::unordered_map<std::wstring, std::array<uint8_t, 32>>;
 
     explicit FileIndex(bool caseSensitive = false) : caseSensitive_(caseSensitive) {}
 
@@ -49,6 +51,10 @@ public:
                       const IFileEnumerator::ProgressCallback& onProgress = {},
                       const std::atomic_bool* cancel = nullptr);
 
+    // Inserts a single entry keeping stats_ consistent. Used by the snapshot
+    // loader to rebuild an index previously serialized to disk.
+    void addEntry(FileEntry&& e);
+
     // Looks up a relative path. Returns false if not present.
     bool find(const std::wstring& relativePath, FileEntry& out) const;
 
@@ -57,8 +63,17 @@ public:
     // destination tree, so that remaining entries are exactly the missing ones.
     bool tryErase(const std::wstring& relativePath, FileEntry& out);
 
+    // Optional per-entry SHA-256 of the source file. Filled when a snapshot is
+    // captured in Content mode, and consumed by offline comparisons (the source
+    // device is absent, so its digest must come from the snapshot).
+    void setHash(const std::wstring& relativePath, const std::array<uint8_t, 32>& digest);
+    bool getHash(const std::wstring& relativePath, std::array<uint8_t, 32>& digest) const;
+    const HashMap& hashes() const { return hashes_; }
+    size_t hashCount() const { return hashes_.size(); }
+
     size_t size() const { return map_.size(); }
     bool empty() const { return map_.empty(); }
+    bool isCaseSensitive() const { return caseSensitive_; }
 
     const Map& entries() const { return map_; }
     const BuildStats& stats() const { return stats_; }
@@ -67,6 +82,7 @@ private:
     std::wstring key(const std::wstring& relativePath) const;
 
     Map map_;
+    HashMap hashes_;
     BuildStats stats_;
     bool caseSensitive_;
 };

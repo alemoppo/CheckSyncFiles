@@ -4,9 +4,11 @@ Verificatore di backup **read-only** per Windows in **C++17 + SDL3** (GUI attiva
 Confronta due alberi di file (es. disco USB o cartella NAS via SMB) per assicurarsi che
 contengano gli stessi dati, **senza mai** copiare, modificare o cancellare nulla.
 
-Stato attuale: **Fasi 1, 2, 3 e 4 completate** (enumerazione Win32, indice, confronto
+Stato attuale: **Fasi 1, 2, 3, 4 e 5 completate** (enumerazione Win32, indice, confronto
 presenza/dimensione, CLI, GUI SDL3 con progress e thread pool, SHA-256 per il contenuto,
-**scanner MFT NTFS** con benchmark MFT vs Win32). La Fase 5 è delineata più sotto.
+**scanner MFT NTFS** con benchmark MFT vs Win32, **snapshot binario con confronto offline,
+cache SHA-256 persistente, export CSV/JSON, gestione di dispositivo scollegato e file
+modificato durante la scansione**).
 
 Priorità dichiarata: **correttezza > sicurezza > affidabilità > performance > estetica**.
 
@@ -106,7 +108,8 @@ Modalità:
   hashato (SHA-256) e confrontato.
 
 Risultati classificati: `Identical`, `Missing` (solo sorgente), `Extra` (solo destinazione),
-`SizeMismatch`, `ContentMismatch`, `ReadError`, `AccessDenied`.
+`SizeMismatch`, `ContentMismatch`, `ReadError`, `AccessDenied`, `ChangedDuringScan`
+(Fase 5: il file è cambiato tra enumerazione e verifica del contenuto).
 
 Ottimizzazioni memoria/velocità:
 - la destinazione è in streaming (mai un secondo indice);
@@ -136,6 +139,49 @@ Thread pool configurabile (vedi `Threading/ThreadPool.{h,cpp}` e `IoClass.h`).
 Nessun thread per file: i worker processano i file da una coda condivisa durante la
 fase di hashing.
 
+## 7b. Fase 5 — snapshot, confronto offline, export, cache, errori avanzati
+
+### Snapshot binario e confronto offline
+
+L'indice sorgente può essere serializzato su disco con `--snapshot-out <file>`
+(format binario compatto **BVSI**, magic `0x49535642` v1; niente JSON: per milioni di
+file il binario è decine di MB invece di centinaia). In modalità **Contenuto** la sorgente
+viene prima hashatta e lo snapshot incorpora i digest SHA-256 per ogni voce.
+
+Con `--compare <snapshot> --dest <dest>` la sorgente non viene letta affatto: l'indice e gli
+impronte si caricano dallo snapshot e si verifica la sola destinazione (utile quando il
+primo dispositivo non è collegato). Se lo snapshot non contiene impronte, la verifica
+Contenuto viene **degradata a Dimensione** (segnalato esplicitamente).
+
+### Export CSV / JSON
+
+`--export <file>` scrive le voci non identiche dopo la scansione. Formato dedotto
+dall'estensione (`.json` = JSON, altrimenti CSV) o forzato con `--export-format`.
+CSV: UTF-8 con BOM (Excel), colonne `status,path,size_source,size_destination,hash_source,
+hash_destination`, escaping RFC 4180 (virgola/quote/a-capo nei nomi). JSON: array in
+streaming (una voce per volta, memoria limitata), escaping RFC 8259, senza BOM.
+Token di stato in italiano: `IDENTICO, MANCANTE, EXTRA, DIM_DIVERSA, CONTENUTO_DIVERSO,
+ERRORE_LETTURA, ACCESSO_NEGATO, MODIFICATO_DURANTE_SCAN`.
+
+### Cache hash persistente
+
+`--hash-cache <file>` attiva una cache SHA-256 con chiave `(path assoluto, dimensione,
+ultima modifica)`: se il file è invariato il digest viene riusato e il file **non viene
+riletto**. La cache è un'ottimizzazione opzionale: non cambia mai un verdetto (la chiave
+viene calcolata sul file corrente prima del lookup). Un file di cache corrotto viene
+ignorato con un avviso, mai bloccante.
+
+### Errori avanzati
+
+- **File modificato durante la scansione** (`ChangedDuringScan`): prima dell'hash si
+  verificano dimensione/timestamp contro il valore registrato all'enumerazione; se
+  cambiano tra i due momenti il file è segnalato senza un verdetto falso (né
+  "Identical" né "ContentMismatch").
+- **Dispositivo scollegato** (NAS/USB durante l'operazione): gli errori Win32 di
+  disconnessione (59, 64, 67, 995, 1167, 1222, 1231, 1236) abortiscono l'enumerazione e
+  vengono segnalati per riverifica; `ACCESS_DENIED` (ACL SMB) non è considerato una
+  disconnessione.
+
 ## 8. Limiti noti
 
 - Directory reparse (junction/symlink) non seguite e riportate come singola voce;
@@ -144,7 +190,10 @@ fase di hashing.
   la directory è segnalata con `ReadError`/`AccessDenied` e i figli non sono contati.
 - La lettura raw della MFT richiede un processo **elevato** (amministratore /
   `SeBackup`); senza di esso il backend MFT segnala "non disponibile" e si usa Win32.
-- Nessuna cache persistente / snapshot / export CSV/JSON (Fase 5).
+- Lo snapshot incorpora i digest solo se catturato in modalità Contenuto; uno snapshot
+  "Presenza"/"Dimensione" consente il solo confronto di presenza/dimensione (degradato).
+- Il confronto offline si basa sullo stato al momento dello snapshot: file modificati sul
+  primo dispositivo dopo la cattura non vengono rilevati (serve ricatturare).
 - Test UNC eseguibili solo in presenza di una vera share di rete.
 
 ---
@@ -181,9 +230,12 @@ Eseguibile GUI: `build_gui/src/bv_gui.exe`. All'avvio la GUI deve trovare le DLL
 SDL: aggiungere `C:\msys64\mingw64\bin` al PATH oppure copiarle accanto all'`.exe`.
 
 La GUI fa girare la scansione su un thread separato, mostra l'avanzamento, barra di
-progressione, pulsanti AVVIA / INTERROMPI, la lista dei problemi filtrabile (Tutti /
-Identici / Mancanti / Extra / Dimensione / Contenuto / Errori) con scroll, il toggle
-case-sensitive e la scelta del **back-end di enumerazione** (Auto / Win32 / MFT).
+progressione, pulsanti AVVIA / INTERROMPI / SNAPSHOT / ESPORTA CSV (Fase 5), la lista dei
+problemi filtrabile (Tutti / Identici / Mancanti / Extra / Dimensione / Contenuto / Errori)
+con scroll, il toggle case-sensitive e la scelta del **back-end di enumerazione**
+(Auto / Win32 / MFT). Il pulsante SNAPSHOT cattura l'indice della sola sorgente in un file
+binario; ESPORTA CSV salva le voci non identiche dell'ultima scansione (dialoghi di
+salvataggio Windows nativi).
 
 ### Con Visual Studio / MSVC e CMake (Windows 11)
 
@@ -201,14 +253,24 @@ rileva `CMakeLists.txt`). Il codice usa solo C++17 standard + API Win32.
 ## Uso della CLI
 
 ```text
-bv_cli --source <percorso> --dest <percorso> [--mode presence|size]
-       [--case-sensitive] [--enum auto|win32|mft] [--list-problems [--limit N]] [--help]
+bv_cli --source <percorso> --dest <percorso> [--mode presence|size|content]
+       [--case-sensitive] [--enum auto|win32|mft] [--list-problems [--limit N]]
+       [--snapshot-out <file>] [--compare <snapshot>] [--hash-cache <file>]
+       [--export <file>] [--export-format csv|json] [--help]
 ```
 
 Esempio:
 
 ```powershell
-bv_cli --source D:\Backup --dest \\NAS\Backup --mode content --enum auto --list-problems
+# verifica normale con esportazione e cache
+bv_cli --source D:\Backup --dest \\NAS\Backup --mode content --enum auto `
+       --list-problems --hash-cache C:\temp\hash.bin --export C:\temp\out.csv
+
+# snapshot della sorgente (contenuto + digest)
+bv_cli --source D:\Backup --mode content --snapshot-out D:\snap\backup.bin
+
+# verifica offline contro lo snapshot (il primo dispositivo non serve)
+bv_cli --compare D:\snap\backup.bin --dest E:\Backup --mode content
 ```
 
 ## Generatore di alberi di test
@@ -229,12 +291,14 @@ src/
   main_cli.cpp            CLI (Fase 1)
   main_gui.cpp            entry GUI SDL3 (Fase 2)
   ScanController.h/.cpp   orchestrazione scansione (sceglie/fallback del backend)
+  Errors.h                rilevamento errore di disconnessione dispositivo (Fase 5)
   UI/AppUI.{h,cpp}        GUI SDL3 (render, input, thread di scan)
   UI/Utf.{h,cpp}          conversione UTF-8/16 per SDL
   Threading/ThreadPool.{h,cpp}, IoClass.h
   Filesystem/
     FileEntry.h           record di una entry
     FileIndex.h/.cpp      indice in memoria (policy case)
+    FileIndexSerializer.h/.cpp  snapshot binario BVSI (Fase 5)
     FileEnumerator.h      interfaccia scanner
     Win32Enumerator.cpp   enumerazione FindFirstFile/Win32
     MftEnumerator.cpp     enumerazione raw NTFS MFT (Fase 4)
@@ -242,8 +306,14 @@ src/
   Comparison/
     ScanMode.h            Presence / Size / Content
     ComparisonResult.h    Status, FileResult, Stats, ResultSet
-    FileComparator.h/.cpp confronto
-  Hashing/Sha256.cpp      SHA-256 CNG/BCrypt (Fase 3)
+    FileComparator.h/.cpp confronto (live e offline, Fase 5)
+  Hashing/
+    Sha256.cpp            SHA-256 CNG/BCrypt (Fase 3)
+    HashCache.h/.cpp      cache SHA-256 persistente (Fase 5)
+  Export/
+    ExportUtil.h/.cpp     token, escaping CSV/JSON, hex digest, inferenza formato
+    CsvExporter.h/.cpp    export CSV (BOM UTF-8) (Fase 5)
+    JsonExporter.h/.cpp   export JSON in streaming (Fase 5)
 tests/
   TestHarness.h, TestTree.h/.cpp, test_main.cpp
 tools/
@@ -255,6 +325,7 @@ tools/
 - **Fase 2**: GUI SDL3, progress, risultati filtrabili, thread pool, Interrompi. Completata.
 - **Fase 3**: SHA-256 (CNG), verifica contenuti, statistiche velocità MB/s. Completata.
 - **Fase 4**: scanner MFT NTFS + benchmark MFT vs Win32. Completata.
-- **Fase 5**: cache, snapshot indice, export CSV/JSON, gestione avanzata errori.
+- **Fase 5**: snapshot indice binario + confronto offline, cache SHA-256 persistente,
+  export CSV/JSON, dispositivo scollegato, file modificato durante la scansione. Completata.
 
 La struttura dettagliata è anche in `HANDOFF.md`.

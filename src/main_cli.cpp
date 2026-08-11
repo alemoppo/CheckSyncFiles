@@ -1,8 +1,10 @@
-// BackupVerifier CLI - Phase 1.
+// BackupVerifier CLI - Phase 1 (extended in Phase 5).
 //
 // Usage:
 //   bv_cli --source <path> --dest <path> [--mode presence|size]
 //          [--case-sensitive] [--enum auto|win32|mft] [--list-problems [--limit N]] [--help]
+//   bv_cli --source <path> --snapshot-out <file> [--mode content]    (snapshot only)
+//   bv_cli --compare <snapshot> --dest <path> [--mode content]       (offline compare)
 
 #include <algorithm>
 #include <cwchar>
@@ -18,10 +20,12 @@
 namespace {
 
 const wchar_t* kUsage =
-    L"BackupVerifier CLI (Fase 1)\n"
+    L"BackupVerifier CLI\n"
     L"\n"
     L"Uso:\n"
     L"  bv_cli --source <percorso> --dest <percorso> [opzioni]\n"
+    L"  bv_cli --source <percorso> --snapshot-out <file> [opzioni]   (solo snapshot)\n"
+    L"  bv_cli --compare <snapshot> --dest <percorso> [opzioni]      (confronto offline)\n"
     L"\n"
     L"Opzioni:\n"
     L"  --mode <presence|size|content>   modalita di confronto (default: presence)\n"
@@ -31,6 +35,11 @@ const wchar_t* kUsage =
     L"  --list-problems          stampa le voci non identiche\n"
     L"  --limit <N>              numero massimo di voci stampate (default: 100)\n"
     L"  --progress               mostra l'avanzamento (fase, conteggi)\n"
+    L"  --export <file>          esporta i problemi in CSV o JSON (estensione .json => JSON)\n"
+    L"  --export-format <csv|json>  formato di esportazione esplicito\n"
+    L"  --snapshot-out <file>    salva l'indice della sorgente (con hash in modalita content)\n"
+    L"  --compare <snapshot>     confronta --dest contro uno snapshot (niente --source)\n"
+    L"  --hash-cache <file>      riusa le impronte SHA-256 non scaricate (percorso+dim+data)\n"
     L"  -h, --help               mostra questo aiuto\n";
 
 struct Args {
@@ -44,6 +53,11 @@ struct Args {
     bv::EnumeratorBackend backend = bv::EnumeratorBackend::Auto;
     bool progress = false;
     bool help = false;
+    std::wstring exportPath;
+    bv::exporting::ExportFormat exportFormat = bv::exporting::ExportFormat::Auto;
+    std::wstring snapshotOut;
+    std::wstring compareFrom;
+    std::wstring hashCacheFile;
 };
 
 bool ParseArgs(int argc, wchar_t** argv, Args& out) {
@@ -75,6 +89,19 @@ bool ParseArgs(int argc, wchar_t** argv, Args& out) {
             out.progress = true;
         } else if (a == L"--limit" && i + 1 < argc) {
             out.limit = std::stoull(argv[++i]);
+        } else if (a == L"--export" && i + 1 < argc) {
+            out.exportPath = argv[++i];
+        } else if (a == L"--export-format" && i + 1 < argc) {
+            const std::wstring f = argv[++i];
+            if (f == L"csv") out.exportFormat = bv::exporting::ExportFormat::Csv;
+            else if (f == L"json") out.exportFormat = bv::exporting::ExportFormat::Json;
+            else { std::wcerr << L"Formato export sconosciuto: " << f << L"\n"; return false; }
+        } else if (a == L"--snapshot-out" && i + 1 < argc) {
+            out.snapshotOut = argv[++i];
+        } else if (a == L"--compare" && i + 1 < argc) {
+            out.compareFrom = argv[++i];
+        } else if (a == L"--hash-cache" && i + 1 < argc) {
+            out.hashCacheFile = argv[++i];
         } else if (a == L"-h" || a == L"--help") {
             out.help = true;
         } else {
@@ -82,7 +109,23 @@ bool ParseArgs(int argc, wchar_t** argv, Args& out) {
             return false;
         }
     }
-    if (!out.help && (out.source.empty() || out.dest.empty())) {
+    if (out.help) return true;
+
+    if (!out.compareFrom.empty()) {
+        if (!out.source.empty()) {
+            std::wcerr << L"Errore: con --compare non si usa --source (la sorgente e lo snapshot).\n\n";
+            return false;
+        }
+        if (out.dest.empty()) {
+            std::wcerr << L"Errore: --compare richiede --dest.\n\n";
+            return false;
+        }
+    } else if (!out.snapshotOut.empty()) {
+        if (out.source.empty()) {
+            std::wcerr << L"Errore: --snapshot-out richiede --source.\n\n";
+            return false;
+        }
+    } else if (out.source.empty() || out.dest.empty()) {
         std::wcerr << L"Errore: --source e --dest sono obbligatori.\n\n";
         return false;
     }
@@ -157,6 +200,7 @@ void PrintResults(const bv::ResultSet& r) {
     std::wcout << L"Extra (file):          " << Group(s.extraFiles) << L"\n";
     std::wcout << L"Dimensione diversa:    " << Group(s.sizeMismatch) << L"\n";
     std::wcout << L"Contenuto diverso:     " << Group(s.contentMismatch) << L"\n";
+    std::wcout << L"Modificati durante scan:" << Group(s.changedDuringScan) << L"\n";
     std::wcout << L"Errori di lettura:     " << Group(s.readErrors) << L"\n";
     std::wcout << L"Accesso negato:        " << Group(s.accessDenied) << L"\n";
     std::wcout << L"\n";
@@ -188,6 +232,11 @@ int MainImpl(int argc, wchar_t** argv) {
     options.caseSensitive = args.caseSensitive;
     options.hashThreads = args.threads;
     options.backend = args.backend;
+    options.snapshotOut = args.snapshotOut;
+    options.compareFrom = args.compareFrom;
+    options.exportPath = args.exportPath;
+    options.exportFormat = args.exportFormat;
+    options.hashCacheFile = args.hashCacheFile;
 
     if (args.progress) {
         options.onProgress = [](const bv::ScanProgress& p) {
@@ -203,8 +252,20 @@ int MainImpl(int argc, wchar_t** argv) {
         };
     }
 
-    std::wcout << L"Sorgente:      " << options.source << L"\n";
-    std::wcout << L"Destinazione:  " << options.destination << L"\n";
+    if (!args.compareFrom.empty()) {
+        std::wcout << L"Sorgente:      snapshot -> " << args.compareFrom << L"\n";
+    } else {
+        std::wcout << L"Sorgente:      " << options.source << L"\n";
+    }
+    if (!options.destination.empty()) {
+        std::wcout << L"Destinazione:  " << options.destination << L"\n";
+    }
+    if (!args.snapshotOut.empty()) {
+        std::wcout << L"Snapshot out:  " << args.snapshotOut << L"\n";
+    }
+    if (!args.hashCacheFile.empty()) {
+        std::wcout << L"Cache hash:    " << args.hashCacheFile << L"\n";
+    }
     std::wcout << L"Modalita:      "
                << (options.mode == bv::ScanMode::Presence ? L"Presenza"
                    : options.mode == bv::ScanMode::Size ? L"Dimensione"
@@ -218,20 +279,47 @@ int MainImpl(int argc, wchar_t** argv) {
                              ? L"Win32 (forza)"
                              : L"auto (MFT se NTFS)") << L"\n\n";
 
-    bv::ScanController controller(options.caseSensitive);
+bv::ScanController controller(options.caseSensitive);
     bv::ScanReport report;
 
-    std::wcout << L"Enumerazione sorgente...\n";
+    if (!args.compareFrom.empty()) {
+        std::wcout << L"Caricamento snapshot...\n";
+    } else {
+        std::wcout << L"Enumerazione sorgente...\n";
+    }
+    if (!options.destination.empty()) {
+        std::wcout << L"Enumerazione destinazione + confronto...\n";
+    }
     report = controller.run(options);
-
-    std::wcout << L"Enumerazione destinazione + confronto...\n";
 
     PrintResults(report.results);
 
     std::wcout << L"Backend usato:        "
                << (report.backendUsed == bv::EnumeratorBackend::Mft ? L"MFT"
                     : report.backendUsed == bv::EnumeratorBackend::Win32 ? L"Win32"
-                                                                         : L"?") << L"\n";
+                                                                          : L"?") << L"\n";
+
+    if (report.usedSnapshot) {
+        std::wcout << L"Sorgente offline:     snapshot caricato (" << report.results.stats.sourceFiles
+                   << L" voci)\n";
+    }
+    if (report.snapshotWritten) {
+        std::wcout << L"Snapshot salvato:     " << options.snapshotOut << L"\n";
+    }
+    if (report.contentDegradedToSize) {
+        std::wcout << L"ATTENZIONE: lo snapshot non contiene impronte SHA-256: la verifica\n"
+                      L"           dei contenuti e stata abbassata al confronto per dimensione.\n";
+    }
+    if (report.exportWritten && !options.exportPath.empty()) {
+        std::wcout << L"Esportazione:        " << options.exportPath << L" ("
+                   << Group(report.results.problems.size()) << L" righe)\n";
+    } else if (!options.exportPath.empty()) {
+        std::wcout << L"Esportazione FALLITA: " << report.exportError << L"\n";
+    }
+    if (report.hashCacheHits > 0) {
+        std::wcout << L"Cache hash:          " << Group(report.hashCacheHits)
+                   << L" file non riletti\n";
+    }
 
     std::wcout << L"\nTempo totale:            " << FormatTime(report.secondsTotal) << L"\n";
     std::wcout << L"  - enum sorgente:       " << FormatTime(report.secondsEnumerateSource) << L"\n";
@@ -258,7 +346,8 @@ int MainImpl(int argc, wchar_t** argv) {
         std::wcout << L"\n=== PROBLEMI (prime " << n << L" di " << problems.size() << L") ===\n";
         const wchar_t* names[] = {
             L"IDENTICO", L"MANCANTE", L"EXTRA", L"DIM_DIVERSA",
-            L"CONTENUTO_DIVERSO", L"ERRORE_LETTURA", L"ACCESSO_NEGATO"};
+            L"CONTENUTO_DIVERSO", L"ERRORE_LETTURA", L"ACCESSO_NEGATO",
+            L"MODIFICATO_DURANTE_SCAN"};
         for (size_t i = 0; i < n; ++i) {
             const bv::FileResult& p = problems[i];
             const wchar_t* name = names[static_cast<int>(p.status)];

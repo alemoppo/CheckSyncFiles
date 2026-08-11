@@ -27,5 +27,10 @@ std::wstring AddLongPathPrefix(const std::wstring& abs);
 // Used as the key normalization for case-insensitive matching.
 std::wstring FoldForCompare(const std::wstring& s);
 
+// Wide (UTF-16 on Windows) <-> UTF-8 conversion via CP_UTF8, used by the
+// exporters and the binary snapshot / hash-cache formats.
+std::string ToUtf8(const std::wstring& w);
+std::wstring FromUtf8(const std::string& s);
+
 } // namespace pathutil
 } // namespace bv
