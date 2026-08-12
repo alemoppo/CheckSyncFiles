@@ -54,6 +54,7 @@ private:
     void startSnapshotScan();
     void stopScan();
     void onExportCsv();
+    void onLoadSnapshot();
     void workerThread(ScanOptions options);
     unsigned int threadToCount() const; // threadSel_ -> pool size (0 = auto)
 
@@ -100,6 +101,12 @@ private:
     bool lastUsedSnapshot_ = false;     // source side loaded from a snapshot
     std::wstring lastSnapshotPath_;
     std::wstring statusNote_;           // transient note (export/snapshot result)
+
+    // Offline comparison: pull the source index from a snapshot instead of
+    // enumerating the source device (which may be unplugged). When set, the
+    // source path field is disabled and the scan uses `compareFrom`.
+    bool useSnapshot_ = false;
+    std::wstring snapshotFile_;
 
     // render-state ----------------------------------------------------------
     bool dirty_ = true;

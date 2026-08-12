@@ -153,6 +153,10 @@ impronte si caricano dallo snapshot e si verifica la sola destinazione (utile qu
 primo dispositivo non è collegato). Se lo snapshot non contiene impronte, la verifica
 Contenuto viene **degradata a Dimensione** (segnalato esplicitamente).
 
+Lo stesso confronto offline è disponibile nella **GUI** con il pulsante **CARICA SNAP.**
+(il campo sorgente viene disabilitato e mostrato come `[snap] <file>`; un secondo clic
+ripristina la modalità online).
+
 ### Export CSV / JSON
 
 `--export <file>` scrive le voci non identiche dopo la scansione. Formato dedotto
@@ -230,12 +234,15 @@ Eseguibile GUI: `build_gui/src/bv_gui.exe`. All'avvio la GUI deve trovare le DLL
 SDL: aggiungere `C:\msys64\mingw64\bin` al PATH oppure copiarle accanto all'`.exe`.
 
 La GUI fa girare la scansione su un thread separato, mostra l'avanzamento, barra di
-progressione, pulsanti AVVIA / INTERROMPI / SNAPSHOT / ESPORTA CSV (Fase 5), la lista dei
-problemi filtrabile (Tutti / Identici / Mancanti / Extra / Dimensione / Contenuto / Errori)
-con scroll, il toggle case-sensitive e la scelta del **back-end di enumerazione**
-(Auto / Win32 / MFT). Il pulsante SNAPSHOT cattura l'indice della sola sorgente in un file
-binario; ESPORTA CSV salva le voci non identiche dell'ultima scansione (dialoghi di
-salvataggio Windows nativi).
+progressione, pulsanti AVVIA / INTERROMPI / SNAPSHOT / ESPORTA CSV / **CARICA SNAP.**
+(confronto offline), la lista dei problemi filtrabile (Tutti / Identici / Mancanti /
+Extra / Dimensione / Contenuto / Errori) con scroll, il toggle case-sensitive e la scelta
+del **back-end di enumerazione** (Auto / Win32 / MFT). Il pulsante SNAPSHOT cattura
+l'indice della sola sorgente in un file binario; ESPORTA CSV salva le voci non identiche
+dell'ultima scansione (dialoghi di salvataggio Windows nativi). CARICA SNAP. apre un
+dialogo di selezione e verifica la **sola destinazione** contro lo snapshot (la sorgente
+non viene letta): un secondo clic o la scelta di una sorgente con Sfoglia torna alla
+modalità online.
 
 ### Con Visual Studio / MSVC e CMake (Windows 11)
 

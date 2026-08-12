@@ -47,7 +47,7 @@ struct Layout {
     SDL_FRect sourceField, destField;
     SDL_FRect sourceBrowse, destBrowse;
 
-    SDL_FRect startBtn, stopBtn, snapBtn, exportBtn;
+    SDL_FRect startBtn, stopBtn, snapBtn, exportBtn, caricaBtn;
 };
 
 Layout ComputeLayout(int W, int H) {
@@ -86,6 +86,7 @@ Layout ComputeLayout(int W, int H) {
     L.stopBtn = {static_cast<float>(kMargin + 130), static_cast<float>(L.y5), 120.0f, 30.0f};
     L.snapBtn = {static_cast<float>(kMargin + 260), static_cast<float>(L.y5), 120.0f, 30.0f};
     L.exportBtn = {static_cast<float>(kMargin + 390), static_cast<float>(L.y5), 120.0f, 30.0f};
+    L.caricaBtn = {static_cast<float>(kMargin + 520), static_cast<float>(L.y5), 150.0f, 30.0f};
     return L;
 }
 
@@ -379,6 +380,45 @@ bool BrowseSaveFile(std::wstring& out, const wchar_t* defName) {
     return ok;
 }
 
+// Modal open-file dialog (modern Windows IFileOpenDialog, COM).
+bool BrowseOpenFile(std::wstring& out, const wchar_t* filterName, const wchar_t* filterSpec) {
+    HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    if (FAILED(hr) && hr != RPC_E_CHANGED_MODE) return false;
+
+    bool ok = false;
+    IFileOpenDialog* pfd = nullptr;
+    hr = CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER,
+                          IID_IFileOpenDialog, reinterpret_cast<void**>(&pfd));
+    if (SUCCEEDED(hr)) {
+        DWORD opts = 0;
+        pfd->GetOptions(&opts);
+        pfd->SetOptions(opts | FOS_FORCEFILESYSTEM | FOS_FILEMUSTEXIST | FOS_PATHMUSTEXIST);
+        COMDLG_FILTERSPEC filter{filterName, filterSpec};
+        pfd->SetFileTypes(1, &filter);
+        if (SUCCEEDED(pfd->Show(nullptr))) {
+            IShellItem* psi = nullptr;
+            if (SUCCEEDED(pfd->GetResult(&psi))) {
+                PWSTR path = nullptr;
+                if (SUCCEEDED(psi->GetDisplayName(SIGDN_FILESYSPATH, &path))) {
+                    out = path;
+                    CoTaskMemFree(path);
+                    ok = true;
+                }
+                psi->Release();
+            }
+        }
+        pfd->Release();
+    }
+    CoUninitialize();
+    return ok;
+}
+
+// Last path component (for showing a selected snapshot compactly).
+std::wstring BaseName(const std::wstring& p) {
+    const size_t pos = p.find_last_of(L"\\/");
+    return (pos == std::wstring::npos) ? p : p.substr(pos + 1);
+}
+
 } // namespace
 
 int AppUI::run() {
@@ -511,6 +551,9 @@ void AppUI::OnMouseDown(int mx, int my) {
         std::wstring picked;
         if (BrowseFolder(picked)) {
             source_ = picked;
+            useSnapshot_ = false; // manual source: back to live enumeration
+            snapshotFile_.clear();
+            statusNote_.clear();
             dirty_ = true;
         }
         return;
@@ -526,6 +569,7 @@ void AppUI::OnMouseDown(int mx, int my) {
 
     // Path fields: focus.
     if (hit(mx, my, L.sourceField)) {
+        if (useSnapshot_) return; // source field is disabled while offline
         sourceFocus_ = true;
         destFocus_ = false;
         SDL_StartTextInput(window_);
@@ -613,6 +657,10 @@ void AppUI::OnMouseDown(int mx, int my) {
         onExportCsv();
         dirty_ = true;
     }
+    if (hit(mx, my, L.caricaBtn) && !running) {
+        onLoadSnapshot();
+        dirty_ = true;
+    }
 
     // Filters.
     const int fr = 92;
@@ -671,7 +719,11 @@ void AppUI::OnTextInput(const char* text) {
 void AppUI::startScan() {
     std::lock_guard<std::mutex> lk(mtx_);
     if (running_) return;
-    if (source_.empty() || dest_.empty()) {
+    if (useSnapshot_) {
+        if (snapshotFile_.empty() || dest_.empty()) {
+            return;
+        }
+    } else if (source_.empty() || dest_.empty()) {
         return;
     }
 
@@ -706,7 +758,46 @@ void AppUI::startScan() {
         std::lock_guard<std::mutex> lk(mtx_);
         progress_ = p;
     };
+    if (useSnapshot_) {
+        // Offline comparison: the source index is loaded from the snapshot,
+        // the source device is not touched (options.source stays empty).
+        options.compareFrom = snapshotFile_;
+        progress_.phase = ScanPhase::CompareDestination; // no source pass
+    }
     worker_ = std::thread(&AppUI::workerThread, this, std::move(options));
+}
+
+// Toggle the offline comparison mode: load a snapshot (the source field is
+// then disabled and the scan uses "compareFrom"), or switch back to a live
+// source when a snapshot is already selected.
+void AppUI::onLoadSnapshot() {
+    std::lock_guard<std::mutex> lk(mtx_);
+    if (running_) return;
+
+    if (useSnapshot_) {
+        // Second click: back to a live source enumeration.
+        useSnapshot_ = false;
+        snapshotFile_.clear();
+        statusNote_ = L"Modalita online: sorgente da enumerare.";
+        dirty_ = true;
+        return;
+    }
+
+    if (sourceFocus_ || destFocus_) {
+        sourceFocus_ = destFocus_ = false;
+        SDL_StopTextInput(window_);
+    }
+
+    std::wstring file;
+    if (!BrowseOpenFile(file, L"Snapshot Backup Verifier (*.bin;*.bvs)", L"*.bin;*.bvs")) {
+        return; // user cancelled the dialog
+    }
+
+    snapshotFile_ = file;
+    useSnapshot_ = true;
+    source_.clear(); // the device is no longer needed
+    statusNote_ = L"Sorgente da snapshot. Impostare la destinazione e premere AVVIA.";
+    dirty_ = true;
 }
 
 void AppUI::startSnapshotScan() {
@@ -866,9 +957,15 @@ void AppUI::render() {
     // ---- Sorgente row ----
     DrawTextVCenter(renderer_, fontBody_, "Sorgente:", L.labelX, L.y1, kFieldH, kTextLo);
     FillRect(renderer_, L.fieldX, L.y1, L.fieldW, kFieldH, kField);
-    DrawRect(renderer_, L.fieldX, L.y1, L.fieldW, kFieldH, sourceFocus_ ? kAccent : kBorder);
-    DrawTextVCenter(renderer_, fontBody_, ToUtf8(source_), L.fieldX + 6, L.y1, kFieldH,
-                    kTextHi);
+    std::wstring srcText = source_;
+    RGBA srcCol = kTextHi;
+    if (useSnapshot_) {
+        srcText = L"[snap] " + BaseName(snapshotFile_);
+        srcCol = kTextLo;
+    }
+    DrawRect(renderer_, L.fieldX, L.y1, L.fieldW, kFieldH,
+             useSnapshot_ ? kBorder : (sourceFocus_ ? kAccent : kBorder));
+    DrawTextVCenter(renderer_, fontBody_, ToUtf8(srcText), L.fieldX + 6, L.y1, kFieldH, srcCol);
     float mx = 0, my = 0;
     SDL_GetMouseState(&mx, &my);
     const bool overSrcBrowse = hit(static_cast<int>(mx), static_cast<int>(my), L.sourceBrowse);
@@ -966,6 +1063,22 @@ void AppUI::render() {
     DrawTextCenterIn(renderer_, fontBold_, "ESPORTA CSV",
                      static_cast<int>(L.exportBtn.x), static_cast<int>(L.exportBtn.y),
                      static_cast<int>(L.exportBtn.w), static_cast<int>(L.exportBtn.h), kTextHi);
+
+    // ---- Button CARICA SNAP. (offline comparison) ----
+    const bool overCarica = !running && hit(static_cast<int>(mx), static_cast<int>(my), L.caricaBtn);
+    FillRect(renderer_, static_cast<int>(L.caricaBtn.x), static_cast<int>(L.caricaBtn.y),
+             static_cast<int>(L.caricaBtn.w), static_cast<int>(L.caricaBtn.h),
+             overCarica ? kAccentHover : (useSnapshot_ ? kAccent : kPanel));
+    DrawRect(renderer_, static_cast<int>(L.caricaBtn.x), static_cast<int>(L.caricaBtn.y),
+             static_cast<int>(L.caricaBtn.w), static_cast<int>(L.caricaBtn.h), kBorder);
+    {
+        std::wstring carLab = useSnapshot_ ? BaseName(snapshotFile_) : L"CARICA SNAP.";
+        if (carLab.size() > 14) carLab = L"..." + carLab.substr(carLab.size() - 11);
+        DrawTextCenterIn(renderer_, fontBold_, ToUtf8(carLab),
+                         static_cast<int>(L.caricaBtn.x), static_cast<int>(L.caricaBtn.y),
+                         static_cast<int>(L.caricaBtn.w), static_cast<int>(L.caricaBtn.h),
+                         kTextHi);
+    }
 
     // ---- Status ----
     std::wstring status = L"Pronto. Specificare sorgente e destinazione.";

@@ -65,6 +65,7 @@ ctest --test-dir build_gui --output-on-failure
 - **(F5) Cache hash** (`Hashing/HashCache.{h,cpp}`): chiave `(path assoluto, size, mtime)` separata da `\x01`; file binario magic `0x43485642` v1; chiave ricavata sul file corrente prima del lookup (hit sempre valido); cache corrotta ignorata con messaggio, mai bloccante. `--hash-cache <file>`. I hit sono contati con `std::atomic` nei worker (`ScanReport.hashCacheHits`).
 - **(F5) Export** (`Export/`): `ExportUtil` (token italiani `IDENTICO/MANCANTE/EXTRA/DIM_DIVERSA/CONTENUTO_DIVERSO/ERRORE_LETTURA/ACCESSO_NEGATO/MODIFICATO_DURANTE_SCAN`, `CsvEscape` RFC 4180, `JsonEscape` RFC 8259, `HexDigest`, `InferFormat` da estensione). `CsvExporter`: UTF-8 **con BOM** (Excel), colonne `status,path,size_source,size_destination,hash_source,hash_destination`. `JsonExporter`: array in streaming, nessuna BOM. `--export <file>` + `--export-format csv|json`. GUI: pulsanti **SNAPSHOT** e **ESPORTA CSV** con dialoghi di salvataggio (IFileSaveDialog/COM).
 - **(F5) Errori avanzati**: `Errors.h` → `IsDeviceDisconnectError()` (codici 59/64/67/995/1167/1222/1231/1236), `Win32Enumerator` segnala `ScanError.lostDevice` e **abortisce** l'enumerazione su disconnessione (ACCESS_DENIED SMB escluso). Nuovo `Status::ChangedDuringScan`: `FileComparator::HashOneSide` confronta la stat pre/post hash contro il valore dell'entry e segnala il file modificato tra enumerazione e verifica senza verdetto falso. `ComparisonResult` esteso con `hasHashSource/hasHashDest/hashSource/hashDest` e `Stats.changedDuringScan`; `PathUtil` con `ToUtf8/FromUtf8`.
+- **(GUI) Confronto offline**: pulsante **CARICA SNAP.** (`BrowseOpenFile`/`IFileOpenDialog`) imposta `AppUI.useSnapshot_` + `snapshotFile_`; la sorgente è caricata da snapshot (`ScanOptions.compareFrom`) e il campo sorgente è disabilitato. Secondo clic o scelta di una sorgente con **Sfoglia** → modalità online.
 - **README.md** completo — da aggiornare a ogni fase.
 
 ## 2. Bug già trovati e risolti (NON ripetere)
@@ -138,7 +139,7 @@ Il progetto va REALIZZATO a fasi (§22 della richiesta originale). Seguire quest
 
 ### FASE 2 — GUI SDL3 + progress + thread pool ✅ (COMPLETATA)
 - Completato: ThreadPool (`Threading/`), progress (enumeratore + ScanController, `--progress` CLI), Interrompi (flag atomico), GUI SDL3 (`UI/AppUI`, `main_gui.cpp`), integrazione CMake `BUILD_GUI` + `SDL3_ttf`.
-- Restano possibili migliorie GUI (non bloccanti): selettore cartelle via dialogo (IFileDialog/COM, non ancora implementato), posizionamento/scroll più raffinati.
+- I selettori a dialogo nativo sono già implementati: `BrowseFolder` (`IFileOpenDialog` con `FOS_PICKFOLDERS`) per Sorgente/Destinazione e `BrowseSaveFile` (`IFileSaveDialog`) per lo snapshot/export (nonché `BrowseOpenFile` per caricare uno snapshot). Restano solo rifiniture non bloccanti (posizionamento/scroll).
 
 ### FASE 3 — SHA-256 (verifica contenuti) ✅ (COMPLETATA)
 - Completato: hash via **Windows CNG BCrypt** (`Hashing/Sha256.cpp`), streaming a blocchi (offset 64-bit, file >4 GiB), pool di `HashWorker` riusando il **ThreadPool Fase 2**, accodamento dei file matched `path==path && size==size` in `FileComparator`, `Stats` con byte hashati + timing, velocità MB/s reali. `ScanMode::Content` = hash reale.
@@ -163,9 +164,15 @@ Il progetto va REALIZZATO a fasi (§22 della richiesta originale). Seguire quest
 > Test aggiunti: 8 (escaping CSV/JSON, round-trip snapshot, snapshot corrotto, offline
 > content, degrade a size, cache seconda run, changed-during-scan). **38/38 test verdi.**
 >
-> Possibili migliorie future (non bloccanti): GUI per confronto offline (pulire la
-> sorgente e selezionare uno snapshot), merge di snapshot incrementali, bucket/ordinamento
+> Possibili migliorie future (non bloccanti): merge di snapshot incrementali, bucket/ordinamento
 > dell'indice per ridurre la memoria sulle tree enormi.
+>
+> **Confronto offline in GUI (aggiunto dopo la Fase 5):** pulsante **CARICA SNAP.** sulla
+> barra dei bottoni (`BrowseOpenFile`/`IFileOpenDialog`). Una volta selezionato uno snapshot
+> BVSI, il campo sogente è disabilitato (`useSnapshot_`, mostra `[snap] <nomefile>`) e
+> l'AVVIA imposta `ScanOptions.compareFrom` al posto di enumerare il dispositivo: si
+> verifica la sola destinazione e i digest provengono dallo snapshot. Un secondo clic su
+> CARICA SNAP. (o la scelta di una sorgente con Sfoglia) ripristina la modalità online.
 
 A fine fase: aggiornare `README.md` + `HANDOFF.md` (barrare questa sezione come ✅),
 aggiungere test, tenere il suite verde (30 test), commit+push.
@@ -184,6 +191,11 @@ Nota: eseguire `build\tests\bv_tests.exe` **elevato** fa girare anche i test MFT
 
 ## 7. Cose da non dimenticare quando si riprende
 
+- **Toolchain attuale (macchina di oggi, differisce da quello originario):** `C:\msys64\ucrt64`
+  con **g++ 16.2.0** + **CMake 4.4.2** + **Ninja** + **SDL3/SDL3_ttf** installati via
+  `pacman -S mingw-w64-ucrt-x86_64-{cmake,ninja,sdl3,sdl3-ttf}` (il vecchio `mingw64/bin` è
+  vuoto; il toolchain è stato aggiornato con `pacman -Syu` a maggio 2026). Per la GUI usare
+  `-DCMAKE_CXX_COMPILER=C:/msys64/ucrt64/bin/g++.exe -DCMAKE_PREFIX_PATH=C:/msys64/ucrt64`.
 - L'ambiente ha **solo MinGW**, non MSVC. Per testare il build MSVC bisognerà installare Visual Studio Build Tools, ma i CMake sono già compatibili. Nota MSVC per la GUI: `find_package(SDL3/SDL3_ttf)` richiede che SDL3 sia raggiungibile (vcpkg o percorso manuale).
 - `BUILD_GUI` è `OFF` di default; usa SDL3 + SDL3_ttf già installati in mingw64. Avvio GUI: `build_gui\src\bv_gui.exe` (serve `C:\msys64\mingw64\bin` nel PATH per le DLL SDL).
 - Il testo richiesto in ORIGINALE è in italiano; la UI e i messaggi CLI sono già in italiano.
