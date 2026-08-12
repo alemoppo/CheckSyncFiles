@@ -860,6 +860,38 @@ TEST("export: csv escaping, BOM and hex digests", [] {
 
 TEST("export: json escaping and no BOM", [] {
     using namespace bv::exporting;
+    // Structural parser: brackets/braces balanced, strings closed, and NO
+    // trailing comma (a ',' followed by ']' or '}' is invalid RFC 8259).
+    const auto wellFormed = [](const std::string& s) -> bool {
+        std::vector<char> stack;
+        bool inStr = false;
+        for (size_t i = 0; i < s.size(); ++i) {
+            const char c = s[i];
+            if (inStr) {
+                if (c == '\\') { ++i; continue; }
+                if (c == '"') inStr = false;
+                continue;
+            }
+            if (c == '"') { inStr = true; continue; }
+            if (c == '{' || c == '[') {
+                stack.push_back(c);
+            } else if (c == '}' || c == ']') {
+                if (stack.empty()) return false;
+                const char open = stack.back();
+                if (open == '{' && c != '}') return false;
+                if (open == '[' && c != ']') return false;
+                stack.pop_back();
+            } else if (c == ',') {
+                size_t j = i + 1;
+                while (j < s.size() && (s[j] == ' ' || s[j] == '\n' || s[j] == '\t' ||
+                                        s[j] == '\r'))
+                    ++j;
+                if (j < s.size() && (s[j] == '}' || s[j] == ']')) return false;
+            }
+        }
+        return stack.empty() && !inStr;
+    };
+
     ResultSet r;
     {
         FileResult p;
@@ -869,6 +901,15 @@ TEST("export: json escaping and no BOM", [] {
         p.sizeDest = 5;
         r.problems.push_back(p);
     }
+    {
+        FileResult p;
+        p.status = Status::Extra;
+        p.relativePath = L"x\".txt";
+        p.hasHashSource = true;
+        for (int i = 0; i < 32; ++i) p.hashSource[i] = static_cast<uint8_t>(i);
+        r.problems.push_back(p);
+    }
+
     const std::wstring file = MakeTempDir() + L"\\out.json";
     std::wstring err;
     CHECK(WriteJson(file, r, err));
@@ -879,6 +920,18 @@ TEST("export: json escaping and no BOM", [] {
     // JSON escaping: quote, backslash, tab.
     CHECK(bytes.find("dir\\\\qu\\\"ote\\\\path\\tfile.bin") != std::string::npos);
     CHECK(bytes.find("\"size_source\":5,\"size_destination\":5") != std::string::npos);
+    // RFC 8259: generated document must be structurally valid and, in
+    // particular, must NOT end the last object with a trailing comma.
+    CHECK(wellFormed(bytes));
+    CHECK(bytes.find("},\n]") == std::string::npos);
+
+    // Empty problems: still a valid, empty JSON array.
+    ResultSet empty;
+    const std::wstring file2 = MakeTempDir() + L"\\out_empty.json";
+    CHECK(WriteJson(file2, empty, err));
+    const std::string bytes2 = ReadFileBytes(file2);
+    CHECK(wellFormed(bytes2));
+    CHECK(bytes2.find('{') == std::string::npos);
 });
 
 TEST("snapshot: index round-trip preserves entries, hashes and case policy", [] {

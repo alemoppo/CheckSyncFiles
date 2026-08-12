@@ -18,20 +18,24 @@ bool WriteJson(const std::wstring& filePath, const ResultSet& result, std::wstri
     }
 
     out << "[\n";
+    bool first = true;
     for (const FileResult& p : result.problems) {
+        // RFC 8259: no trailing comma -- separator goes between items only.
+        if (!first) out << ",\n";
+        first = false;
         out << "{\"status\":\"" << StatusToken(p.status)
             << "\",\"path\":\"" << JsonEscape(p.relativePath)
             << "\",\"size_source\":" << std::to_string(p.sizeSource)
             << ",\"size_destination\":" << std::to_string(p.sizeDest)
             << ",\"hash_source\":\"" << HexDigest(p.hasHashSource, p.hashSource)
             << "\",\"hash_destination\":\"" << HexDigest(p.hasHashDest, p.hashDest)
-            << "\"},\n";
+            << "\"}";
         if (!out.good()) {
             error = L"errore di scrittura durante l'esportazione JSON: " + filePath;
             return false;
         }
     }
-    out << "]\n";
+    out << "\n]\n";
 
     out.flush();
     if (!out.good()) {
