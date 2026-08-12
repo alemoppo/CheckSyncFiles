@@ -73,6 +73,14 @@ constexpr uint32_t kAttrEnd = 0xFFFFFFFF;
 constexpr uint64_t kMftHighestSystem = 23; // low band of volume metafiles
 constexpr uint32_t kIndxMagic = 0x58444E49u; // "INDX"
 constexpr uint64_t kMaxAttrData = 256ull << 20;
+// INDEX_BLOCK size is NOT a universal constant: it is the directory's own
+// $INDEX_ROOT index_block_size (value+0x08). On every NTFS volume this
+// project targets it is 4096 (1 cluster, 8 x 512-byte sectors), but the
+// parser reads it from the metadata instead of assuming it. 4096 is kept
+// only as a defensive fallback when the $INDEX_ROOT read is incomplete.
+constexpr size_t kIndexBlockSizeDefault = 4096;
+constexpr size_t kMinIndexBlockSize = 512;
+constexpr size_t kMaxIndexBlockSize = 256 * 1024;
 
 // Temporary debug aid: set BV_MFT_DEBUG=1 in the environment to trace every
 // point where the MFT scan bails out and why.
@@ -87,6 +95,21 @@ bool MftDebug() {
     do {                                      \
         if (MftDebug()) std::fprintf(stderr, __VA_ARGS__); \
     } while (0)
+
+// Optional opt-in ground-truth diagnostics, never part of normal operation:
+//   BV_MFT_DEBUG_FILE=<path>  appends one line
+//                             "indxBlocks=<n> indxChildrenFromBlocks=<m>"
+// to <path> at the end of every successful enumerate(). It exists so the
+// elevated regression test can assert that $INDEX_ALLOCATION leaf blocks were
+// really parsed and contributed directory children, i.e. that the scan did
+// not silently fall back to parent-pointer-only reconstruction. No output at
+// all unless the environment variable is set.
+std::wstring MftDiagFilePath() {
+    WCHAR buf[1024];
+    const DWORD n = GetEnvironmentVariableW(L"BV_MFT_DEBUG_FILE", buf, 1024);
+    if (n == 0 || n >= 1024) return std::wstring();
+    return buf;
+}
 
 // ---------------------------------------------------------------------------
 // NTFS primitive parsing
@@ -143,6 +166,49 @@ bool ApplyFixup(uint8_t* rec, size_t bufSize) {
         if (*p == usn) {
             *p = *reinterpret_cast<const uint16_t*>(rec + usOffset + 2u * i);
         }
+    }
+    return true;
+}
+
+// NTFS INDEX_BLOCK (INDX) multi-sector fixup. INDX records use the same USA
+// mechanism as FILE records -- the last 2 bytes of every 512-byte sector hold
+// the update sequence number (USN) on disk and the true bytes live in the
+// UPDATE_SEQUENCE_ARRAY at `usa_ofs` -- but the header layout is different
+// (INDEX_RECORD_HEADER, not FILE_RECORD_HEADER), so this must NOT reuse
+// ApplyFixup():
+//
+//   block+0x00 4  magic "INDX"
+//   block+0x04 2  usa_ofs (offset of the USA array)
+//   block+0x06 2  usa_count (words in the array: 1 USN + one per sector)
+//   block+0x08 8  lsn
+//   block+0x10 8  index block VCN
+//   block+0x18    INDEX_HEADER ("node": entries_offset, index_length, ...)
+//
+// Returns false (corrupt block) if any check fails: INDX magic mismatch (the
+// caller checks the same bytes), USA array out of the block bounds, missing
+// USN+replacement words for every sector, or a sector tail that does not
+// equal the USN. A corrupt INDEX_BLOCK must never be parsed: callers mark the
+// scan incomplete (== Win32 fallback) instead of silently skipping it.
+//
+// NOTE: this low-level INDX fixup is intentionally duplicated in
+// tools/mftdiag.cpp and tools/mftprobe.cpp (raw parsing for diagnostics);
+// keep the three copies in sync.
+bool UndoFixupIndexBlock(uint8_t* block, size_t blockSize, uint32_t bytesPerSector) {
+    if (blockSize < 48 || bytesPerSector < 1 || bytesPerSector > blockSize) return false;
+    if (blockSize % bytesPerSector != 0) return false;
+    const uint16_t usOffset = *reinterpret_cast<const uint16_t*>(block + 4);
+    const uint16_t usCount = *reinterpret_cast<const uint16_t*>(block + 6);
+    if (usOffset == 0 || (size_t)usOffset + (size_t)usCount * 2u > blockSize) return false;
+    const uint32_t sectors = blockSize / bytesPerSector;
+    if ((uint32_t)usCount < sectors + 1u) return false; // need the USN + one per sector
+
+    const uint16_t usn = *reinterpret_cast<const uint16_t*>(block + usOffset);
+    for (uint32_t i = 1; i <= sectors; ++i) {
+        const size_t pos = (size_t)i * bytesPerSector - 2u;
+        if (pos + 2 > blockSize) return false;
+        uint16_t* p = reinterpret_cast<uint16_t*>(block + pos);
+        if (*p != usn) return false; // block not fixup-protected as expected
+        *p = *reinterpret_cast<const uint16_t*>(block + usOffset + 2u * i);
     }
     return true;
 }
@@ -227,6 +293,7 @@ struct RecInfo {
     std::vector<IndexChild> children; // $I30 children resolved so far
     std::vector<uint8_t> idxRoot;     // copy of the resident $INDEX_ROOT value
     std::vector<uint8_t> idxAlloc;    // copy of the $INDEX_ALLOCATION attr header
+    uint32_t idxBlockSize = 0;        // index_block_size from $INDEX_ROOT (value+0x08)
     bool indexResolved = false;       // $I30 fully resolved (root + allocation)
 };
 
@@ -316,6 +383,12 @@ void ParseRecord(const uint8_t* rec, size_t bufSize, RecInfo& out) {
             const uint32_t valueLen = *reinterpret_cast<const uint32_t*>(a + 16);
             if (a + valueOff + valueLen <= end) {
                 out.idxRoot.assign(a + valueOff, a + valueOff + valueLen);
+                if (valueLen >= 16) {
+                    // $INDEX_ROOT header: indexed_attr_type@+0, collation@+4,
+                    // index_block_size@+8, clusters_per_index_block@+12.
+                    out.idxBlockSize =
+                        *reinterpret_cast<const uint32_t*>(a + valueOff + 8);
+                }
             }
         } else if (type == kAttrIndexAlloc) {
             // copy the whole attribute header (incl. the run map) because the
@@ -373,14 +446,46 @@ void ParseIndexRootValue(const std::vector<uint8_t>& v, std::vector<IndexChild>&
     ParseIndexNode(node, v.data() + v.size(), dst);
 }
 
-// Parse INDEX_BLOCK (INDX) data (the whole $INDEX_ALLOCATION stream).
-void ParseIndexAllocationData(const std::vector<uint8_t>& data,
-                              std::vector<IndexChild>& dst) {
-    for (size_t off = 0; off + 4096 <= data.size(); off += 4096) {
-        const uint8_t* b = data.data() + off;
-        if (*reinterpret_cast<const uint32_t*>(b) != kIndxMagic) continue;
-        ParseIndexNode(b + 16, b + 4096, dst);
+// Parse the whole $INDEX_ALLOCATION stream of a directory. The stream is
+// `data.size()` bytes made of INDEX_BLOCK records, each `blockSize` bytes
+// wide. blockSize comes from the directory's own $INDEX_ROOT
+// (index_block_size at value+0x08); the caller supplies it. On NTFS it is
+// almost always 4096 (1 cluster of 8 x 512-byte sectors), but it is read from
+// metadata, not assumed.
+//
+// Every INDX block carries a USA (multi-sector) fixup that must be undone
+// BEFORE parsing (UndoFixupIndexBlock). The node/INDEX_HEADER of a block sits
+// at block+0x18 -- right after the 24-byte INDEX_RECORD_HEADER -- NOT at
+// block+0x10, where the block VCN field lives (reading the VCN as the node
+// yields entries_offset 0/1 and silently parses nothing).
+//
+// DIFFERENT FROM $INDEX_ROOT: a resident $INDEX_ROOT value needs no separate
+// fixup, because it lives inside the FILE record whose own ApplyFixup() has
+// already restored its sector tails; and its node sits at value+0x10 (16-byte
+// INDEX_ROOT header: indexed_attr_type, collation, index_block_size,
+// clusters_per_index_block), not +0x18.
+//
+// A stream may legitimately contain UNUSED blocks: NTFS sizes $INDEX_ALLOCATION
+// in cluster multiples and leaves free blocks (no INDX magic, zeroed) interleaved
+// or at the tail for future growth. Those are skipped, NOT treated as corruption
+// (every large directory index has this slack). A block that carries INDX magic
+// but fails the USA fixup, however, is a genuinely corrupt USED block: parsing
+// it would read overwritten sector tails as index data.
+//
+// Returns SIZE_MAX when a fixup fails on an INDX block (corrupt: caller marks
+// the scan incomplete), else the number of INDX blocks parsed.
+size_t ParseIndexAllocationData(std::vector<uint8_t>& data, size_t blockSize,
+                                uint32_t bytesPerSector, std::vector<IndexChild>& dst) {
+    if (blockSize < kMinIndexBlockSize || blockSize > kMaxIndexBlockSize) return SIZE_MAX;
+    size_t blocks = 0;
+    for (size_t off = 0; off + blockSize <= data.size(); off += blockSize) {
+        uint8_t* b = data.data() + off;
+        if (*reinterpret_cast<const uint32_t*>(b) != kIndxMagic) continue; // unused/free block
+        if (!UndoFixupIndexBlock(b, blockSize, bytesPerSector)) return SIZE_MAX;
+        ParseIndexNode(b + 24, b + blockSize, dst); // INDEX_HEADER at block+0x18
+        ++blocks;
     }
+    return blocks;
 }
 
 // Read the full data of a non-resident attribute from its stored header copy.
@@ -495,14 +600,15 @@ bool MftEnumerator::enumerate(const std::wstring& root,
         BVDBG("mft[5] NTFS_VOLUME_DATA failed\\n");
         return false;
     }
-    const uint64_t segSize = vd.BytesPerFileRecordSegment;
+const uint64_t segSize = vd.BytesPerFileRecordSegment;
     const uint64_t cluster = vd.BytesPerCluster;
+    const uint32_t bytesPerSector = vd.BytesPerSector;
     const uint64_t mftStartBytes =
         static_cast<uint64_t>(vd.MftStartLcn.QuadPart) * vd.BytesPerCluster;
     const uint64_t mftBytes = static_cast<uint64_t>(vd.MftValidDataLength.QuadPart);
-    if (segSize == 0 || mftBytes == 0 || cluster == 0) {
+    if (segSize == 0 || mftBytes == 0 || cluster == 0 || bytesPerSector == 0) {
         CloseHandle(hVol);
-        BVDBG("mft[6] bad geometry seg=%llu mft=%llu clus=%llu\\n",(unsigned long long)segSize,(unsigned long long)mftBytes,(unsigned long long)cluster);
+        BVDBG("mft[6] bad geometry seg=%llu mft=%llu clus=%llu\n",(unsigned long long)segSize,(unsigned long long)mftBytes,(unsigned long long)cluster);
         return false;
     }
     // Force pending NTFS metadata to disk before the raw read; otherwise a
@@ -654,6 +760,9 @@ bool MftEnumerator::enumerate(const std::wstring& root,
 
     uint64_t files = 0;
     uint64_t dirs = 0;
+    // Opt-in ground-truth counters (see MftDiagFilePath below).
+    size_t diagIndexBlocks = 0;
+    size_t diagIndexChildren = 0;
 
     const auto isMetafile = [](uint64_t recNo, const std::wstring& nm) {
         return recNo <= kMftHighestSystem && !nm.empty() && nm[0] == L'$';
@@ -675,7 +784,17 @@ bool MftEnumerator::enumerate(const std::wstring& root,
                 if (!ReadNonResidentAttr(hVol, cluster, d.idxAlloc, data)) {
                     failIncomplete(L"directory $INDEX_ALLOCATION unreadable", dirRec);
                 } else {
-                    ParseIndexAllocationData(data, d.children);
+                    const size_t blk = (d.idxBlockSize >= kMinIndexBlockSize &&
+                                        d.idxBlockSize <= kMaxIndexBlockSize)
+                                           ? d.idxBlockSize
+                                           : kIndexBlockSizeDefault;
+                    const size_t parsed =
+                        ParseIndexAllocationData(data, blk, bytesPerSector, d.children);
+                    if (parsed == SIZE_MAX) {
+                        failIncomplete(L"directory $INDEX_ALLOCATION block corrupt", dirRec);
+                    } else {
+                        diagIndexBlocks += parsed;
+                    }
                 }
             }
             if (d.children.empty() && d.idxRoot.empty()) {
@@ -697,6 +816,7 @@ bool MftEnumerator::enumerate(const std::wstring& root,
             // be the DOS 8.3 short name and is not a reliable display name).
             const std::wstring recName = ChildNameOf(recs[cr], {dirRec, d.seq});
             kids.emplace(cr, ChildEntry{recName.empty() ? c.name : recName, true});
+            ++diagIndexChildren;
         }
         if (auto it = revChildren.find(dirRec); it != revChildren.end()) {
             for (uint32_t cr : it->second) {
@@ -757,6 +877,19 @@ bool MftEnumerator::enumerate(const std::wstring& root,
 
     (void)onError;
     CloseHandle(hVol);
+
+    // Opt-in ground-truth diagnostics (BV_MFT_DEBUG_FILE): report how many
+    // $INDEX_ALLOCATION blocks were parsed and how many children were sourced
+    // from directory indexes (as opposed to the parent-pointer union). Used
+    // by the elevated regression test; silent when the variable is not set.
+    if (const std::wstring diagPath = MftDiagFilePath(); !diagPath.empty()) {
+        if (FILE* f = _wfopen(diagPath.c_str(), L"a")) {
+            std::fprintf(f, "indxBlocks=%llu indxChildren=%llu\n",
+                         (unsigned long long)diagIndexBlocks,
+                         (unsigned long long)diagIndexChildren);
+            std::fclose(f);
+        }
+    }
     return !incomplete;
 }
 

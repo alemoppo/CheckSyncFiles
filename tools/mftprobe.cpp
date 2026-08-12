@@ -37,7 +37,7 @@ enum {
 };
 
 static uint64_t g_seg = 0u, g_mftStart = 0u, g_mftBytes = 0u;
-static DWORD g_cluster = 0;
+static DWORD g_cluster = 0, g_sector = 0;
 static HANDLE g_hVol = INVALID_HANDLE_VALUE;
 
 static uint64_t RefRecord(uint64_t r) { return r & 0xFFFFFFFFFFFFULL; }
@@ -77,6 +77,7 @@ static bool OpenVolume(wchar_t driveLetter) {
     g_mftStart = (uint64_t)vd.MftStartLcn.QuadPart * vd.BytesPerCluster;
     g_mftBytes = (uint64_t)vd.MftValidDataLength.QuadPart;
     g_cluster = vd.BytesPerCluster;
+    g_sector = vd.BytesPerSector;
     // Force pending NTFS metadata to disk so raw MFT reads are not stale.
     FlushFileBuffers(g_hVol);
     return g_seg > 0 && g_mftBytes > 0;
@@ -112,6 +113,32 @@ static bool ApplyFixup(uint8_t* rec, size_t n) {
         if (pos + 2 > n) break;
         uint16_t* p = (uint16_t*)(rec + pos);
         if (*p == usn) *p = *(uint16_t*)(rec + usOff + 2u * i);
+    }
+    return true;
+}
+
+// NTFS INDEX_BLOCK (INDX) multi-sector fixup -- IDENTICAL COPY of the low-level
+// logic in src/Filesystem/MftEnumerator.cpp and tools/mftdiag.cpp; keep the
+// three copies in sync. INDEX_BLOCK uses the same USA trick as FILE records
+// but with an INDEX_RECORD_HEADER (magic "INDX", usa_ofs@+4, usa_count@+6,
+// lsn@+8, vcn@+0x10), so it must not borrow ApplyFixup(). Returns false for a
+// corrupt block (out-of-bounds USA, missing USN/tail words, tail != USN).
+static bool UndoFixupIndexBlock(uint8_t* block, size_t blockSize, uint32_t bytesPerSector) {
+    if (blockSize < 48 || bytesPerSector < 1 || bytesPerSector > blockSize ||
+        blockSize % bytesPerSector != 0)
+        return false;
+    uint16_t usOffset = *(uint16_t*)(block + 4);
+    uint16_t usCount = *(uint16_t*)(block + 6);
+    if (usOffset == 0 || (size_t)usOffset + (size_t)usCount * 2u > blockSize) return false;
+    uint32_t sectors = blockSize / bytesPerSector;
+    if ((uint32_t)usCount < sectors + 1u) return false;
+    uint16_t usn = *(uint16_t*)(block + usOffset);
+    for (uint32_t i = 1; i <= sectors; ++i) {
+        size_t pos = (size_t)i * bytesPerSector - 2u;
+        if (pos + 2 > blockSize) return false;
+        uint16_t* p = (uint16_t*)(block + pos);
+        if (*p != usn) return false;
+        *p = *(uint16_t*)(block + usOffset + 2u * i);
     }
     return true;
 }
@@ -361,10 +388,16 @@ static void DumpDirIndex(const std::vector<uint8_t>& rec, const char* label) {
                  (rflags & 2) ? 1 : 0);
     std::wstring nm = FilenameOf(rec);
     std::wprintf(L"  %s name=[%ls]\n", label, nm.c_str());
+    uint32_t blkSizeOf = 0; // index_block_size from $INDEX_ROOT (value+0x08)
     WalkAttrs(rec.data(), rec.size(), [&](const Attr& at) {
         if (at.type == A_FILENAME && at.resident) PrintFileName(at.value, at.valueLen, "    fn");
         if (at.type == A_INDEX_ROOT && at.resident) {
             std::wprintf(L"  %s $INDEX_ROOT valueLen=%u\n", label, (unsigned)at.valueLen);
+            if (at.valueLen >= 16) {
+                // indexed_attr_type@+0, collation@+4, index_block_size@+8,
+                // clusters_per_index_block@+12
+                blkSizeOf = *(uint32_t*)(at.value + 8);
+            }
             if (at.valueLen >= 32) {
                 DumpIndexHeader(at.value + 16, "root");
                 DumpIndexEntries(at.value + 16, at.value + at.valueLen, "root");
@@ -374,13 +407,21 @@ static void DumpDirIndex(const std::vector<uint8_t>& rec, const char* label) {
             std::wprintf(L"  %s $INDEX_ALLOCATION present (non-resident)\n", label);
             std::vector<uint8_t> blocks;
             if (ReadNonResidentRuns(at, blocks)) {
-                // parse each 4096 index block
-                for (size_t off = 0; off + 4096 <= blocks.size(); off += 4096) {
-                    const uint8_t* b = blocks.data() + off;
-                    // INDEX_BLOCK header: magic@0, US@4.., VCN@12, then INDEX_HEADER@16
+                // block size from the directory's own $INDEX_ROOT; fall back to
+                // 4096 (the value NTFS uses on all supported volumes).
+                size_t bs = (blkSizeOf >= 512) ? blkSizeOf : 4096;
+                // parse each index block: USA fixup FIRST, then INDEX_HEADER at
+                // block+0x18 (NOT +0x10 where the block VCN field lives).
+                for (size_t off = 0; off + bs <= blocks.size(); off += bs) {
+                    uint8_t* b = blocks.data() + off;
                     if (*(uint32_t*)b != 0x58444E49u /*INDX*/) continue;
-                    DumpIndexHeader(b + 16, "alloc-block");
-                    DumpIndexEntries(b + 16, b + 4096, "alloc-block");
+                    if (!UndoFixupIndexBlock(b, bs, g_sector)) {
+                        std::wprintf(L"  %s  index block @%zu CORRUPT (fixup failed)\n",
+                                     label, off);
+                        continue;
+                    }
+                    DumpIndexHeader(b + 0x18, "alloc-block");
+                    DumpIndexEntries(b + 0x18, b + bs, "alloc-block");
                 }
             } else {
                 std::wprintf(L"  %s  (could not read index blocks)\n", label);

@@ -771,6 +771,52 @@ TEST("mft: controlled equivalence matrix (needs admin, else skipped)", [] {
 });
 
 // ---------------------------------------------------------------------------
+// Audit Issue 1 regression: a directory whose $I30 spills past the inline
+// $INDEX_ROOT must be read from its $INDEX_ALLOCATION leaf blocks (INDX, with
+// the USA multi-sector fixup undone before parsing). When elevated, the test
+// asserts MFT == Win32 AND that at least one allocation block was actually
+// parsed (BV_MFT_DEBUG_FILE ground-truth counter). Not elevated: skipped.
+// The diagnostic is opt-in and the scan itself must succeed with or without it.
+
+TEST("mft: large directory reads $INDEX_ALLOCATION blocks (needs admin)", [] {
+    const auto dir = MakeTempDir();
+    const std::wstring big = dir + L"\\bigdir";
+    fs::create_directories(big);
+    // ~300 entries with 90-char names in ONE directory: guaranteed > 4096 bytes
+    // of index data, forcing NTFS past the resident $INDEX_ROOT leaf.
+    std::wstring suffix(90, L'z');
+    for (int i = 0; i < 300; ++i) {
+        wchar_t buf[24];
+        wsprintfW(buf, L"f%04u", static_cast<unsigned>(i));
+        std::ofstream(fs::path(big) / (std::wstring(buf) + suffix + L".txt")).put('x');
+    }
+
+    RefSet win;
+    CHECK(EnumerateSet(dir, false, win));
+
+    const std::wstring dbg = dir + L"\\_mftdiag.txt";
+    SetEnvironmentVariableW(L"BV_MFT_DEBUG_FILE", dbg.c_str());
+    DeleteFileW(dbg.c_str());
+    RefSet mft;
+    const bool mftOk = EnumerateSet(dir, true, mft);
+    SetEnvironmentVariableW(L"BV_MFT_DEBUG_FILE", nullptr);
+    if (!mftOk) {
+        std::wcout << L"  mft non disponibile (processo non elevato), test saltato\n";
+        return;
+    }
+
+    const size_t diffs = CompareMftVsWin(L"large-indx", win, mft);
+    CHECK_MSG(diffs == 0, "mft vs win32 differ on large directory");
+
+    long indxBlocks = 0;
+    if (FILE* f = _wfopen(dbg.c_str(), L"r")) {
+        if (std::fscanf(f, "indxBlocks=%ld", &indxBlocks) != 1) indxBlocks = -1;
+        std::fclose(f);
+    }
+    CHECK_MSG(indxBlocks > 0, "$INDEX_ALLOCATION leaf blocks were not exercised");
+});
+
+// ---------------------------------------------------------------------------
 // Phase 5: export CSV/JSON, binary snapshot, hash cache, offline compare
 
 TEST("export: csv escaping, BOM and hex digests", [] {
