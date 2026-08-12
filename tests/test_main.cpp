@@ -26,6 +26,7 @@
 
 #include "Comparison/ScanMode.h"
 #include "Comparison/FileComparator.h"
+#include "Errors.h"
 #include "Export/CsvExporter.h"
 #include "Export/JsonExporter.h"
 #include "Filesystem/FileIndex.h"
@@ -260,6 +261,29 @@ public:
 };
 
 } // namespace
+
+TEST("errors: device-disconnect predicate is precise", [] {
+    using bv::IsDeviceDisconnectError;
+    // The abandon-storage codes 59/64/67/995/1167/1222/1231/1236 must abort.
+    CHECK(IsDeviceDisconnectError(59));
+    CHECK(IsDeviceDisconnectError(64));
+    CHECK(IsDeviceDisconnectError(67));
+    CHECK(IsDeviceDisconnectError(995));   // ERROR_OPERATION_ABORTED
+    CHECK(IsDeviceDisconnectError(1167));
+    CHECK(IsDeviceDisconnectError(1222));
+    CHECK(IsDeviceDisconnectError(1231));
+    CHECK(IsDeviceDisconnectError(1236));
+    // Everyday, non-fatal errors must NEVER abort the scan as "device gone":
+    // ACL denial, missing entry, bad parameter, sharing violation, and the
+    // benign end-of-directory sentinel.
+    CHECK(!IsDeviceDisconnectError(2));   // ERROR_FILE_NOT_FOUND
+    CHECK(!IsDeviceDisconnectError(3));   // ERROR_PATH_NOT_FOUND
+    CHECK(!IsDeviceDisconnectError(5));   // ERROR_ACCESS_DENIED
+    CHECK(!IsDeviceDisconnectError(32));  // ERROR_SHARING_VIOLATION
+    CHECK(!IsDeviceDisconnectError(53));  // ERROR_BAD_NETPATH
+    CHECK(!IsDeviceDisconnectError(87));  // ERROR_INVALID_PARAMETER
+    CHECK(!IsDeviceDisconnectError(0));
+});
 
 TEST("cli: strict numeric parsing rejects junk and overflow", [] {
     using bv::util::ParseThreadCount;
