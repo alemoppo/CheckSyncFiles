@@ -18,18 +18,21 @@ Il progetto è un **repository git inizializzato** e pushato su `github.com/alem
 (branch `main`, commit di base `413c066`); i dir build sono in `.gitignore`. Dopo ogni task:
 `git add -A && git commit -m "..." && git push`.
 
-Build pulita (`-Wall -Wextra`, 0 warning), **38/38 test passati** in modalità normale
-(ctest verde; i 2 test relativi ad access-denied falliscono solo se il processo è elevato,
-dove il deny è simulato male). I 2 test **MFT** passano se il processo è **elevato**,
-altrimenti vengono saltati (fallback Win32).
+Build pulita (`-Wall -Wextra`, 0 warning), **39/39 test passati** in modalità normale
+(ctest verde; i 2 test relativi ad access-denied/cache falliscono solo se il processo è elevato,
+dove il deny è simulato male / l'antivirus interferisce). I test **MFT** (3) passano se il
+processo è **elevato**, altrimenti vengono saltati (fallback Win32). Aggiunto il test
+**"mft: controlled equivalence matrix"**: 7 fixture (stress 100 dir/5000 file, deep-nested,
+unicode, >4GiB sparse, empty-dirs, hardlinks, reuse create→delete→recreate) confrontate
+MFT vs Win32 **con 0 differenze** su tutti i punti (verificato elevato).
 
 - Toolchain reale qui: **MinGW-w64 g++ 16.1.0 + CMake 4.3.2 + Ninja** (NON c'è MSVC installato).
 - Directory di lavoro: `C:\Users\alemo\Documents\Agentic\CheckSyncFiles`
 - **`build/`**: build CLI/tests/tool (`BUILD_GUI=OFF`).
 - **`build_gui/`**: build con GUI (`BUILD_GUI=ON`, `CMAKE_PREFIX_PATH=C:/msys64/mingw64`).
 - Eseguibili: `build\src\bv_cli.exe`, `build_gui\src\bv_gui.exe`, `build\tests\bv_tests.exe`, `build\tests\bv_testgen.exe`. La GUI richiede SDL3.dll/SDL3_ttf.dll sul PATH (sono in `C:\msys64\mingw64\bin`).
-- Tool MFT: `build\tests\bv_mftbench.exe` (correttezza + timing), `build\tests\bv_mftprobe.exe` (diagnostica record).
-- I tool MFT e i test MFT richiedono un processo **elevato** (UAC). Script riutilizzabili in `C:\Users\alemo\AppData\Local\Temp\opencode\` (`elev_run.ps1`, `elev_run_tests.ps1`, `elev_run_cli.ps1`).
+- Tool MFT: `build\tests\bv_mftbench.exe` (correttezza + timing), `build\tests\bv_mftprobe.exe` (diagnostica record), `build\tests\bv_mftdiag.exe` (confronto MFT vs Win32 su volume reale + probe a 11 punti, nuovo).
+- I tool MFT e i test MFT richiedono un processo **elevato** (UAC). Script riutilizzabili in `C:\Users\alemo\AppData\Local\Temp\opencode\` (`elev_run.ps1`, `elev_run_tests.ps1`, `elev_run_cli.ps1`, `mftdiag_elev.cmd`, `mftbench_real_elev.cmd`, `mft_matrix_elev.cmd`).
 
 **Comandi:**
 ```powershell
@@ -60,7 +63,7 @@ ctest --test-dir build_gui --output-on-failure
 - **(F2) Interrompi**: `ScanOptions.cancel` (flag atomico) propagato in `FileIndex::build` e `FileComparator::run` (early-stop per-voce); il worker della GUI ne esce pulito.
 - **(F2) GUI SDL3** (`src/UI/AppUI.{h,cpp}`, `UI/Utf.{h,cpp}`, `main_gui.cpp`): finestra SDL3, font via SDL3_ttf, campi Sorgente/Destinazione a testo, radio modalità, selezione thread (Auto/1/2/4/8/16), toggle **case-sensitive**, scelta **back-end** (Auto/Win32/MFT), bottoni AVVIA/INTERROMPI, riga di stato, barra di avanzamento indeterminata, filtri risultati (Tutti/Identici/Mancanti/Extra/Dimensione/Contenuto/Errori), lista risultati con scroll+a righe alternate, barra riepilogo. Modello di threading: UI sul main thread, scan su worker; progress+risultato copiati sotto mutex. `run()` fa `join()` del worker al close (niente detach → niente use-after-free).
 - **(F3) Hashing**: `Hashing/Sha256.cpp` via Windows CNG (`BCrypt`) in streaming a blocchi; `ScanController`/`FileComparator` accodano i file matched path==path && size==size e li hashano con un pool di `HashWorker`; `Stats` espone byte hashati + timing; velocità MB/s reali.
-- **(F4) MFT scanner** (`Filesystem/MftEnumerator.{h,cpp}`): legge la MFT raw via il record 0 (`$MFT`) decodificandone i **data-run** (la MFT è frammentata, `MftStartLcn` = solo primo extent); directory/reparse dai flag di header record (`rec+22`); dimensione da `$DATA`; record non "in use" scartati. Selezione backend in `ScanController` (Auto/Win32/Mft) con fallback automatico.
+- **(F4) MFT scanner** (`Filesystem/MftEnumerator.{h,cpp}`): legge la MFT raw via il record 0 (`$MFT`) decodificandone i **data-run** (la MFT è frammentata, `MftStartLcn` = solo primo extent); ricostruzione **top-down** degli indici `$I30` (root inline + INDX block via data-run) con union dei parent-pointer, validazione **sequence** su ogni FILE_REFERENCE, nome da `$FILE_NAME` con priorità namespace **WIN32**, dimensione da `$DATA`, root via `FILE_ID_INFO`, metafile band ≤23 esclusa, `enumerate()` `false` se incompleta → fallback Win32 pulito in `ScanController`. Backend selezionabile (Auto/Win32/Mft).
 - **(F5) Snapshot binario** (`Filesystem/FileIndexSerializer.{h,cpp}`): format compatto **BVSI** v1 (magic `0x49535642`, little-endian, path UTF-8, per-entry: size/mtime/FILETIME/attributes/fileId/isDirectory + digest SHA-256 opzionale). `--snapshot-out <file>` cattura l'indice sorgente; in modalità Contenuto la sorgente è hashatta PRIMA (i digest riutilizzati dal confronto live, niente doppia lettura) e lo snapshot li incorpora. `--compare <snapshot>` carica l'indice senza toccare il primo device: `FileComparator` in costruttore **offline** (senza sourceRoot) usa solo i digest salvati. Snapshot senza digest → verifica Contenuto **degradata a Dimensione** (`contentDegradedToSize`, `modeUsed` aggiornato).
 - **(F5) Cache hash** (`Hashing/HashCache.{h,cpp}`): chiave `(path assoluto, size, mtime)` separata da `\x01`; file binario magic `0x43485642` v1; chiave ricavata sul file corrente prima del lookup (hit sempre valido); cache corrotta ignorata con messaggio, mai bloccante. `--hash-cache <file>`. I hit sono contati con `std::atomic` nei worker (`ScanReport.hashCacheHits`).
 - **(F5) Export** (`Export/`): `ExportUtil` (token italiani `IDENTICO/MANCANTE/EXTRA/DIM_DIVERSA/CONTENUTO_DIVERSO/ERRORE_LETTURA/ACCESSO_NEGATO/MODIFICATO_DURANTE_SCAN`, `CsvEscape` RFC 4180, `JsonEscape` RFC 8259, `HexDigest`, `InferFormat` da estensione). `CsvExporter`: UTF-8 **con BOM** (Excel), colonne `status,path,size_source,size_destination,hash_source,hash_destination`. `JsonExporter`: array in streaming, nessuna BOM. `--export <file>` + `--export-format csv|json`. GUI: pulsanti **SNAPSHOT** e **ESPORTA CSV** con dialoghi di salvataggio (IFileSaveDialog/COM).
@@ -87,6 +90,42 @@ ctest --test-dir build_gui --output-on-failure
 6. **Record non "in use"**: i record `FILE` deleted/stantii hanno ancora un `$FILE_NAME` parsabile → l'MFT enumerator contava 1 voce in più della realtà (es. 401 vs 400). **FIX**: scartare i record con flag header bit 0x0001 (`rec+22`) non impostato.
 7. **Directory via `$FILE_NAME` fileAttributes**: il campo fileAttributes del `$FILE_NAME` (offset 56) risultava 0 per le directory → `dir=0`. **FIX**: leggere directory/reparse dai **flag di header del record** (`rec+22`, bit 1 = dir, bit 2 = reparse) — fonte affidabile.
 8. **Dimensione di `$FILE_NAME`**: `realSize` nel `$FILE_NAME` (offset 48) è 0 per file creati con `SetEndOfFile` (i dati stanno in `$DATA`). **FIX**: dimensione dall'attributo **`$DATA`** (residente `contentLen` @16, non-residente `realSize` @48).
+
+### MFT v2 (rivisto, NON ripetere)
+9. **La catena bottom-up dai soli parent-pointer era sbagliata su volume reale**: su
+   `C:\Users\alemo\AppData\Local\Temp` il parser v1 falliva su molti path. **FIX v2**:
+   ricostruzione **top-down** percorrendo gli indici `$I30` di ogni directory (root inline
+   in `$INDEX_ROOT`, INDX block da `$INDEX_ALLOCATION` tramite data-run; la stessa
+   struttura che usa `FindFirstFileW`), con la union dei parent-pointer come fonte
+   ridondante. Vedi `README.md` §1.
+10. **Nomi 8.3 nell'$I30**: la stessa directory stante `$I30` misura lo stesso record con
+    chiave WIN32 (es. `256.15MB.7z`) e chiave DOS (es. `255C81~1.TMP`). Usare la key
+    dell'indice come nome visuale produce path spuri. **FIX**: il nome viene preso dal
+    **`$FILE_NAME` del record figlio** (namespace WIN32 preferito, vedi sotto), la key
+    serve solo a matchare il record.
+11. **Namespace `$FILE_NAME`**: scegliere il nome per il path con priorità
+    **WIN32 (ns==1)**, fallback **WIN32+DOS (ns==3)**, mai DOS (2) né POSIX (0).
+    Documentato; i nomi DOS finiscono solo come chiave di esistenza, mai nel path.
+12. **Sequence number**: la `FILE_REFERENCE` = record_number (48 bit) + **sequence (16
+    bit)** non è mai un indice. Si valuta `parent.seq == parent_reference.seq` per ogni
+    `$FILE_NAME` e per i figli dell'$I30; una ref **stale** (seq non combacia) viene
+    scartata/classificata → la scansione segnala incomplete, non produce path falsi.
+13. **Scala a 5 record fixation root** (avvenuti, NON ripetere): l'invariant
+    self-parent (`parent==self`) vale **solo** per la root del volume (record 5), non per
+    una root arbitraria; una root passata dall'utente si risolve via `FILE_ID_INFO`/Win32
+    (record più seq, `GetFileInformationByHandleEx`) e si verifica il solo seq match del
+    self-parent quando la root è il record 5. `$INDEX_ROOT` viene copiato (non
+    puntato) prima del parse dei data-run.
+14. **Metafile non utente**: la banda record ≤ 23 ($MFT, $LogFile, ...) è esclusa; i
+    record non "in use" restano i soli eliminati (v. §2 punto 6).
+15. **`enumerate()` ritorna `false` se incompleta** (ma la ricostruzione resta utile
+    anche su scansioni parziali). `ScanController` già gestisce il `false` con
+    `runWithFallback`: il FileIndex parziale viene scartato e ricostruito da zero col
+    fallback Win32 — il messaggio di incomplete finisce negli errori. **Nessuna scansione
+    parziale silenziosa**; il backend MFT non deve mai sembrare valida quando non lo è.
+16. **Debug**: `BV_MFT_DEBUG=1` in ambiente fa stampare (stderr) il motivo di ogni
+    bail-out (`mft[1..10]`); disattivata di default, è una modalità diagnostica
+    permanente e non produce rumore.
 
 ### Offsets NTFS verificati (usare questi)
 - Record MFT header: seq @16, flags @22 (bit0x01 in-use, 0x02 dir, 0x04 reparse), first-attr @20, record size @28, signature "FILE" 0x454C4946, fixup USN; sectors = recordSize/512.
@@ -128,7 +167,7 @@ src/
   Threading/ ThreadPool.h/.cpp, IoClass.h
   UI/ AppUI.h/.cpp, Utf.h/.cpp
 tests/ TestHarness.h, TestTree.h/.cpp, test_main.cpp, CMakeLists.txt
-tools/ testgen.cpp, mftbench.cpp, mftprobe.cpp
+tools/ testgen.cpp, mftbench.cpp, mftprobe.cpp, mftdiag.cpp
 ```
 
 ---
@@ -183,7 +222,7 @@ aggiungere test, tenere il suite verde (30 test), commit+push.
 
 File modificato durante scansione; percorsi UNC reali; NTFS vs non-NTFS; "milioni di entry simulate" (es. `--stress` con N grande e misura tempo/memoria); benchmark MFT vs Win32. Mantenere i test esistenti verdi mentre si refactora.
 
-Già coperti (38 totali): ThreadPool (drain/parallelismo/latch deterministico/0 thread/dtr), IoClass, progress (`onProgress` → file + fase Done), cancel (pre-set ferma subito), ioclasse, **MFT** (`IsSupported` su NTFS + enumerazione MFT == Win32, saltata se non elevato), **export CSV/JSON** (escaping, BOM, digest hex), **snapshot** (round-trip con hash + case policy, file corrotto rifiutato), **offline** (content contro snapshot, degrade a Size), **cache hash** (seconda run senza rilettura), **changed-during-scan** (stat pre/post hash).
+Già coperti (39 totali): ThreadPool (drain/parallelismo/latch deterministico/0 thread/dtr), IoClass, progress (`onProgress` → file + fase Done), cancel (pre-set ferma subito), ioclasse, **MFT** (`IsSupported` su NTFS + enumerazione MFT == Win32 + **matrice di equivalenza controllata**, saltati se non elevato), **export CSV/JSON** (escaping, BOM, digest hex), **snapshot** (round-trip con hash + case policy, file corrotto rifiutato), **offline** (content contro snapshot, degrade a Size), **cache hash** (seconda run senza rilettura), **changed-during-scan** (stat pre/post hash).
 
 Nota: eseguire `build\tests\bv_tests.exe` **elevato** fa girare anche i test MFT; senza elevazione risultano "sostanzialmente saltati" (fallback Win32). Con il processo elevato i 2 test "access denied"/"content mode" falliscono solo perché il deny/accesso non viene simulato bene da admin — non è un bug del codice MFT.
 

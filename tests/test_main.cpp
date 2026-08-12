@@ -9,12 +9,15 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <map>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <vector>
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <winioctl.h>
 
 #include <atomic>
 #include <array>
@@ -632,6 +635,139 @@ TEST("mft: enumeration matches Win32 (needs admin, else skipped)", [] {
         std::sort(b.begin(), b.end());
         CHECK(a == b);
     }
+});
+
+// ---------------------------------------------------------------------------
+// MFT back-end equivalence matrix (Phase 4 investigate-and-verify).
+// When run elevated, both back-ends must produce the exact same index on the
+// controlled fixtures below: same file/dir counts, and no path that exists on
+// one side only -- nor size/type mismatches. Not elevated: skipped.
+
+namespace {
+
+using RefEntry = std::pair<uint64_t, bool>; // size, isDir
+using RefSet = std::map<std::wstring, RefEntry>;
+
+bool EnumerateSet(const std::wstring& root, bool useMft, RefSet& out) {
+    std::unique_ptr<IFileEnumerator> en =
+        useMft ? std::unique_ptr<IFileEnumerator>(new MftEnumerator())
+               : std::unique_ptr<IFileEnumerator>(new Win32Enumerator());
+    const bool ok = en->enumerate(
+        root, [&](FileEntry&& e) {
+            out[e.relativePath] = RefEntry{e.size, e.isDirectory};
+            return true;
+        },
+        [](const ScanError&) {});
+    return ok;
+}
+
+// Prints and returns the number of differences; win/mft are the two sets.
+size_t CompareMftVsWin(const std::wstring& label, RefSet& win, RefSet& mft) {
+    size_t wFiles = 0, wDirs = 0, mFiles = 0, mDirs = 0, onlyW = 0, onlyM = 0, mism = 0;
+    for (const auto& kv : win) { (kv.second.second ? wDirs : wFiles)++; }
+    for (const auto& kv : mft) { (kv.second.second ? mDirs : mFiles)++; }
+    auto iw = win.begin();
+    auto im = mft.begin();
+    while (iw != win.end() || im != mft.end()) {
+        if (im == mft.end() || (iw != win.end() && iw->first < im->first)) {
+            ++onlyW;
+            ++iw;
+        } else if (iw == win.end() || im->first < iw->first) {
+            ++onlyM;
+            ++im;
+        } else {
+            if (iw->second != im->second) ++mism;
+            ++iw;
+            ++im;
+        }
+    }
+    std::wcout << L"  [" << label << L"] win files=" << wFiles << L" dirs=" << wDirs
+               << L" mft files=" << mFiles << L" dirs=" << mDirs << L" onlyWin=" << onlyW
+               << L" onlyMft=" << onlyM << L" size/typeMismatch=" << mism << L"\n";
+    return onlyW + onlyM + mism;
+}
+
+} // namespace
+
+TEST("mft: controlled equivalence matrix (needs admin, else skipped)", [] {
+    bool any = false;
+    const auto checkRoot = [&](const std::wstring& label, const std::wstring& root) {
+        RefSet win, mft;
+        if (!EnumerateSet(root, false, win)) return;   // win32 must always work
+        const bool mftOk = EnumerateSet(root, true, mft);
+        if (!mftOk) {
+            std::wcout << L"  [" << label << L"] mft non disponibile (processo non elevato?)\n";
+            return;
+        }
+        any = true;
+        const size_t diffs = CompareMftVsWin(label, win, mft);
+        CHECK_MSG(diffs == 0, "mft vs win32 have differences");
+    };
+
+    // Test 1 -- simple volume: 100 directories, 5000 files.
+    {
+        const auto dir = MakeTempDir();
+        testgen::CreateStressTree(dir, 5000);
+        checkRoot(L"stress-100x5000", dir);
+    }
+    // Test 2 -- nested directories A/B/C/D.
+    {
+        const auto dir = MakeTempDir();
+        testgen::CreateDeepPath(dir, 4, L"deep.txt");
+        checkRoot(L"deep-nested", dir);
+    }
+    // Test 3 -- unicode names (accents, CJK, emoji).
+    {
+        const auto dir = MakeTempDir();
+        const std::wstring names[] = {L"à è ì ò ù.txt", L"日本語.txt", L"中文.txt",
+                                      L"emoji🙂.txt"};
+        for (const auto& n : names) {
+            std::ofstream(fs::path(dir) / n).put('x');
+        }
+        checkRoot(L"unicode", dir);
+    }
+    // Test 4 -- larger than 4 GiB (sparse): size must round-trip from $DATA.
+    {
+        const auto dir = MakeTempDir();
+        const std::wstring big = dir + L"\\big.sparse";
+        HANDLE hb = CreateFileW(big.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                                FILE_ATTRIBUTE_SPARSE_FILE, nullptr);
+        if (hb != INVALID_HANDLE_VALUE) {
+            LARGE_INTEGER li;
+            li.QuadPart = 4LL * 1024 * 1024 * 1024 + 17; // >4GiB
+            SetFilePointerEx(hb, li, nullptr, FILE_BEGIN);
+            SetEndOfFile(hb);
+            CloseHandle(hb);
+        }
+        checkRoot(L"large->4GiB", dir);
+    }
+    // Test 7 -- empty directories are preserved.
+    {
+        const auto dir = MakeTempDir();
+        fs::create_directories(dir + L"\\empty1");
+        fs::create_directories(dir + L"\\a\\empty2");
+        checkRoot(L"empty-dirs", dir);
+    }
+    // Test 6 -- hard links: one record, two paths.
+    {
+        const auto dir = MakeTempDir();
+        fs::create_directories(dir + L"\\l1");
+        fs::create_directories(dir + L"\\l2");
+        const std::wstring target = dir + L"\\l1\\data.txt";
+        std::ofstream(fs::path(target)).put('x');
+        CreateHardLinkW((dir + L"\\l2\\alias.txt").c_str(), target.c_str(), nullptr);
+        checkRoot(L"hardlinks", dir);
+    }
+    // Test 5 -- record reuse: create, delete, recreate (same paths).
+    {
+        const auto dir = MakeTempDir();
+        testgen::CreateStressTree(dir, 800);
+        RemoveAllWin(dir);
+        fs::create_directories(dir);
+        testgen::CreateStressTree(dir, 800);
+        checkRoot(L"reuse-800", dir);
+    }
+    (void)any;
 });
 
 // ---------------------------------------------------------------------------

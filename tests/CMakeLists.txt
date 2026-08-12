@@ -14,6 +14,8 @@ if(BUILD_TESTGEN)
   target_link_libraries(bv_mftbench PRIVATE bv_testtree shell32)
   add_executable(bv_mftprobe ../tools/mftprobe.cpp)
   target_link_libraries(bv_mftprobe PRIVATE shell32)
+  add_executable(bv_mftdiag ../tools/mftdiag.cpp)
+  target_link_libraries(bv_mftdiag PRIVATE bv_testtree shell32)
 endif()
 
 add_test(NAME unit COMMAND bv_tests)

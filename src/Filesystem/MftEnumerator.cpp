@@ -1,6 +1,7 @@
 #include "MftEnumerator.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <unordered_map>
 #include <vector>
 
@@ -14,12 +15,51 @@
 #include <windows.h>
 #include <winioctl.h>
 
-// Phase 4 NTFS MFT scan. Reads the raw $MFT region (located via
-// FSCTL_GET_NTFS_VOLUME_DATA at MftStartLcn*BytesPerCluster spanning
-// MftValidDataLength) and reconstructs the subtree rooted at `root`, filling
-// FileEntry.fileId with the MFT record number. Requires admin privileges.
-// Best-effort: any unsupported/unreadable condition returns false so the caller
-// falls back to Win32Enumerator without ever producing a wrong result.
+// Phase 4 NTFS MFT scan (v2).
+//
+// Reads the raw $MFT once (located via FSCTL_GET_NTFS_VOLUME_DATA at
+// MftStartLcn*BytesPerCluster spanning MftValidDataLength, accessed through
+// the $MFT data-run map because the MFT is usually fragmented) and
+// reconstructs the subtree rooted at `root`.
+//
+// v2 reconstruction model (differs from v1, which trusted each record's
+// $FILE_NAME parent pointer chain bottom-up):
+//
+//   * File references are treated as { record_number, sequence_number }. The
+//     sequence is validated against the live record at every hop. A reference
+//     whose sequence does not match the current record is a STALE reference
+//     (the target record was deleted and reused) and is never trusted.
+//
+//   * Directory membership is walked TOP-DOWN from the root using each
+//     directory's own $I30 index ($INDEX_ROOT inline entries + $INDEX_ALLOCATION
+//     INDX blocks). The $I30 index is exactly the structure the filesystem
+//     exposes to FindFirstFileW, so a child present in the directory index is,
+//     by construction, the set Win32 enumeration reports. Rebuilding from the
+//     index no longer depends on the child's parent pointer being intact: a
+//     file whose $FILE_NAME parent reference is stale/broken is still found
+//     because its directory index entry survives.
+//
+//   * Parent pointers are used as a redundant union source: a record whose
+//     win32 $FILE_NAME references directory D (with matching sequence) is
+//     emitted as a child of D even if D's index did not list it. Index entries
+//     are authoritative; chain links only add.
+//
+//   * Every $FILE_NAME attribute is parsed. Namespace is respected: the
+//     shell-visible path uses namespace 1 (WIN32), falling back to 3 (WIN32+DOS);
+//     DOS 8.3 short names (namespace 2) and the POSIX internal name (0) are not
+//     used for the output path. A record with several $FILE_NAME attributes in
+//     different directories is a hard link: each (parent,name) pair becomes a
+//     distinct output path (our FileIndex is one-entry-per-path).
+//
+//   * Incompleteness is signalled honestly: if a child listed in a subtree
+//     directory's $I30 index cannot be resolved (record out of range, not in
+//     use, or sequence mismatch), or a directory's $INDEX_ALLOCATION exists but
+//     cannot be read, enumerate() returns false and the caller must fall back
+//     to Win32Enumerator. A partial index is never reported as a successful
+//     scan.
+//
+// FileEntry.fileId is filled with the MFT record number. Requires an elevated
+// process (raw volume access). Read-only.
 
 namespace bv {
 
@@ -27,21 +67,39 @@ namespace {
 
 constexpr uint32_t kAttrFileName = 0x30;   // NTFS_ATTR_FILENAME
 constexpr uint32_t kAttrData = 0x80;       // NTFS_ATTR_DATA
+constexpr uint32_t kAttrIndexRoot = 0x90;  // NTFS_ATTR_INDEX_ROOT
+constexpr uint32_t kAttrIndexAlloc = 0xA0; // NTFS_ATTR_INDEX_ALLOCATION
 constexpr uint32_t kAttrEnd = 0xFFFFFFFF;
 constexpr uint64_t kMftHighestSystem = 23; // low band of volume metafiles
-constexpr uint64_t kNoParent = 0xFFFFFFFFFFFFFFFFULL;
+constexpr uint32_t kIndxMagic = 0x58444E49u; // "INDX"
+constexpr uint64_t kMaxAttrData = 256ull << 20;
 
-struct ParsedRec {
-    uint64_t parent = 0;
-    uint64_t size = 0;
-    uint64_t dataSize = 0; // $DATA logical size (authoritative)
-    uint64_t mtime = 0;    // FILETIME of last write
-    uint32_t flags = 0;    // FILE_ATTRIBUTE_* (dir / reparse bits used)
-    bool hasName = false;
-    std::wstring name;     // filled only when wantName is true
+// Temporary debug aid: set BV_MFT_DEBUG=1 in the environment to trace every
+// point where the MFT scan bails out and why.
+bool MftDebug() {
+    static const int flag = [] {
+        char buf[8] = {0};
+        return GetEnvironmentVariableA("BV_MFT_DEBUG", buf, 8) > 0 && buf[0] == '1';
+    }();
+    return flag != 0;
+}
+#define BVDBG(...)                            \
+    do {                                      \
+        if (MftDebug()) std::fprintf(stderr, __VA_ARGS__); \
+    } while (0)
+
+// ---------------------------------------------------------------------------
+// NTFS primitive parsing
+// ---------------------------------------------------------------------------
+
+struct FileRef {
+    uint64_t rec;   // record number   (bits 0..47 of the 64-bit reference)
+    uint16_t seq;   // sequence number (bits 48..63)
 };
 
-uint64_t FileRefRecordNumber(uint64_t ref) { return ref & 0xFFFFFFFFFFFFULL; }
+FileRef SplitRef(uint64_t v) {
+    return {v & 0xFFFFFFFFFFFFULL, static_cast<uint16_t>((v >> 48) & 0xFFFF)};
+}
 
 void EnableBackupPrivileges() {
     auto enable = [](LPCWSTR name) {
@@ -64,6 +122,7 @@ void EnableBackupPrivileges() {
     enable(SE_RESTORE_NAME);
 }
 
+// Resolve the multi-sector-fixup words of every 512-byte sector in the record.
 bool ApplyFixup(uint8_t* rec, size_t bufSize) {
     if (bufSize < 48) return false;
     if (*reinterpret_cast<const uint32_t*>(rec) != 0x454C4946u) return false; // "FILE"
@@ -88,43 +147,12 @@ bool ApplyFixup(uint8_t* rec, size_t bufSize) {
     return true;
 }
 
-void ParseRecord(const uint8_t* rec, size_t bufSize, bool wantName, ParsedRec& out) {
-    const uint16_t attrOffset = *reinterpret_cast<const uint16_t*>(rec + 20);
-    if (attrOffset < 48 || (size_t)attrOffset + 16 > bufSize) return;
-
-    const uint8_t* a = rec + attrOffset;
-    const uint8_t* const end = rec + bufSize;
-
-    while (a + 16 <= end) {
-        const uint32_t type = *reinterpret_cast<const uint32_t*>(a);
-        if (type == kAttrEnd) break;
-        const uint32_t len = *reinterpret_cast<const uint32_t*>(a + 4);
-        if (len < 16 || a + len > end) break;
-
-        if (type == kAttrFileName && a[8] == 0) { // resident
-            const uint16_t valueOff = *reinterpret_cast<const uint16_t*>(a + 20);
-            const uint8_t* v = a + valueOff;
-            if (a + valueOff + 66 <= end) {
-                out.parent = FileRefRecordNumber(*reinterpret_cast<const uint64_t*>(v));
-                out.size = *reinterpret_cast<const uint64_t*>(v + 48); // real size @0x30
-                out.mtime = *reinterpret_cast<const uint64_t*>(v + 16); // modified @0x10
-                out.flags = *reinterpret_cast<const uint32_t*>(v + 56);
-                const uint8_t nameLen = v[64]; // length in characters
-                const uint8_t ns = v[65];
-                if (wantName && nameLen > 0 && ns <= 3 &&
-                    a + valueOff + 66u + (size_t)nameLen * 2u <= end) {
-                    const wchar_t* p = reinterpret_cast<const wchar_t*>(v + 66);
-                    out.name.assign(p, p + nameLen);
-                }
-                out.hasName = true;
-            }
-        } else if (type == kAttrData && a[8] == 0) { // resident $DATA
-            out.dataSize = *reinterpret_cast<const uint32_t*>(a + 16); // content length
-        } else if (type == kAttrData && a[8] != 0) { // non-resident $DATA
-            out.dataSize = *reinterpret_cast<const uint64_t*>(a + 48); // real size @0x30
-        }
-        a += len; // keep the LAST $FILE_NAME (the Win32 name)
-    }
+bool ReadVolAt(HANDLE hVol, uint64_t abs, uint8_t* out, DWORD len) {
+    LARGE_INTEGER li;
+    li.QuadPart = (LONGLONG)abs;
+    DWORD got = 0;
+    return SetFilePointerEx(hVol, li, nullptr, FILE_BEGIN) &&
+           ReadFile(hVol, out, len, &got, nullptr) && got == len;
 }
 
 // A contiguous cluster run belonging to the $MFT data attribute.
@@ -134,28 +162,24 @@ struct MftRun {
     int64_t len;      // clusters
 };
 
-bool ReadVolAt(HANDLE hVol, uint64_t abs, uint8_t* out, DWORD len) {
-    LARGE_INTEGER li;
-    li.QuadPart = (LONGLONG)abs;
-    DWORD got = 0;
-    return SetFilePointerEx(hVol, li, nullptr, FILE_BEGIN) &&
-           ReadFile(hVol, out, len, &got, nullptr) && got == len;
-}
-
-// Decode the data-run list of a non-resident attribute into run map.
-bool ParseDataRuns(const uint8_t* a, std::vector<MftRun>& runs) {
+// Decode the data-run list of a non-resident attribute header `a`.
+std::vector<MftRun> ParseDataRuns(const uint8_t* a, size_t aSize) {
+    std::vector<MftRun> runs;
     const uint16_t mapOff = *reinterpret_cast<const uint16_t*>(a + 32);
     const int64_t lowVcn = *reinterpret_cast<const int64_t*>(a + 16);
     const int64_t highVcn = *reinterpret_cast<const int64_t*>(a + 24);
+    if (mapOff == 0 || mapOff >= aSize) return runs;
     const uint8_t* r = a + mapOff;
+    const uint8_t* const aEnd = a + aSize;
     int64_t vcn = lowVcn;
     int64_t lcn = 0;
     bool first = true;
-    while (*r && r < a + 512) {
+    while (*r && r < aEnd) {
         uint8_t lenb = (*r) & 0x0F;
         uint8_t offb = (*r) >> 4;
         if (lenb == 0) break;
         ++r;
+        if (lenb > 8 || offb > 8 || r + lenb + offb > aEnd) break;
         int64_t len = 0;
         for (int i = lenb - 1; i >= 0; --i) len = (len << 8) | r[i];
         int64_t lcnD = 0;
@@ -172,10 +196,245 @@ bool ParseDataRuns(const uint8_t* a, std::vector<MftRun>& runs) {
         vcn += len;
         if (vcn > highVcn) break;
     }
-    return !runs.empty();
+    return runs;
+}
+
+// ---------------------------------------------------------------------------
+// Per-record parsed data
+// ---------------------------------------------------------------------------
+
+struct NameInfo {
+    FileRef parent;      // parent directory file reference (full, with seq)
+    uint8_t ns = 0xFF;   // $FILE_NAME namespace
+    uint64_t mtime = 0;  // modified time (FILETIME) from this $FILE_NAME
+    std::wstring name;
+};
+
+struct IndexChild {
+    FileRef ref;         // child file reference recorded in the directory index
+    std::wstring name;   // key name (per-directory ground truth)
+};
+
+struct RecInfo {
+    bool parsed = false;
+    bool inUse = false;
+    bool isDir = false;
+    bool isReparse = false;
+    uint16_t seq = 0;
+    uint64_t mtime = 0;    // best-known last-write time
+    uint64_t dataSize = 0; // $DATA logical size (authoritative)
+    std::vector<NameInfo> names;      // every $FILE_NAME attribute
+    std::vector<IndexChild> children; // $I30 children resolved so far
+    std::vector<uint8_t> idxRoot;     // copy of the resident $INDEX_ROOT value
+    std::vector<uint8_t> idxAlloc;    // copy of the $INDEX_ALLOCATION attr header
+    bool indexResolved = false;       // $I30 fully resolved (root + allocation)
+};
+
+// `$FILE_NAME` namespace:
+//   0 = POSIX, 1 = WIN32, 2 = DOS (8.3 short), 3 = WIN32+DOS.
+const NameInfo* PickWin32Name(const RecInfo& r) {
+    const NameInfo* pick = nullptr;
+    for (const auto& n : r.names) {
+        if (n.ns == 1) pick = &n; // last WIN32 name wins (hard links append)
+    }
+    if (!pick) {
+        for (const auto& n : r.names) {
+            if (n.ns == 3) { pick = &n; break; }
+        }
+    }
+    if (!pick) {
+        for (const auto& n : r.names) {
+            if (n.ns != 0xFF) { pick = &n; break; }
+        }
+    }
+    return pick;
+}
+
+// The name of `r` used when adding it as a child of directory `dirRef`.
+//
+// The name is taken from the record's own $FILE_NAME, NOT from the directory
+// index key: NTFS stores BOTH the Win32 (long) name and the DOS 8.3 short name
+// as separate $FILE_NAME attributes, and the $I30 index may key the same
+// record under either. The sort order of the DOS key means the "wrong" entry
+// can come first, so the index key is not a reliable display name. The
+// record's matching attribute for `dirRef` with namespace WIN32 (1) is the
+// name the shell shows.
+std::wstring ChildNameOf(const RecInfo& r, FileRef dirRef) {
+    std::wstring fallback;
+    for (const auto& n : r.names) {
+        if (n.parent.rec != dirRef.rec || n.parent.seq != dirRef.seq) continue;
+        if (n.ns == 1) return n.name;
+        fallback = n.name;
+    }
+    if (!fallback.empty()) return fallback;
+    const NameInfo* p = PickWin32Name(r);
+    return p ? p->name : std::wstring();
+}
+
+// Parse one record (after fixup) into `out`.
+void ParseRecord(const uint8_t* rec, size_t bufSize, RecInfo& out) {
+    const uint16_t attrOffset = *reinterpret_cast<const uint16_t*>(rec + 20);
+    if (attrOffset < 48 || (size_t)attrOffset + 24 > bufSize) return;
+    out.seq = *reinterpret_cast<const uint16_t*>(rec + 16);
+    const uint16_t hdr = *reinterpret_cast<const uint16_t*>(rec + 22);
+    out.inUse = (hdr & 1) != 0;
+    out.isDir = (hdr & 2) != 0;
+    out.isReparse = (hdr & 4) != 0;
+
+    const uint8_t* a = rec + attrOffset;
+    const uint8_t* const end = rec + bufSize;
+
+    while (a + 16 <= end) {
+        const uint32_t type = *reinterpret_cast<const uint32_t*>(a);
+        if (type == kAttrEnd) break;
+        const uint32_t len = *reinterpret_cast<const uint32_t*>(a + 4);
+        if (len < 16 || a + len > end) break;
+
+        if (type == kAttrFileName && a[8] == 0) { // resident $FILE_NAME
+            const uint16_t valueOff = *reinterpret_cast<const uint16_t*>(a + 20);
+            const uint8_t* v = a + valueOff;
+            if (a + valueOff + 66 <= end) {
+                NameInfo n;
+                n.parent = SplitRef(*reinterpret_cast<const uint64_t*>(v));
+                n.mtime = *reinterpret_cast<const uint64_t*>(v + 16); // modified @0x10
+                n.ns = v[65];
+                const uint8_t nameLen = v[64]; // length in characters
+                if (nameLen > 0 && a + valueOff + 66u + (size_t)nameLen * 2u <= end) {
+                    const wchar_t* p = reinterpret_cast<const wchar_t*>(v + 66);
+                    n.name.assign(p, p + nameLen);
+                }
+                const uint64_t nameMtime = n.mtime;
+                out.names.push_back(std::move(n));
+                out.mtime = nameMtime; // best-known last-write (last wins, as v1)
+            }
+        } else if (type == kAttrData && a[8] == 0) { // resident $DATA
+            out.dataSize = *reinterpret_cast<const uint32_t*>(a + 16); // content length
+        } else if (type == kAttrData && a[8] != 0) { // non-resident $DATA
+            out.dataSize = *reinterpret_cast<const uint64_t*>(a + 48); // real size @0x30
+        } else if (type == kAttrIndexRoot && a[8] == 0) {
+            const uint16_t valueOff = *reinterpret_cast<const uint16_t*>(a + 20);
+            const uint32_t valueLen = *reinterpret_cast<const uint32_t*>(a + 16);
+            if (a + valueOff + valueLen <= end) {
+                out.idxRoot.assign(a + valueOff, a + valueOff + valueLen);
+            }
+        } else if (type == kAttrIndexAlloc) {
+            // copy the whole attribute header (incl. the run map) because the
+            // record buffer is recycled between records
+            const size_t copyLen = std::min<size_t>(len, 4096);
+            out.idxAlloc.assign(a, a + copyLen);
+        }
+        a += len;
+    }
+    out.parsed = true;
+}
+
+// ---------------------------------------------------------------------------
+// $I30 index parsing
+// ---------------------------------------------------------------------------
+
+// Parse the entries of one INDEX_HEADER node (root node or a 4096 INDX block).
+void ParseIndexNode(const uint8_t* node, const uint8_t* nodeEnd,
+                    std::vector<IndexChild>& dst) {
+    if (nodeEnd - node < 16) return;
+    const uint32_t entriesOff = *reinterpret_cast<const uint32_t*>(node);
+    const uint32_t indexLen = *reinterpret_cast<const uint32_t*>(node + 4);
+    if (entriesOff == 0 || entriesOff >= indexLen) return;
+    if (indexLen > (uint32_t)(nodeEnd - node)) return;
+    const uint8_t* e = node + entriesOff;
+    const uint8_t* const eEnd = node + indexLen;
+    for (;;) {
+        if (e + 16 > eEnd) break;
+        const uint64_t childRef = *reinterpret_cast<const uint64_t*>(e);
+        const uint16_t elen = *reinterpret_cast<const uint16_t*>(e + 8);
+        const uint16_t klen = *reinterpret_cast<const uint16_t*>(e + 10);
+        const uint16_t eflags = *reinterpret_cast<const uint16_t*>(e + 12);
+        if (elen < 16 || e + elen > eEnd) break;
+        if (eflags & 2) break; // end-of-node marker
+        if (childRef != 0) {
+            IndexChild ic;
+            ic.ref = SplitRef(childRef);
+            if (klen >= 66 && e + 16 + klen <= eEnd) {
+                const uint8_t* key = e + 16;
+                const uint8_t nl = key[64];
+                if (66u + (size_t)nl * 2u <= klen) {
+                    const wchar_t* p = reinterpret_cast<const wchar_t*>(key + 66);
+                    ic.name.assign(p, p + nl);
+                }
+            }
+            dst.push_back(std::move(ic));
+        }
+        e += elen;
+    }
+}
+
+// Parse the resident $INDEX_ROOT value into `dst`.
+void ParseIndexRootValue(const std::vector<uint8_t>& v, std::vector<IndexChild>& dst) {
+    const uint8_t* node = v.data() + 16;
+    ParseIndexNode(node, v.data() + v.size(), dst);
+}
+
+// Parse INDEX_BLOCK (INDX) data (the whole $INDEX_ALLOCATION stream).
+void ParseIndexAllocationData(const std::vector<uint8_t>& data,
+                              std::vector<IndexChild>& dst) {
+    for (size_t off = 0; off + 4096 <= data.size(); off += 4096) {
+        const uint8_t* b = data.data() + off;
+        if (*reinterpret_cast<const uint32_t*>(b) != kIndxMagic) continue;
+        ParseIndexNode(b + 16, b + 4096, dst);
+    }
+}
+
+// Read the full data of a non-resident attribute from its stored header copy.
+bool ReadNonResidentAttr(HANDLE hVol, uint64_t cluster, const std::vector<uint8_t>& hdrCopy,
+                         std::vector<uint8_t>& out) {
+    if (hdrCopy.size() < 56) return false;
+    const uint16_t mapOff = *reinterpret_cast<const uint16_t*>(hdrCopy.data() + 32);
+    const int64_t lowVcn = *reinterpret_cast<const int64_t*>(hdrCopy.data() + 16);
+    const int64_t highVcn = *reinterpret_cast<const int64_t*>(hdrCopy.data() + 24);
+    const uint64_t dataSize = *reinterpret_cast<const uint64_t*>(hdrCopy.data() + 48);
+    if (mapOff == 0 || mapOff >= hdrCopy.size() || dataSize == 0 ||
+        dataSize > kMaxAttrData || highVcn < lowVcn) {
+        return false;
+    }
+    const uint64_t totalBytes = (uint64_t)(highVcn - lowVcn + 1) * cluster;
+    if (totalBytes > kMaxAttrData || totalBytes < dataSize) return false;
+    std::vector<uint8_t> tmp((size_t)totalBytes);
+    const uint8_t* r = hdrCopy.data() + mapOff;
+    const uint8_t* const rEnd = hdrCopy.data() + hdrCopy.size();
+    int64_t vcn = lowVcn;
+    int64_t lcn = 0;
+    bool first = true;
+    while (*r && r < rEnd) {
+        const uint8_t lenb = (*r) & 0x0F;
+        const uint8_t offb = (*r) >> 4;
+        if (lenb == 0) break;
+        ++r;
+        if (lenb > 8 || offb > 8 || r + lenb + offb > rEnd) break;
+        int64_t len = 0;
+        for (int i = lenb - 1; i >= 0; --i) len = (len << 8) | r[i];
+        int64_t lcnD = 0;
+        for (int i = offb - 1; i >= 0; --i) lcnD = (lcnD << 8) | r[lenb + i];
+        if (offb && (r[lenb + offb - 1] & 0x80)) lcnD -= (int64_t)1 << (8 * offb);
+        r += lenb + offb;
+        if (first) { lcn = lcnD; first = false; } else { lcn += lcnD; }
+        for (int64_t k = 0; k < len; ++k) {
+            const size_t byteOff = (size_t)vcn * cluster;
+            if (byteOff + cluster <= tmp.size()) {
+                ReadVolAt(hVol, (uint64_t)(lcn + k) * cluster, tmp.data() + byteOff,
+                          (DWORD)cluster);
+            }
+            ++vcn;
+        }
+    }
+    if (tmp.size() > dataSize) tmp.resize((size_t)dataSize);
+    out.swap(tmp);
+    return !out.empty();
 }
 
 } // namespace
+
+// ---------------------------------------------------------------------------
+// The enumerator
+// ---------------------------------------------------------------------------
 
 bool MftEnumerator::IsSupported(const std::wstring& root) {
     const std::wstring norm = pathutil::NormalizeRoot(root);
@@ -196,89 +455,98 @@ bool MftEnumerator::enumerate(const std::wstring& root,
     const std::wstring normRoot = pathutil::NormalizeRoot(root);
     if (normRoot.size() < 3 || normRoot[1] != L':' || normRoot[0] == L'\\' ||
         normRoot[0] == L'/') {
+        BVDBG("mft[1] root path unsupported\\n");
         return false; // caller falls back to Win32
     }
-    if (!IsSupported(normRoot)) return false;
+    if (!IsSupported(normRoot)) { BVDBG("mft[1b] not NTFS\\n"); return false; }
 
     EnableBackupPrivileges();
     const std::wstring drive = std::wstring(1, normRoot[0]) + L":\\";
     const std::wstring devVol = L"\\\\.\\" + drive.substr(0, 2); // e.g. "\\\\.\\C:"
 
-    // Root directory MFT record number (low 64 bits of the file id).
+    // Root directory file reference (record + sequence) from Win32.
     HANDLE hRoot = CreateFileW(pathutil::AddLongPathPrefix(normRoot).c_str(), 0,
                                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                                nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
-    if (hRoot == INVALID_HANDLE_VALUE) return false;
-    uint64_t rootId = 0;
+    if (hRoot == INVALID_HANDLE_VALUE) { BVDBG("mft[2] cannot open root\\n"); return false; }
+    uint64_t rootRefWin = 0;
     {
         FILE_ID_INFO fid = {};
         if (!GetFileInformationByHandleEx(hRoot, FileIdInfo, &fid, sizeof(fid))) {
             CloseHandle(hRoot);
+            BVDBG("mft[3] FileIdInfo failed\\n");
             return false;
         }
-        std::memcpy(&rootId, fid.FileId.Identifier, sizeof(uint64_t));
-        rootId &= 0xFFFFFFFFFFFFULL; // record number (drop sequence bits)
+        std::memcpy(&rootRefWin, fid.FileId.Identifier, sizeof(uint64_t));
     }
     CloseHandle(hRoot);
+    const FileRef rootRef = SplitRef(rootRefWin);
 
-    // Open the volume device and locate the MFT region.
+    // Open the volume device and read the NTFS geometry.
     HANDLE hVol = CreateFileW(devVol.c_str(), GENERIC_READ,
                               FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                               nullptr, OPEN_EXISTING, 0, nullptr);
-    if (hVol == INVALID_HANDLE_VALUE) return false;
+    if (hVol == INVALID_HANDLE_VALUE) { BVDBG("mft[4] cannot open volume\\n"); return false; }
     NTFS_VOLUME_DATA_BUFFER vd = {};
     DWORD ret = 0;
     if (!DeviceIoControl(hVol, FSCTL_GET_NTFS_VOLUME_DATA, nullptr, 0, &vd, sizeof(vd),
                          &ret, nullptr)) {
         CloseHandle(hVol);
+        BVDBG("mft[5] NTFS_VOLUME_DATA failed\\n");
         return false;
     }
     const uint64_t segSize = vd.BytesPerFileRecordSegment;
+    const uint64_t cluster = vd.BytesPerCluster;
     const uint64_t mftStartBytes =
         static_cast<uint64_t>(vd.MftStartLcn.QuadPart) * vd.BytesPerCluster;
     const uint64_t mftBytes = static_cast<uint64_t>(vd.MftValidDataLength.QuadPart);
-    if (segSize == 0 || mftBytes == 0) {
+    if (segSize == 0 || mftBytes == 0 || cluster == 0) {
         CloseHandle(hVol);
+        BVDBG("mft[6] bad geometry seg=%llu mft=%llu clus=%llu\\n",(unsigned long long)segSize,(unsigned long long)mftBytes,(unsigned long long)cluster);
         return false;
     }
+    // Force pending NTFS metadata to disk before the raw read; otherwise a
+    // freshly-created tree may be read back in a partially-flushed state.
+    FlushFileBuffers(hVol);
     const uint64_t nRecords = mftBytes / segSize;
 
-    // ---- Build the $MFT data-run map from record 0 (the MFT may be ------
-    // ---- fragmented; never read it as if it were contiguous from ---------
-    // ---- MftStartLcn, that would return wrong physical records. ---------
-    const uint64_t cluster = vd.BytesPerCluster;
+    // ---- $MFT data-run map from record 0 (fragmentation-aware) -------------
     std::vector<uint8_t> rec0((size_t)segSize);
     if (!ReadVolAt(hVol, mftStartBytes, rec0.data(), (DWORD)segSize) ||
         !ApplyFixup(rec0.data(), rec0.size())) {
         CloseHandle(hVol);
+        BVDBG("mft[7] record 0 read/fixup failed\\n");
         return false;
     }
     std::vector<MftRun> runs;
     {
         const uint16_t first = *reinterpret_cast<const uint16_t*>(rec0.data() + 20);
         const uint8_t* a = rec0.data() + first;
-        const uint8_t* const end = rec0.data() + rec0.size();
+        const uint8_t* const end = rec0.data() + segSize;
         while (a + 24 <= end) {
             const uint32_t type = *reinterpret_cast<const uint32_t*>(a);
             if (type == kAttrEnd) break;
             const uint32_t len = *reinterpret_cast<const uint32_t*>(a + 4);
             if (len < 24 || a + len > end) break;
-            if (type == 0x80 /* $DATA */ && a[8] != 0) ParseDataRuns(a, runs); // non-resident
+            if (type == kAttrData && a[8] != 0) {
+                runs = ParseDataRuns(a, (size_t)(end - a)); // first $DATA = $MFT itself
+                break;
+            }
             a += len;
         }
     }
     if (runs.empty()) {
         CloseHandle(hVol);
+        BVDBG("mft[8] $MFT run map empty\\n");
         return false;
     }
     std::sort(runs.begin(), runs.end(),
               [](const MftRun& x, const MftRun& y) { return x.startVcn < y.startVcn; });
 
+    // Iterate every MFT record, in record order, reading each run's physical
+    // clusters. `cb` receives (recordIndex, recordBytes, recordSize).
     constexpr DWORD kMaxBuf = 8 * 1024 * 1024;
     std::vector<uint8_t> buf(kMaxBuf);
-
-    // Iterate every MFT record, in record order, by reading each run's physical
-    // clusters. `cb` receives (recordIndex, recordBytes, recordSize).
     const auto foreachRecord = [&](const auto& cb) {
         for (const auto& run : runs) {
             const uint64_t runStartMft = (uint64_t)run.startVcn * cluster; // MFT-relative byte
@@ -303,117 +571,193 @@ bool MftEnumerator::enumerate(const std::wstring& root,
         }
     };
 
-    // ---- Pass A: parent record number for every named record -------------
-    std::vector<uint64_t> parentOf(nRecords, kNoParent);
+    // ---- Pass A: parse every record ----------------------------------------
+    std::vector<RecInfo> recs(nRecords);
     foreachRecord([&](uint64_t recIndex, uint8_t* rec, size_t n) {
+        RecInfo& r = recs[recIndex];
         if (!ApplyFixup(rec, n)) return;
-        if (!(*reinterpret_cast<const uint16_t*>(rec + 22) & 1)) return; // not in use
-        ParsedRec pr;
-        ParseRecord(rec, n, false, pr);
-        if (!pr.hasName) return;
-        parentOf[recIndex] = pr.parent;
-    });
-
-    const auto inSubtree = [&](uint64_t id) -> bool {
-        uint64_t cur = id;
-        for (int depth = 0; depth < 256; ++depth) {
-            if (cur == rootId) return true;
-            cur = parentOf[cur];
-            if (cur == 0 || cur == kNoParent) return false;
+        ParseRecord(rec, n, r);
+        if (r.parsed && r.isDir && !r.idxRoot.empty()) {
+            ParseIndexRootValue(r.idxRoot, r.children); // resolve in a second pass below
         }
-        return false;
-    };
-
-    // ---- Pass B: collect subtree nodes + child lists ---------------------
-    struct SubNode {
-        std::wstring name;
-        uint64_t size = 0;
-        uint64_t mtime = 0;
-        uint8_t isDir = 0;
-        uint8_t isReparse = 0;
-    };
-    std::unordered_map<uint64_t, SubNode> nodes;
-    std::unordered_map<uint64_t, std::vector<uint64_t>> children;
-    foreachRecord([&](uint64_t recIndex, uint8_t* rec, size_t n) {
-        if (!ApplyFixup(rec, n)) return;
-        if (!(*reinterpret_cast<const uint16_t*>(rec + 22) & 1)) return; // not in use
-        if (!inSubtree(recIndex)) return;
-        ParsedRec pr;
-        ParseRecord(rec, n, true, pr);
-        if (!pr.hasName) return;
-        // Directory / reparse come from the MFT record header flags, which are
-        // reliable (the $FILE_NAME fileAttributes field is not always set).
-        const uint16_t hdr = *reinterpret_cast<const uint16_t*>(rec + 22);
-        const bool isDir = (hdr & 2) != 0;
-        const bool isReparse = (hdr & 4) != 0;
-        SubNode sn;
-        sn.name = std::move(pr.name);
-        sn.size = pr.dataSize ? pr.dataSize : pr.size;
-        sn.mtime = pr.mtime;
-        sn.isDir = isDir ? 1 : 0;
-        sn.isReparse = isReparse ? 1 : 0;
-        nodes[recIndex] = std::move(sn);
-        children[pr.parent].push_back(recIndex);
     });
-    CloseHandle(hVol);
 
-    // Sort each parent's child list by name so DFS pops in ascending order.
-    for (auto& kv : children) {
-        std::sort(kv.second.begin(), kv.second.end(), [&](uint64_t a, uint64_t b) {
-            return nodes[a].name < nodes[b].name;
-        });
+    bool incomplete = false;
+    auto failIncomplete = [&](const wchar_t* why, uint64_t rec) {
+        incomplete = true;
+        if (onError) {
+            ScanError e;
+            e.path = L"";
+            e.message = std::wstring(L"MFT scan incomplete: ") + why + L" (record " +
+                        std::to_wstring(rec) + L")";
+            e.winError = ERROR_INVALID_DATA;
+            onError(e);
+        }
+    };
+
+    // ---- Root structural validation ----------------------------------------
+    if (rootRef.rec >= nRecords || !recs[rootRef.rec].inUse ||
+        recs[rootRef.rec].seq != rootRef.seq) {
+        BVDBG("mft[9] root invalid rec=%llu n=%llu inUse=%d seq=%u liveSeq=%u\\n",
+              (unsigned long long)rootRef.rec, (unsigned long long)nRecords,
+              rootRef.rec < nRecords ? (recs[rootRef.rec].inUse ? 1 : 0) : -1,
+              (unsigned)rootRef.seq,
+              rootRef.rec < nRecords ? (unsigned)recs[rootRef.rec].seq : 0);
+        CloseHandle(hVol);
+        return false; // the recorded root does not exist as such in the MFT
     }
+    const RecInfo& rootInfo = recs[rootRef.rec];
+    if (!rootInfo.isDir) {
+        BVDBG("mft[10] root is not a directory\\n");
+        CloseHandle(hVol);
+        return false;
+    }
+    // NTFS structural root note: the volume root is record 5 and its own
+    // $FILE_NAME parent pointer refers to itself -- that is the structural
+    // invariant by which a volume root is recognisable without trusting a
+    // hard-coded record number. We locate the scan root via the Win32 file id
+    // (source of truth) and verify the invariant when the scan root happens to
+    // be the volume root. Any other directory root is a normal directory and
+    // carries no self-parent.
+    if (rootRef.rec == 5) {
+        bool selfParent = false;
+        for (const auto& nm : rootInfo.names) {
+            if (nm.parent.rec == rootRef.rec && nm.parent.seq == rootRef.seq) selfParent = true;
+        }
+        BVDBG("mft[10b] volume root record 5: self-parent=%d\\n", selfParent ? 1 : 0);
+        if (!selfParent) {
+            CloseHandle(hVol);
+            return false;
+        }
+    }
+
+    // ---- Reverse index: record number -> children (for the chain union) ----
+    // Each entry links a record whose win32 $FILE_NAME points to that parent.
+    std::unordered_map<uint64_t, std::vector<uint32_t>> revChildren;
+    revChildren.reserve(nRecords);
+    for (uint64_t i = 0; i < nRecords; ++i) {
+        const RecInfo& r = recs[i];
+        if (!r.parsed || !r.inUse || r.names.empty()) continue;
+        for (const auto& nm : r.names) {
+            if (nm.ns != 0xFF) revChildren[nm.parent.rec].push_back((uint32_t)i);
+        }
+    }
+
+    // ---- Top-down walk from the root ---------------------------------------
+    struct ChildEntry {
+        std::wstring name;
+        bool viaIndex;
+    };
+
+    std::vector<std::pair<uint64_t, std::wstring>> work;
+    work.push_back({rootRef.rec, L""});
 
     uint64_t files = 0;
     uint64_t dirs = 0;
 
-    struct Frame {
-        uint64_t id;
-        std::wstring rel; // relative path of the node's parent directory
+    const auto isMetafile = [](uint64_t recNo, const std::wstring& nm) {
+        return recNo <= kMftHighestSystem && !nm.empty() && nm[0] == L'$';
     };
-    std::vector<Frame> stack;
-    if (auto it = children.find(rootId); it != children.end()) {
-        for (size_t k = it->second.size(); k-- > 0;) {
-            stack.push_back({it->second[k], L""});
-        }
-    }
 
-    while (!stack.empty()) {
-        Frame f = stack.back();
-        stack.pop_back();
-        const SubNode& n = nodes[f.id];
-        const std::wstring childRel = pathutil::JoinRel(f.rel, n.name);
+    while (!work.empty()) {
+        const auto top = work.back();
+        work.pop_back();
+        const uint64_t dirRec = top.first;
+        const std::wstring dirRel = top.second;
 
-        // Volume metafiles ($MFT, $Boot, ...) that FindFirstFile doesn't surface.
-        if (f.id <= kMftHighestSystem && !n.name.empty() && n.name[0] == L'$') continue;
+        RecInfo& d = recs[dirRec];
 
-        FileEntry e;
-        e.relativePath = childRel;
-        e.size = n.isDir ? 0 : n.size;
-        e.lastWriteTime = n.mtime;
-        e.fileId = f.id;
-        e.attributes = (n.isDir ? FILE_ATTRIBUTE_DIRECTORY : 0) |
-                       (n.isReparse ? FILE_ATTRIBUTE_REPARSE_POINT : 0);
-        e.isDirectory = n.isDir;
-        if (n.isDir) {
-            ++dirs;
-        } else {
-            ++files;
-        }
-        if (!onEntry(std::move(e))) return true; // consumer aborted
-
-        if (n.isDir && !n.isReparse) {
-            if (auto cit = children.find(f.id); cit != children.end()) {
-                for (size_t k = cit->second.size(); k-- > 0;) {
-                    stack.push_back({cit->second[k], childRel});
+        // Resolve the directory's full $I30 (inline + allocation leaf blocks).
+        if (!d.indexResolved) {
+            d.indexResolved = true;
+            if (!d.idxAlloc.empty()) {
+                std::vector<uint8_t> data;
+                if (!ReadNonResidentAttr(hVol, cluster, d.idxAlloc, data)) {
+                    failIncomplete(L"directory $INDEX_ALLOCATION unreadable", dirRec);
+                } else {
+                    ParseIndexAllocationData(data, d.children);
                 }
             }
-            if (onProgress) onProgress(files, dirs, childRel);
+            if (d.children.empty() && d.idxRoot.empty()) {
+                failIncomplete(L"directory has no readable $I30 index", dirRec);
+            }
         }
+
+        // Collect this directory's children: index entries first (authoritative),
+        // then parent-pointer union (redundant source).
+        std::unordered_map<uint64_t, ChildEntry> kids;
+        for (const auto& c : d.children) {
+            const uint64_t cr = c.ref.rec;
+            if (cr >= nRecords || !recs[cr].parsed || !recs[cr].inUse ||
+                recs[cr].seq != c.ref.seq) {
+                failIncomplete(L"index child record missing or sequence mismatch", cr);
+                continue;
+            }
+            // Prefer the record's WIN32 name for this parent (the index key can
+            // be the DOS 8.3 short name and is not a reliable display name).
+            const std::wstring recName = ChildNameOf(recs[cr], {dirRec, d.seq});
+            kids.emplace(cr, ChildEntry{recName.empty() ? c.name : recName, true});
+        }
+        if (auto it = revChildren.find(dirRec); it != revChildren.end()) {
+            for (uint32_t cr : it->second) {
+                RecInfo& cRec = recs[cr];
+                if (!cRec.parsed || !cRec.inUse) continue;
+                // stale parent references (reused directory record) are caught
+                // by the sequence check: only links carrying this directory's
+                // live sequence are trusted.
+                bool linkOk = false;
+                for (const auto& nm : cRec.names) {
+                    if (nm.parent.rec == dirRec && nm.parent.seq == d.seq) linkOk = true;
+                }
+                if (!linkOk) continue;
+                if (kids.count(cr)) continue;
+                kids.emplace(cr, ChildEntry{ChildNameOf(cRec, {dirRec, d.seq}), false});
+            }
+        }
+
+        // Emit children in alphabetical order (depth-first), skipping the
+        // volume metafile band ($MFT, $Boot, ...).
+        std::vector<std::pair<uint64_t, ChildEntry>> ordered(kids.begin(), kids.end());
+        std::sort(ordered.begin(), ordered.end(),
+                  [](const std::pair<uint64_t, ChildEntry>& a,
+                     const std::pair<uint64_t, ChildEntry>& b) { return a.second.name < b.second.name; });
+
+        for (size_t k = ordered.size(); k-- > 0;) {
+            const uint64_t cr = ordered[k].first;
+            const std::wstring& cname = ordered[k].second.name;
+            if (isMetafile(cr, cname)) continue;
+            const RecInfo& cRec = recs[cr];
+
+            const std::wstring childRel = pathutil::JoinRel(dirRel, cname);
+
+            FileEntry e;
+            e.relativePath = childRel;
+            e.size = cRec.isDir ? 0 : (cRec.dataSize ? cRec.dataSize : 0);
+            e.lastWriteTime = cRec.mtime;
+            e.fileId = cr;
+            e.attributes = (cRec.isDir ? FILE_ATTRIBUTE_DIRECTORY : 0) |
+                           (cRec.isReparse ? FILE_ATTRIBUTE_REPARSE_POINT : 0);
+            e.isDirectory = cRec.isDir;
+            if (cRec.isDir) {
+                ++dirs;
+            } else {
+                ++files;
+            }
+            if (!onEntry(std::move(e))) {
+                CloseHandle(hVol);
+                return true; // consumer aborted
+            }
+
+            if (cRec.isDir && !cRec.isReparse) {
+                work.push_back({cr, childRel});
+            }
+        }
+        if (onProgress) onProgress(files, dirs, dirRel);
     }
 
     (void)onError;
-    return true;
+    CloseHandle(hVol);
+    return !incomplete;
 }
 
 } // namespace bv

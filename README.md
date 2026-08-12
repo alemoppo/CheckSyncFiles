@@ -37,6 +37,22 @@ Approccio usato:
   record fisici errati). Si legge invece il record 0 (`$MFT`) e dal suo attributo
   `$DATA` non-residente si decodificano i **data-run** (`ParseDataRuns`); ogni file
   record viene poi letto fisicamente percorrendo i run in ordine di record.
+- la ricostruzione è **top-down**: si percorrono gli indici `$I30` di ogni directory
+  (voce inline in `$INDEX_ROOT` + blocchi INDX di `$INDEX_ALLOCATION` letti tramite i
+  data-run) — la stessa struttura che usa `FindFirstFileW` — e i parent-pointer dei
+  `$FILE_NAME` fungono da fonte ridondante (union). Il v1 (sola catena bottom-up dai
+  parent-pointer) produceva path errati su volumi reali.
+- il **nome** di ogni figlio viene preso dal **`$FILE_NAME`** del suo record con
+  priorità di namespace **WIN32 (1)**, fallback WIN32+DOS (3), mai DOS (2)/POSIX (0):
+  le chiavi dell'$I30 possono essere nomi 8.3 DOS dello stesso record (es. `255C81~1.TMP`),
+  quindi la key dell'indice non è mai usata come nome visuale.
+- ogni **FILE_REFERENCE** è trattata come `record_number (48 bit) + sequence (16 bit)`,
+  mai come un indice: per ogni `$FILE_NAME` e per ogni figlio dell'$I30 si valida
+  `parent.sequence == sequence_salvata`; una reference **stale** viene scartata e la
+  scansione segnala incomplete invece di produrre path falsi.
+- la **root** è risolta con `FILE_ID_INFO` (Win32) in record+sequence (con
+  `GetFileInformationByHandleEx`); l'invariant "self-parent" è verificato solo quando la
+  root è il record 5 del volume (l'unico caso in cui vale).
 - directory/reparse point provengono dai **flag di header del record** (`rec+22`,
   bit 1 = directory, bit 2 = reparse) perché il campo fileAttributes di `$FILE_NAME`
   non è sempre impostato.
@@ -44,7 +60,12 @@ Approccio usato:
   in header; non-residente: `realSize`) perché il `realSize` di `$FILE_NAME` può essere 0
   per file materializzati con `SetEndOfFile`.
 - i record non più **"in use"** (flag header bit 0x0001 non impostato) vengono ignorati
-  per escludere record stantii (deleted).
+  per escludere record stantii (deleted); la banda dei metafile di sistema (record ≤ 23:
+  `$MFT`, `$LogFile`, ...) non è mai esposta come voce utente.
+- un `enumerate()` **incompleto** ritorna `false`: il `FileIndex` parziale viene
+  scartato e ricostruito da zero dal fallback Win32 (mai una scansione parziale che
+  sembri valida). `BV_MFT_DEBUG=1` in ambiente abilita una traccia diagnostica del motivo
+  di ogni bail-out (default off).
 
 La MFT è **un'ottimizzazione, non una dipendenza**: il programma continua a funzionare
 se il volume non è NTFS, se l'accesso alla MFT non è disponibile, se mancano i privilegi,
@@ -219,6 +240,7 @@ Eseguibili prodotti in `build/`:
 - `tests/bv_testgen.exe` — generatore di alberi di test
 - `tests/bv_mftbench.exe` — benchmark/correttezza MFT vs Win32
 - `tests/bv_mftprobe.exe` — diagnostica MFT/record NTFS
+- `tests/bv_mftdiag.exe` — confronto MFT vs Win32 su volume reale + probe (elevato)
 
 #### GUI SDL3 (Fase 2)
 
@@ -324,7 +346,7 @@ src/
 tests/
   TestHarness.h, TestTree.h/.cpp, test_main.cpp
 tools/
-  testgen.cpp, mftbench.cpp, mftprobe.cpp
+  testgen.cpp, mftbench.cpp, mftprobe.cpp, mftdiag.cpp
 ```
 
 ## Roadmap
