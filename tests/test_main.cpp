@@ -935,6 +935,26 @@ TEST("export: csv escaping, BOM and hex digests", [] {
         for (int i = 0; i < 32; ++i) p.hashSource[i] = static_cast<uint8_t>(i);
         r.problems.push_back(p);
     }
+    {
+        // CSV/DDE formula injection: a name that starts with '=', '+', '-' or
+        // '@' must never be emitted bare, or a spreadsheet would evaluate it.
+        FileResult p;
+        p.status = Status::Missing;
+        p.relativePath = L"=SUM(A1:A9).txt";
+        r.problems.push_back(p);
+    }
+    {
+        FileResult p;
+        p.status = Status::Missing;
+        p.relativePath = L"-cmd.xlsx";
+        r.problems.push_back(p);
+    }
+    {
+        FileResult p;
+        p.status = Status::Missing;
+        p.relativePath = L"@hdr";
+        r.problems.push_back(p);
+    }
     const std::wstring file = MakeTempDir() + L"\\out.csv";
     std::wstring err;
     CHECK(WriteCsv(file, r, err));
@@ -952,6 +972,14 @@ TEST("export: csv escaping, BOM and hex digests", [] {
     CHECK(bytes.find("p\xc3\xa0\xc3\xa8\xc3\xa9.io") != std::string::npos);
     CHECK(bytes.find("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f") !=
           std::string::npos);
+    // Formula-injection cells are quoted with a leading apostrophe...
+    CHECK(bytes.find("\"'=SUM(A1:A9).txt\"") != std::string::npos);
+    CHECK(bytes.find("\"'-cmd.xlsx\"") != std::string::npos);
+    CHECK(bytes.find("\"'@hdr\"") != std::string::npos);
+    // ...and no bare formula prefix survives on any path cell.
+    CHECK(bytes.find(",=SUM") == std::string::npos);
+    CHECK(bytes.find(",-cmd") == std::string::npos);
+    CHECK(bytes.find(",@hdr") == std::string::npos);
 });
 
 TEST("export: json escaping and no BOM", [] {

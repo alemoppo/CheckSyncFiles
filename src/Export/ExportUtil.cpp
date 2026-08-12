@@ -22,6 +22,16 @@ std::string StatusToken(Status s) {
     return "?";
 }
 
+namespace {
+// True for characters a spreadsheet would read as the start of a formula or
+// hyperlink when a CSV cell begins with them. Such cells are carriers for the
+// classic "CSV/DDE formula injection".
+bool CsvFormulaTrigger(wchar_t c) {
+    return c == L'=' || c == L'+' || c == L'-' || c == L'@' ||
+           c == L'\t' || c == L'\r' || c == L'\f';
+}
+} // namespace
+
 std::string CsvEscape(const std::wstring& s) {
     const std::string u8 = pathutil::ToUtf8(s);
     bool need = false;
@@ -31,11 +41,19 @@ std::string CsvEscape(const std::wstring& s) {
             break;
         }
     }
-    if (!need) return u8;
+    // CSV-injection defense: a cell that BEGINS with = + - @ \t \r \f would be
+    // interpreted by Excel/LibreOffice as a formula (or DDE hyperlink) when the
+    // export is opened directly, turning a file name like "=SUM(A1)" into an
+    // executable payload. Force RFC-4180 quoting and prefix an apostrophe
+    // inside the quotes -- the standard neutralization marker. Programmatic
+    // consumers must strip the leading apostrophe of such cells.
+    const bool formulaRisk = !s.empty() && CsvFormulaTrigger(s[0]);
+    if (!need && !formulaRisk) return u8;
 
     std::string out;
     out.reserve(u8.size() + 8);
     out += '"';
+    if (formulaRisk) out += '\'';
     for (char c : u8) {
         if (c == '"') out += '"';
         out += c;
