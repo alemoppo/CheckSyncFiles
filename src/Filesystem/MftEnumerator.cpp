@@ -340,6 +340,10 @@ std::wstring ChildNameOf(const RecInfo& r, FileRef dirRef) {
 
 // Parse one record (after fixup) into `out`.
 void ParseRecord(const uint8_t* rec, size_t bufSize, RecInfo& out) {
+    // Parse bounded, defensive: a malformed record may never cause reads past
+    // the buffer. Every field access below is guarded either by the record
+    // bounds (bufSize / end) or by the enclosing attribute's own length (len).
+    if (bufSize < 48) return;
     const uint16_t attrOffset = *reinterpret_cast<const uint16_t*>(rec + 20);
     if (attrOffset < 48 || (size_t)attrOffset + 24 > bufSize) return;
     out.seq = *reinterpret_cast<const uint16_t*>(rec + 16);
@@ -355,33 +359,47 @@ void ParseRecord(const uint8_t* rec, size_t bufSize, RecInfo& out) {
         const uint32_t type = *reinterpret_cast<const uint32_t*>(a);
         if (type == kAttrEnd) break;
         const uint32_t len = *reinterpret_cast<const uint32_t*>(a + 4);
-        if (len < 16 || a + len > end) break;
+        // Resident attributes have a 24-byte header (valueLength@+16,
+        // valueOffset@+20); non-resident ones at least 56 bytes. Requiring
+        // len>=24 keeps the common header reads below in bounds.
+        if (len < 24 || a + len > end) break;
+        const bool nonResident = a[8] != 0;
+        // Attribute values must lie inside [a, a+len), never spilling into the
+        // following attribute; the value bounds below are checked against `len`.
 
-        if (type == kAttrFileName && a[8] == 0) { // resident $FILE_NAME
-            const uint16_t valueOff = *reinterpret_cast<const uint16_t*>(a + 20);
-            const uint8_t* v = a + valueOff;
-            if (a + valueOff + 66 <= end) {
-                NameInfo n;
-                n.parent = SplitRef(*reinterpret_cast<const uint64_t*>(v));
-                n.mtime = *reinterpret_cast<const uint64_t*>(v + 16); // modified @0x10
-                n.ns = v[65];
-                const uint8_t nameLen = v[64]; // length in characters
-                if (nameLen > 0 && a + valueOff + 66u + (size_t)nameLen * 2u <= end) {
-                    const wchar_t* p = reinterpret_cast<const wchar_t*>(v + 66);
-                    n.name.assign(p, p + nameLen);
-                }
-                const uint64_t nameMtime = n.mtime;
-                out.names.push_back(std::move(n));
-                out.mtime = nameMtime; // best-known last-write (last wins, as v1)
-            }
-        } else if (type == kAttrData && a[8] == 0) { // resident $DATA
-            out.dataSize = *reinterpret_cast<const uint32_t*>(a + 16); // content length
-        } else if (type == kAttrData && a[8] != 0) { // non-resident $DATA
-            out.dataSize = *reinterpret_cast<const uint64_t*>(a + 48); // real size @0x30
-        } else if (type == kAttrIndexRoot && a[8] == 0) {
+        if (type == kAttrFileName && !nonResident) { // resident $FILE_NAME
             const uint16_t valueOff = *reinterpret_cast<const uint16_t*>(a + 20);
             const uint32_t valueLen = *reinterpret_cast<const uint32_t*>(a + 16);
-            if (a + valueOff + valueLen <= end) {
+            if (valueOff >= 24 && (size_t)valueOff + valueLen <= len) {
+                const uint8_t* v = a + valueOff;
+                // NAME fixed part is 66 bytes (parent file ref @0, mtime @0x10,
+                // name length @64, namespace @65), then 2 bytes per character.
+                if (valueLen >= 68) {
+                    NameInfo n;
+                    n.parent = SplitRef(*reinterpret_cast<const uint64_t*>(v));
+                    n.mtime = *reinterpret_cast<const uint64_t*>(v + 16); // modified @0x10
+                    n.ns = v[65];
+                    const uint8_t nameLen = v[64]; // length in characters
+                    if (nameLen > 0 && (size_t)nameLen * 2u <= valueLen - 66u) {
+                        const wchar_t* p = reinterpret_cast<const wchar_t*>(v + 66);
+                        n.name.assign(p, p + nameLen);
+                    }
+                    const uint64_t nameMtime = n.mtime;
+                    out.names.push_back(std::move(n));
+                    out.mtime = nameMtime; // best-known last-write (last wins, as v1)
+                }
+            }
+        } else if (type == kAttrData && !nonResident) { // resident $DATA
+            const uint32_t valueLen = *reinterpret_cast<const uint32_t*>(a + 16);
+            out.dataSize = valueLen; // content length
+        } else if (type == kAttrData && nonResident) { // non-resident $DATA
+            if (len >= 56) { // real size lives at +0x30 (8 bytes)
+                out.dataSize = *reinterpret_cast<const uint64_t*>(a + 48);
+            }
+        } else if (type == kAttrIndexRoot && !nonResident) {
+            const uint16_t valueOff = *reinterpret_cast<const uint16_t*>(a + 20);
+            const uint32_t valueLen = *reinterpret_cast<const uint32_t*>(a + 16);
+            if (valueOff >= 24 && (size_t)valueOff + valueLen <= len) {
                 out.idxRoot.assign(a + valueOff, a + valueOff + valueLen);
                 if (valueLen >= 16) {
                     // $INDEX_ROOT header: indexed_attr_type@+0, collation@+4,
@@ -392,7 +410,8 @@ void ParseRecord(const uint8_t* rec, size_t bufSize, RecInfo& out) {
             }
         } else if (type == kAttrIndexAlloc) {
             // copy the whole attribute header (incl. the run map) because the
-            // record buffer is recycled between records
+            // record buffer is recycled between records. Stray (un-parented)
+            // $INDEX_ALLOCATION attributes on the same record are harmless.
             const size_t copyLen = std::min<size_t>(len, 4096);
             out.idxAlloc.assign(a, a + copyLen);
         }
