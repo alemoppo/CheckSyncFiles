@@ -233,6 +233,52 @@ TEST("file index: case policy drives lookups", [] {
     CHECK(cs.find(L"Foo\\a.txt", e));
 });
 
+namespace {
+
+// Enumerator that replays a fixed list of entries (used to exercise the
+// duplicate-key path that a real disk walk cannot easily produce).
+class FakeEnumerator : public IFileEnumerator {
+public:
+    // noinline: keeps GCC's -Warray-bounds device-inlining false positive away
+    // from the other enumerators' call sites (it mistakes the iterator loop
+    // for an out-of-bounds read of the base-class object).
+    __attribute__((noinline)) bool enumerate(const std::wstring&,
+                                             const EntryCallback& onEntry,
+                                             const ErrorCallback&,
+                                             const ProgressCallback&) override {
+        for (auto& p : paths) {
+            FileEntry e;
+            e.relativePath = p;
+            e.size = 0;
+            e.isDirectory = false;
+            if (!onEntry(std::move(e))) return false;
+        }
+        return true;
+    }
+    std::vector<std::wstring> paths;
+};
+
+} // namespace
+
+TEST("file index: duplicate folded keys are last-wins with consistent stats", [] {
+    // Same key under the case-insensitive policy: "Foo.txt" and "foo.TXT".
+    // Last entry wins; the index holds exactly one record per key and the
+    // stats count only the kept entry.
+    FakeEnumerator fak;
+    fak.paths = {L"Foo.txt", L"foo.TXT"};
+    FileIndex idx(false);
+    const auto r = idx.build(L"", fak);
+    CHECK(r.ok);
+    CHECK_EQ(idx.size(), 1ull);
+    CHECK_EQ(r.stats.files, 1ull);
+    CHECK_EQ(r.stats.dirs, 0ull);
+
+    FileEntry e;
+    CHECK(idx.find(L"Foo.txt", e));
+    CHECK(idx.find(L"foo.TXT", e)); // both spellings hit the single record
+    CHECK(e.relativePath == L"foo.TXT"); // and it is the last reported one
+});
+
 // ---------------------------------------------------------------------------
 // Full scans
 // ---------------------------------------------------------------------------
@@ -1133,3 +1179,4 @@ int main() {
     CleanupTempDirs();
     return rc;
 }
+

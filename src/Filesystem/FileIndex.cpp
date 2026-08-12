@@ -34,13 +34,32 @@ FileIndex::BuildResult FileIndex::build(const std::wstring& root, IFileEnumerato
 }
 
 void FileIndex::addEntry(FileEntry&& e) {
-    stats_.files += e.isDirectory ? 0 : 1;
-    stats_.dirs += e.isDirectory ? 1 : 0;
-    stats_.bytes += e.isDirectory ? 0 : e.size;
-    // Compute the key BEFORE moving e (argument evaluation order is unspecified,
-    // and std::move would leave e in a moved-from state).
+    // Two entries may fold to the same key (e.g. "Foo.txt" and "foo.TXT" when
+    // the index is case-insensitive and a case-tolerant enumerator reports
+    // both). The semantics are defined as LAST-WINS: the newer entry replaces
+    // the older one, and the index always holds exactly one record per key.
+    // Stats reflect only the kept record, so files == size() stays true.
     const std::wstring k = key(e.relativePath);
-    map_.emplace(k, std::move(e));
+    const bool isDir = e.isDirectory;
+    const uint64_t sz = e.size;
+    auto it = map_.find(k);
+    if (it == map_.end()) {
+        map_.emplace(k, std::move(e));
+    } else {
+        if (it->second.isDirectory) {
+            --stats_.dirs;
+        } else {
+            --stats_.files;
+            stats_.bytes -= it->second.size;
+        }
+        it->second = std::move(e); // replace, do not re-insert (keeps node stable)
+    }
+    if (isDir) {
+        ++stats_.dirs;
+    } else {
+        ++stats_.files;
+        stats_.bytes += sz;
+    }
 }
 
 void FileIndex::setHash(const std::wstring& relativePath,
