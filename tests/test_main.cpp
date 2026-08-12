@@ -39,6 +39,7 @@
 #include "TestHarness.h"
 #include "TestTree.h"
 #include "Threading/ThreadPool.h"
+#include "Util/StrictNumbers.h"
 
 namespace {
 
@@ -259,6 +260,31 @@ public:
 };
 
 } // namespace
+
+TEST("cli: strict numeric parsing rejects junk and overflow", [] {
+    using bv::util::ParseThreadCount;
+    using bv::util::ParseUInt64;
+    uint64_t v = 0;
+    CHECK(ParseUInt64(L"0", v) && v == 0);
+    CHECK(ParseUInt64(L"100", v) && v == 100);
+    CHECK(ParseUInt64(L"18446744073709551615", v) && v == 18446744073709551615ull);
+    CHECK(!ParseUInt64(L"", v));
+    CHECK(!ParseUInt64(L"-1", v));
+    CHECK(!ParseUInt64(L"12abc", v));
+    CHECK(!ParseUInt64(L"abc12", v));
+    CHECK(!ParseUInt64(L"18446744073709551616", v)); // overflows uint64
+    CHECK(!ParseUInt64(L"1.5", v));
+    CHECK(!ParseUInt64(L" 10", v));
+    CHECK(!ParseUInt64(L"10 ", v));
+    unsigned int t = 0;
+    CHECK(ParseThreadCount(L"0", t) && t == 0);
+    CHECK(ParseThreadCount(L"12", t) && t == 12);
+    CHECK(ParseThreadCount(L"4096", t) && t == 4096);
+    CHECK(!ParseThreadCount(L"4097", t));
+    CHECK(!ParseThreadCount(L"-1", t));
+    CHECK(!ParseThreadCount(L"0x10", t));
+    CHECK(!ParseThreadCount(L"1e3", t));
+});
 
 TEST("file index: duplicate folded keys are last-wins with consistent stats", [] {
     // Same key under the case-insensitive policy: "Foo.txt" and "foo.TXT".

@@ -12,6 +12,7 @@
 #include <string>
 
 #include "ScanController.h"
+#include "Util/StrictNumbers.h"
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -74,7 +75,12 @@ bool ParseArgs(int argc, wchar_t** argv, Args& out) {
             else if (m == L"content") { out.mode = bv::ScanMode::Content; }
             else { std::wcerr << L"Modalita sconosciuta: " << m << L"\n"; return false; }
         } else if (a == L"--threads" && i + 1 < argc) {
-            out.threads = static_cast<unsigned int>(std::stoul(argv[++i]));
+            const std::wstring v = argv[++i];
+            if (!bv::util::ParseThreadCount(v, out.threads)) {
+                std::wcerr << L"Valore non valido per --threads (atteso 0-"
+                           << bv::util::kMaxThreads << L"): " << v << L"\n";
+                return false;
+            }
         } else if (a == L"--enum" && i + 1 < argc) {
             const std::wstring b = argv[++i];
             if (b == L"auto") out.backend = bv::EnumeratorBackend::Auto;
@@ -88,7 +94,13 @@ bool ParseArgs(int argc, wchar_t** argv, Args& out) {
         } else if (a == L"--progress") {
             out.progress = true;
         } else if (a == L"--limit" && i + 1 < argc) {
-            out.limit = std::stoull(argv[++i]);
+            const std::wstring v = argv[++i];
+            uint64_t parsed = 0;
+            if (!bv::util::ParseUInt64(v, parsed)) {
+                std::wcerr << L"Valore non valido per --limit: " << v << L"\n";
+                return false;
+            }
+            out.limit = static_cast<size_t>(parsed);
         } else if (a == L"--export" && i + 1 < argc) {
             out.exportPath = argv[++i];
         } else if (a == L"--export-format" && i + 1 < argc) {
