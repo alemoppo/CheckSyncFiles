@@ -1,6 +1,7 @@
 # Build output
 /build/
 /build_gui/
+/bin/
 
 # CMake
 CMakeCache.txt

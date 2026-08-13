@@ -22,7 +22,7 @@ target_link_libraries(bv_cli PRIVATE bv_core shell32)
 if(BUILD_GUI)
   find_package(SDL3 REQUIRED)
   find_package(SDL3_ttf REQUIRED)
-  add_executable(bv_gui
+  add_executable(bv_gui WIN32
     main_gui.cpp
     UI/AppUI.cpp
     UI/Utf.cpp

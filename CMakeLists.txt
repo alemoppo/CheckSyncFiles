@@ -22,6 +22,10 @@ option(BUILD_GUI "Build SDL3 GUI (requires SDL3; Phase 2+)" OFF)
 option(BUILD_TESTS "Build unit tests (Phase 1)" ON)
 option(BUILD_TESTGEN "Build test tree generator tool" ON)
 
+# All executables (CLI, GUI, tools, tests) land in a single top-level bin/
+# folder instead of being scattered in the per-source output dirs.
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/bin")
+
 add_subdirectory(src)
 
 if(BUILD_TESTS)
