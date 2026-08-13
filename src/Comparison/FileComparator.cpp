@@ -258,7 +258,8 @@ void FileComparator::runHashing(
         std::vector<Outcome> outcomes(n);
         for (size_t i = 0; i < n; ++i) {
             const HashPair& hp = pendingHashes_[done + i];
-            pool.submit([this, &hp, &o = outcomes[i], cache, offline] {
+            pool.submit([this, &hp, &o = outcomes[i], cache, offline, cancel] {
+                if (cancel && cancel->load(std::memory_order_relaxed)) return;
                 if (offline) {
                     // Source device absent: use the digest captured in the snapshot.
                     o.hasSrc = source_.getHash(hp.relativePath, o.srcDigest);

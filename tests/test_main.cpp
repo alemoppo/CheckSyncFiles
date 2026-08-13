@@ -247,7 +247,8 @@ public:
     __attribute__((noinline)) bool enumerate(const std::wstring&,
                                              const EntryCallback& onEntry,
                                              const ErrorCallback&,
-                                             const ProgressCallback&) override {
+                                             const ProgressCallback&,
+                                             const std::atomic_bool* = nullptr) override {
         for (auto& p : paths) {
             FileEntry e;
             e.relativePath = p;

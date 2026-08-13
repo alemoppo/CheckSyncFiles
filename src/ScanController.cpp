@@ -46,7 +46,8 @@ void HashSourceIndex(FileIndex& index, const std::wstring& root, ThreadPool& poo
         std::vector<std::array<uint8_t, 32>> digests(n);
         for (size_t i = 0; i < n; ++i) {
             const std::wstring& rel = files[done + i];
-            pool.submit([&root, &rel, &d = digests[i], cache, &cacheHits] {
+            pool.submit([&root, &rel, &d = digests[i], cache, &cacheHits, cancel] {
+                if (cancel && cancel->load(std::memory_order_relaxed)) return;
                 const std::wstring abs = pathutil::MakeAbsolute(root, rel);
                 uint64_t sz = 0;
                 uint64_t mt = 0;

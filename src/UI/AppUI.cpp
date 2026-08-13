@@ -505,6 +505,7 @@ void AppUI::processEvents() {
         switch (ev.type) {
             case SDL_EVENT_QUIT:
                 quit_ = true;
+                cancel_.store(true); // let the worker wind down before the join
                 break;
             case SDL_EVENT_WINDOW_RESIZED:
                 winW_ = ev.window.data1;
@@ -1013,10 +1014,12 @@ void AppUI::render() {
         std::wstring thrInfo;
         if (mode_ == ScanMode::Content) {
             if (running) {
-                if (progress.threads > 0) {
-                    thrInfo = L"→ " + std::to_wstring(progress.threads) + L" thread hash";
-                } else {
-                    thrInfo = L"(hashing in avvio...)";
+                if (progress.phase == ScanPhase::Hashing) {
+                    if (progress.threads > 0) {
+                        thrInfo = L"→ " + std::to_wstring(progress.threads) + L" thread hash";
+                    } else {
+                        thrInfo = L"(hashing in avvio...)";
+                    }
                 }
             } else if (resultsReady_) {
                 thrInfo = L"→ " + std::to_wstring(threadCountUsed) + L" thread hash";

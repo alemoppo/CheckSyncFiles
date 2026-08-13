@@ -20,7 +20,8 @@ public:
     bool enumerate(const std::wstring& root,
                    const EntryCallback& onEntry,
                    const ErrorCallback& onError,
-                   const ProgressCallback& onProgress = {}) override;
+                   const ProgressCallback& onProgress = {},
+                   const std::atomic_bool* cancel = nullptr) override;
 };
 
 } // namespace bv

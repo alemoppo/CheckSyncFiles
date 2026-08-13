@@ -575,7 +575,8 @@ bool MftEnumerator::IsSupported(const std::wstring& root) {
 bool MftEnumerator::enumerate(const std::wstring& root,
                               const EntryCallback& onEntry,
                               const ErrorCallback& onError,
-                              const ProgressCallback& onProgress) {
+                              const ProgressCallback& onProgress,
+                              const std::atomic_bool* cancel) {
     const std::wstring normRoot = pathutil::NormalizeRoot(root);
     if (normRoot.size() < 3 || normRoot[1] != L':' || normRoot[0] == L'\\' ||
         normRoot[0] == L'/') {
@@ -672,12 +673,16 @@ const uint64_t segSize = vd.BytesPerFileRecordSegment;
     // clusters. `cb` receives (recordIndex, recordBytes, recordSize).
     constexpr DWORD kMaxBuf = 8 * 1024 * 1024;
     std::vector<uint8_t> buf(kMaxBuf);
+    const auto cancelledNow = [&]() {
+        return cancel && cancel->load(std::memory_order_relaxed);
+    };
     const auto foreachRecord = [&](const auto& cb) {
         for (const auto& run : runs) {
             const uint64_t runStartMft = (uint64_t)run.startVcn * cluster; // MFT-relative byte
             const uint64_t runBytes = (uint64_t)run.len * cluster;
             uint64_t within = 0;
             while (within < runBytes) {
+                if (cancelledNow()) return; // long raw sweep: poll the cancel flag
                 const DWORD want = (DWORD)std::min<uint64_t>(kMaxBuf, runBytes - within);
                 LARGE_INTEGER li;
                 li.QuadPart = (LONGLONG)((uint64_t)run.lcn * cluster + within);
@@ -706,6 +711,10 @@ const uint64_t segSize = vd.BytesPerFileRecordSegment;
             ParseIndexRootValue(r.idxRoot, r.children); // resolve in a second pass below
         }
     });
+    if (cancelledNow()) {
+        CloseHandle(hVol);
+        return true; // aborted during the raw MFT sweep
+    }
 
     bool incomplete = false;
     auto failIncomplete = [&](const wchar_t* why, uint64_t rec) {
@@ -761,6 +770,10 @@ const uint64_t segSize = vd.BytesPerFileRecordSegment;
     std::unordered_map<uint64_t, std::vector<uint32_t>> revChildren;
     revChildren.reserve(nRecords);
     for (uint64_t i = 0; i < nRecords; ++i) {
+        if (cancelledNow()) {
+            CloseHandle(hVol);
+            return true;
+        }
         const RecInfo& r = recs[i];
         if (!r.parsed || !r.inUse || r.names.empty()) continue;
         for (const auto& nm : r.names) {
@@ -788,6 +801,10 @@ const uint64_t segSize = vd.BytesPerFileRecordSegment;
     };
 
     while (!work.empty()) {
+        if (cancelledNow()) {
+            CloseHandle(hVol);
+            return true;
+        }
         const auto top = work.back();
         work.pop_back();
         const uint64_t dirRec = top.first;

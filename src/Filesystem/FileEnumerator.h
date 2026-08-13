@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <string>
@@ -41,10 +42,14 @@ public:
     //
     // `onProgress` (optional) is invoked periodically with running totals to
     // drive a progress bar; a default no-op is used when omitted.
+    // `cancel` (optional) is polled by the enumerator so long internal passes
+    // (e.g. the raw MFT record sweep) can be aborted promptly, not only when
+    // the next entry callback fires.
     virtual bool enumerate(const std::wstring& root,
                            const EntryCallback& onEntry,
                            const ErrorCallback& onError,
-                           const ProgressCallback& onProgress = {}) = 0;
+                           const ProgressCallback& onProgress = {},
+                           const std::atomic_bool* cancel = nullptr) = 0;
 };
 
 } // namespace bv

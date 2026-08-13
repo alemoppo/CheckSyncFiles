@@ -26,7 +26,8 @@ FileIndex::BuildResult FileIndex::build(const std::wstring& root, IFileEnumerato
             return true;
         },
         [&result](const ScanError& err) { result.errors.push_back(err); },
-        onProgress);
+        onProgress,
+        cancel);
 
     result.ok = ok;
     result.stats = stats_;

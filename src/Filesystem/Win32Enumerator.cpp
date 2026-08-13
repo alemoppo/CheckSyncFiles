@@ -26,7 +26,8 @@ uint64_t MakeSize64(DWORD high, DWORD low) {
 bool Win32Enumerator::enumerate(const std::wstring& root,
                                 const EntryCallback& onEntry,
                                 const ErrorCallback& onError,
-                                const ProgressCallback& onProgress) {
+                                const ProgressCallback& onProgress,
+                                const std::atomic_bool* cancel) {
     const std::wstring normRoot = pathutil::NormalizeRoot(root);
     if (normRoot.empty()) {
         onError({L"", L"Root path is empty", ERROR_INVALID_NAME});
@@ -87,6 +88,10 @@ bool Win32Enumerator::enumerate(const std::wstring& root,
 
         bool abort = false;
         do {
+            if (cancel && cancel->load(std::memory_order_relaxed)) {
+                abort = true;
+                break;
+            }
             if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) {
                 continue;
             }
