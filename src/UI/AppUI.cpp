@@ -1007,11 +1007,18 @@ void AppUI::render() {
         DrawToggle(renderer_, fontBody_, threadNames[i], kMargin + 60 + i * tr, L.y4 + 2,
                    tr - 10, 22, threadSel_ == i);
     }
-    // Number of hash workers actually launched (resolved "auto" too).
+    // Number of hash workers actually launched (resolved "auto" too), live
+    // while the Hashing phase is running.
     {
         std::wstring thrInfo;
         if (mode_ == ScanMode::Content) {
-            if (running || resultsReady_) {
+            if (running) {
+                if (progress.threads > 0) {
+                    thrInfo = L"→ " + std::to_wstring(progress.threads) + L" thread hash";
+                } else {
+                    thrInfo = L"(hashing in avvio...)";
+                }
+            } else if (resultsReady_) {
                 thrInfo = L"→ " + std::to_wstring(threadCountUsed) + L" thread hash";
             } else {
                 thrInfo = L"(auto: stimato al lancio)";

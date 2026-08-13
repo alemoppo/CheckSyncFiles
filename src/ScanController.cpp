@@ -109,6 +109,10 @@ ScanReport ScanController::run(const ScanOptions& options) {
         }
     }
 
+    // Live count of hash workers, reported in ScanProgress during the Hashing
+    // phase so a UI can show the actual pool size while it runs (0 elsewhere).
+    unsigned int hashThreadsActive = 0;
+
     const auto emitProgress = [&](ScanPhase phase, uint64_t files, uint64_t dirs,
                                   const std::wstring& path) {
         if (options.onProgress) {
@@ -117,6 +121,7 @@ ScanReport ScanController::run(const ScanOptions& options) {
             p.files = files;
             p.dirs = dirs;
             p.currentPath = path;
+            p.threads = hashThreadsActive;
             options.onProgress(p);
         }
     };
@@ -245,7 +250,9 @@ ScanReport ScanController::run(const ScanOptions& options) {
         // source a second time.
         if (haveSnapshot && report.sourceOk) {
             if (mode == ScanMode::Content) {
-                ThreadPool sourcePool(resolveHashThreads());
+                const unsigned int srcThreads = resolveHashThreads();
+                hashThreadsActive = srcThreads;
+                ThreadPool sourcePool(srcThreads);
                 std::atomic<size_t> hits{0};
                 const auto hashProgress = [&](uint64_t done, uint64_t total) {
                     emitProgress(ScanPhase::Hashing, done, total, L"");
@@ -253,11 +260,10 @@ ScanReport ScanController::run(const ScanOptions& options) {
                 const double th0 = NowSeconds();
                 HashSourceIndex(sourceIndex, options.source, sourcePool, options.cancel,
                                 cache.get(), hits, hashProgress);
+                hashThreadsActive = 0;
                 report.secondsHashing += NowSeconds() - th0;
                 report.hashCacheHits += hits.load();
-                report.hashThreadsUsed = options.hashThreads == 0
-                                             ? resolveHashThreads()
-                                             : options.hashThreads;
+                report.hashThreadsUsed = srcThreads;
                 sourceHashesReady = true;
             }
             std::wstring werr;
@@ -298,15 +304,17 @@ ScanReport ScanController::run(const ScanOptions& options) {
 
         if (mode == ScanMode::Content && destOk &&
             !(options.cancel && options.cancel->load())) {
-            const unsigned int hashThreads = resolveHashThreads();
-            report.hashThreadsUsed = hashThreads;
-            ThreadPool hashPool(hashThreads);
+            const unsigned int destThreads = resolveHashThreads();
+            report.hashThreadsUsed = destThreads;
+            hashThreadsActive = destThreads;
+            ThreadPool hashPool(destThreads);
             const auto hashProgress = [&](uint64_t done, uint64_t total) {
                 emitProgress(ScanPhase::Hashing, done, total, L"");
             };
             const double th1 = NowSeconds();
             comparator->runHashing(hashPool, report.results, options.cancel, hashProgress,
                                    cache.get());
+            hashThreadsActive = 0;
             report.secondsHashing += NowSeconds() - th1;
             report.hashCacheHits += comparator->cacheHits();
         }

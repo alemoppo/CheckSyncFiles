@@ -32,6 +32,9 @@ struct ScanProgress {
     uint64_t files = 0;   // files visited in the current phase
     uint64_t dirs = 0;    // directories visited in the current phase
     std::wstring currentPath; // directory currently being processed
+    // Number of hash workers actually running during ScanPhase::Hashing
+    // (live, updated while the phase is in progress); 0 in the other phases.
+    unsigned int threads = 0;
 };
 
 struct ScanOptions {
