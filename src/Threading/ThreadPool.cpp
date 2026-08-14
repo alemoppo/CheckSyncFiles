@@ -29,6 +29,12 @@ void ThreadPool::waitAll() {
     doneCv_.wait(lk, [&] { return completed_ >= target; });
 }
 
+void ThreadPool::waitOutstandingBelow(uint64_t maxOutstanding) {
+    if (nThreads_ == 0) return;
+    std::unique_lock<std::mutex> lk(mutex_);
+    doneCv_.wait(lk, [&] { return (issued_ - completed_) <= maxOutstanding; });
+}
+
 void ThreadPool::workerLoop() {
     for (;;) {
         std::function<void()> task;

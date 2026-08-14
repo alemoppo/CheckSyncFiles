@@ -733,6 +733,93 @@ TEST("threadpool: task exceptions are counted, never kill the pool", [] {
     CHECK_EQ(pool.taskErrors(), 1ull);
 });
 
+TEST("threadpool: waitOutstandingBelow() under the cap returns without waiting", [] {
+    bv::ThreadPool pool(4);
+    std::atomic<int> done{0};
+    for (int i = 0; i < 10; ++i) pool.submit([&] { done.fetch_add(1); });
+    // A generous cap is satisfied immediately: no blocking, unlike waitAll().
+    pool.waitOutstandingBelow(100);
+    pool.waitAll();
+    CHECK_EQ(done.load(), 10);
+});
+
+TEST("threadpool: waitOutstandingBelow() blocks until in-flight drops below the cap", [] {
+    bv::ThreadPool pool(1);
+    std::atomic<bool> taskStarted{false};
+    std::atomic<bool> waitReturned{false};
+    std::promise<void> gate;
+
+    pool.submit([&] {
+        taskStarted.store(true, std::memory_order_release);
+        gate.get_future().wait();
+    });
+    while (!taskStarted.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+    // The single task is still running => 1 outstanding. Cap 0 must not be met
+    // until the task finishes.
+    std::thread waiter([&] {
+        pool.waitOutstandingBelow(0);
+        waitReturned.store(true, std::memory_order_release);
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    CHECK_MSG(!waitReturned.load(std::memory_order_acquire),
+              "waitOutstandingBelow(0) returned while a task was still in flight");
+    gate.set_value();
+    waiter.join();
+    CHECK(waitReturned.load(std::memory_order_acquire));
+});
+
+TEST("threadpool: waitOutstandingBelow() throttles, not drains", [] {
+    // pool(1): task 0 blocks on the first gate; tasks 1..7 block on a second
+    // gate kept closed until after the wait returns. While both gates are shut,
+    // 8 tasks are submitted and none has finished (outstanding == 8), so
+    // waitOutstandingBelow(7) must NOT return. Opening only the first gate lets
+    // exactly task 0 finish: outstanding drops to 7 (the cap) and the wait
+    // returns while tasks 1..7 are still blocked -- the pool is throttled, not
+    // drained. Releasing the second gate then finishes everything.
+    bv::ThreadPool pool(1);
+    const int k = 8;
+    std::atomic<int> started{0};
+    std::promise<void> gate0;
+    std::promise<void> gate1p;
+    std::shared_future<void> gate1 = gate1p.get_future();
+
+    pool.submit([&] {
+        started.fetch_add(1);
+        gate0.get_future().wait();
+    });
+    for (int i = 1; i < k; ++i) {
+        pool.submit([&] {
+            started.fetch_add(1);
+            gate1.wait();
+        });
+    }
+    // Task 0 has been dequeued and is blocked; tasks 1..7 sit queued behind it,
+    // so all 8 tasks are submitted-but-not-finished (outstanding == 8).
+    while (started.load() < 1) std::this_thread::yield();
+
+    std::atomic<bool> waitReturned{false};
+    std::thread waiter([&] {
+        pool.waitOutstandingBelow(k - 1);
+        waitReturned.store(true, std::memory_order_release);
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    CHECK_MSG(!waitReturned.load(std::memory_order_acquire),
+              "waitOutstandingBelow(k-1) returned while k tasks were in flight");
+    gate0.set_value();
+    waiter.join();
+    CHECK(waitReturned.load(std::memory_order_acquire));
+    // Only some of the work completed before the wait returned (in-flight fell to
+    // the cap); the rest is still queued/blocked -- the pool was NOT drained.
+    const int startedAtReturn = started.load();
+    CHECK_MSG(startedAtReturn >= 1 && startedAtReturn < k,
+              "waitOutstandingBelow() returned only after partial completion");
+    gate1p.set_value();
+    pool.waitAll();
+    CHECK_EQ(started.load(), k);
+});
+
 TEST("ioclass: classify local vs network", [] {
     using namespace bv;
     CHECK(ClassifyIoClass(L"D:\\a", L"D:\\b") == IoClass::LocalLocal);
@@ -1593,6 +1680,36 @@ private:
     bv::ScanError err_;
 };
 
+// Emits its entries, counting each one (so another enumerator can gate on "this
+// side has produced enough"), stops early as soon as `cancel` is set, and if it
+// reaches the end of the stream first, waits for cancellation before reporting
+// it -- so a test can deterministically end this side as Cancelled while the
+// other side is still enumerating. The per-entry cancel check makes this the
+// mid-stream cancellation shape for the content-overlap tests.
+class CountingCancelAwareEnumerator : public bv::IFileEnumerator {
+public:
+    CountingCancelAwareEnumerator(std::vector<FileEntry> entries, std::atomic<int>* emitted,
+                                  const std::atomic_bool* cancel)
+        : entries_(std::move(entries)), emitted_(emitted), cancel_(cancel) {}
+    bool enumerate(const std::wstring&, const EntryCallback& onEntry, const ErrorCallback&,
+                   const ProgressCallback&, const std::atomic_bool*) override {
+        for (FileEntry& e : entries_) {
+            if (cancel_ && cancel_->load(std::memory_order_acquire)) return false;
+            if (emitted_) emitted_->fetch_add(1, std::memory_order_relaxed);
+            if (!onEntry(FileEntry(e))) return false;
+        }
+        if (cancel_) {
+            while (!cancel_->load(std::memory_order_acquire)) std::this_thread::yield();
+        }
+        return false; // cancellation was requested during the walk
+    }
+
+private:
+    std::vector<FileEntry> entries_;
+    std::atomic<int>* emitted_;
+    const std::atomic_bool* cancel_;
+};
+
 // Runs the concurrent comparer against two real trees. Both sides default to
 // Win32; callers can inject custom enumerator factories / a whole fallback chain.
 ConcurrentComparer::Result RunConcurrent(
@@ -1940,6 +2057,175 @@ TEST("concurrent comparer: hash workers always use their own candidate", [] {
         CHECK(r.results.problems[0].status == Status::ContentMismatch);
         CHECK(r.results.problems[0].relativePath == L"f0.dat");
     }
+});
+
+TEST("concurrent comparer: >batch content overlap is correct, deterministic, progress-consistent", [] {
+    // 600 same-size files on both sides: several 256-candidate batches are
+    // submitted while both workers are still enumerating (live A + live B). The
+    // overlapped run must match the serial reference exactly, and hash progress
+    // must never report done > total or a regressing count, ending at done ==
+    // total == every candidate.
+    const auto dir = MakeTempDir();
+    const size_t count = 600; // > kHashBatchSize (256): several overlapping batches
+    const std::wstring src = dir + L"\\src";
+    const std::wstring dst = dir + L"\\dst";
+    testgen::CreateStressTree(src, count);
+    fs::copy(src, dst, fs::copy_options::recursive);
+
+    ConcurrentComparer::Result serial;
+    {
+        bv::ThreadPool pool(0); // synchronous submit: no overlap, a reference
+        ConcurrentComparer cmp(false, ScanMode::Content, false, src, dst,
+                               ConcurrentComparer::SourceKind::Live, nullptr);
+        serial = cmp.runWithFactories(MakeWin32Factory, MakeWin32Factory, pool);
+    }
+
+    std::vector<std::pair<uint64_t, uint64_t>> emissions;
+    bool invariantOk = true;
+    ConcurrentComparer::Result parallel;
+    {
+        bv::ThreadPool pool(4);
+        ConcurrentComparer cmp(false, ScanMode::Content, false, src, dst,
+                               ConcurrentComparer::SourceKind::Live, nullptr);
+        auto onHashProgress = [&](uint64_t done, uint64_t total) {
+            if (done > total) invariantOk = false; // never more done than discovered
+            if (!emissions.empty()) {
+                if (done < emissions.back().first) invariantOk = false;   // done is monotone
+                if (total < emissions.back().second) invariantOk = false; // total is monotone
+            }
+            emissions.emplace_back(done, total);
+        };
+        parallel = cmp.runWithFactories(MakeWin32Factory, MakeWin32Factory, pool,
+                                        {}, onHashProgress);
+    }
+
+    CHECK(parallel.sourceStatus == ConcurrentComparer::WorkerStatus::Success);
+    CHECK(parallel.destinationStatus == ConcurrentComparer::WorkerStatus::Success);
+    CHECK_EQ(parallel.results.stats.identicalFiles, count);
+    CHECK(parallel.results.problems.empty());
+    CHECK_MSG(SameResults(serial.results, parallel.results),
+              "overlapped hashing must not change the logical results");
+    CHECK_MSG(invariantOk, "hash progress violated done<=total or monotonicity");
+    CHECK(!emissions.empty());
+    // The last emission (after the final drain) reports a fully completed run.
+    CHECK_EQ(emissions.back().first, count);
+    CHECK_EQ(emissions.back().second, count);
+});
+
+TEST("concurrent comparer: FromIndex content overlap verifies a large tree against the live destination",
+     [] {
+    // Offline source (FromIndex): digests come from the index, the destination
+    // is read live. 600 candidates again exceed the batch size, so batches are
+    // submitted while the destination is still enumerating. Only the
+    // destination is ever touched for hashing.
+    const auto dir = MakeTempDir();
+    const size_t count = 600;
+    const std::wstring src = dir + L"\\src";
+    const std::wstring dst = dir + L"\\dst";
+    testgen::CreateStressTree(src, count);
+    fs::copy(src, dst, fs::copy_options::recursive);
+
+    FileIndex idx(false);
+    {
+        Win32Enumerator en;
+        const auto br = idx.build(src, en);
+        CHECK(br.ok);
+    }
+    for (const auto& [key, e] : idx.entries()) {
+        if (e.isDirectory) continue;
+        std::array<uint8_t, 32> digest;
+        CHECK(hashing::Sha256File(src + L"\\" + e.relativePath, digest) == hashing::HashStatus::Ok);
+        idx.setHash(e.relativePath, digest);
+    }
+    CHECK_EQ(idx.hashCount(), count);
+
+    bv::ThreadPool pool(4);
+    ConcurrentComparer cmp(false, ScanMode::Content, false, src, dst,
+                           ConcurrentComparer::SourceKind::FromIndex, &idx);
+    const auto r = cmp.runWithFactories(MakeWin32Factory, MakeWin32Factory, pool);
+
+    CHECK(r.sourceStatus == ConcurrentComparer::WorkerStatus::Success);
+    CHECK(r.destinationStatus == ConcurrentComparer::WorkerStatus::Success);
+    CHECK_EQ(r.results.stats.identicalFiles, count);
+    CHECK_EQ(r.results.stats.contentMismatch, 0ull);
+    CHECK(r.results.problems.empty());
+});
+
+TEST("concurrent comparer: cancel mid-content-hash drains submitted jobs, fabricates no verdicts", [] {
+    // Cancellation is requested while content candidates are still being hashed
+    // on a live pool. Both workers must stop promptly, the run must return
+    // (submitted hash jobs drain -- no deadlock in the bounded in-flight wait),
+    // and no missing/extra may be fabricated from a partial walk.
+    const auto dir = MakeTempDir();
+    const size_t count = 600;
+    const std::wstring src = dir + L"\\src";
+    const std::wstring dst = dir + L"\\dst";
+    testgen::CreateStressTree(src, count);
+    fs::copy(src, dst, fs::copy_options::recursive);
+    const auto srcEntries = CaptureEntries(src);
+    const auto dstEntries = CaptureEntries(dst);
+
+    std::atomic_bool cancel{false};
+    std::atomic<int> destEmitted{0};
+    bv::ThreadPool pool(4);
+    ConcurrentComparer cmp(false, ScanMode::Content, false, src, dst,
+                           ConcurrentComparer::SourceKind::Live, nullptr, &cancel);
+    // The destination emits entries (counting them) and stops as soon as cancel
+    // is set. The source emits everything and only then requests cancellation,
+    // gated on the destination having produced enough entries that at least one
+    // 256-candidate hash batch was already submitted: hashing is in flight when
+    // cancellation is signalled.
+    auto srcFac = [&] {
+        return std::unique_ptr<IFileEnumerator>(new ReplayEnumerator(
+            srcEntries, {},
+            [&] {
+                while (destEmitted.load(std::memory_order_acquire) < 300)
+                    std::this_thread::yield();
+                cancel.store(true, std::memory_order_release);
+            }));
+    };
+    auto dstFac = [&] {
+        return std::unique_ptr<IFileEnumerator>(
+            new CountingCancelAwareEnumerator(dstEntries, &destEmitted, &cancel));
+    };
+    const auto r = cmp.runWithFactories(std::move(srcFac), std::move(dstFac), pool);
+
+    // Cancellation was requested during the walk (the source sets it as its
+    // final act), so neither side is a clean Success: both report Cancelled.
+    CHECK(r.sourceStatus == ConcurrentComparer::WorkerStatus::Cancelled);
+    CHECK(r.destinationStatus == ConcurrentComparer::WorkerStatus::Cancelled);
+    CHECK_EQ(r.results.stats.missingFiles + r.results.stats.missingDirs +
+                 r.results.stats.extraFiles + r.results.stats.extraDirs, 0ull);
+    CHECK_MSG(r.results.stats.identicalFiles > 0,
+              "content pairs submitted before cancellation must still be classified");
+});
+
+TEST("concurrent comparer: destination failure with submitted hashes drains without hanging", [] {
+    // The destination emits enough entries to submit content-hash work and then
+    // reports an incomplete scan. The already-submitted hash jobs must drain,
+    // the run must return, and the failed side's partial walk must not fabricate
+    // missing/extra verdicts.
+    const auto dir = MakeTempDir();
+    const size_t count = 600;
+    const std::wstring src = dir + L"\\src";
+    const std::wstring dst = dir + L"\\dst";
+    testgen::CreateStressTree(src, count);
+    fs::copy(src, dst, fs::copy_options::recursive);
+    const auto dstEntries = CaptureEntries(dst);
+
+    bv::ThreadPool pool(4);
+    ConcurrentComparer cmp(false, ScanMode::Content, false, src, dst,
+                           ConcurrentComparer::SourceKind::Live, nullptr);
+    auto dstFac = [&] {
+        return std::unique_ptr<IFileEnumerator>(
+            new FailAfterNEnumerator(dstEntries, dstEntries.size()));
+    };
+    const auto r = cmp.runWithFactories(MakeWin32Factory, std::move(dstFac), pool);
+
+    CHECK(r.sourceStatus == ConcurrentComparer::WorkerStatus::Success);
+    CHECK(r.destinationStatus == ConcurrentComparer::WorkerStatus::Failed);
+    CHECK_EQ(r.results.stats.missingFiles + r.results.stats.missingDirs +
+                 r.results.stats.extraFiles + r.results.stats.extraDirs, 0ull);
 });
 
 TEST("concurrent comparer: FromIndex source verifies against a live destination", [] {

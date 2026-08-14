@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -35,8 +36,9 @@ namespace bv {
 //
 // Memory bound: the match table throttles a side that runs ahead of the other; a
 // device can never push its entries arbitrarily far past what the other device
-// has produced. Content verification runs after BOTH workers finish, on the
-// caller's pool.
+// has produced. Content verification overlaps with enumeration: pending same-size
+// pairs are submitted to the caller's pool as they accumulate, and the number of
+// in-flight SHA-256 tasks is bounded so a fast scanner cannot flood the queue.
 //
 // Outcome gating: Missing/Extra are reported only when both sides succeeded and
 // no cancellation happened. If a side fails (e.g. an MFT scan goes incomplete
@@ -159,8 +161,11 @@ private:
     void sortProblems(ResultSet& out);
     // Content mode: hashes pending same-size pairs through the shared pool as
     // soon as a full batch accumulates (overlapping hashing with enumeration),
-    // and drains whatever remains at finalization. waitAll() per batch keeps the
-    // number of outstanding SHA-256 tasks bounded.
+    // and drains whatever remains at finalization. Before each batch the pool is
+    // asked to wait until the number of outstanding tasks drops below
+    // kHashMaxOutstanding; the workers only block when the queue is genuinely
+    // backed up, so overlap is kept without ever stalling enumeration for a whole
+    // batch. The submitted tasks update hashDone_ as they finish.
     void FlushHashCandidates(std::vector<ContentCandidate>& pending, ConcurrentSink& sink);
 
     bool caseSensitive_;
@@ -180,12 +185,19 @@ private:
 
     // Content-hash overlap context, set once in runImpl before any worker starts
     // and only read afterwards (the atomics below are written by the workers and
-    // the final drain).
+    // the final drain). kHashBatchSize bounds how many candidates a worker
+    // carries between flushes; kHashMaxOutstanding bounds the in-flight tasks in
+    // the pool across both workers.
+    static constexpr size_t kHashBatchSize = 256;
+    static constexpr size_t kHashMaxOutstanding = 1024;
     ThreadPool* hashPool_ = nullptr;
     bool offlineSource_ = false; // source digests come from fromIndex_
     hashing::HashCache* cache_ = nullptr;
-    std::atomic<uint64_t> hashDone_{0};       // candidates hashed so far
+    std::atomic<uint64_t> hashDone_{0};       // candidates hashed so far (tasks)
     std::atomic<uint64_t> totalCandidates_{0}; // candidates discovered so far
+    // Serializes onHashProgress_ invocations: both workers and the final drain
+    // can emit hash progress from different threads.
+    std::mutex hashProgressMutex_;
 };
 
 } // namespace bv

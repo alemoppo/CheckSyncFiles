@@ -149,22 +149,26 @@ ConcurrentComparer::Result ConcurrentComparer::runImpl(
     if (clean) {
         if (mode_ == ScanMode::Content) {
             // Full batches were hashed while the workers were still enumerating;
-            // flush whatever is left and then wait for the last batch. After this
-            // no hash task can still touch the sink.
+            // flush whatever is left. The submitted tasks run asynchronously; the
+            // final waitAll below guarantees that none can still touch the sink
+            // when it is taken.
             FlushHashCandidates(candidatesA, sink);
             FlushHashCandidates(candidatesB, sink);
-            if (onHashProgress_) {
-                onHashProgress_(hashDone_.load(std::memory_order_relaxed),
-                                totalCandidates_.load(std::memory_order_relaxed));
-            }
         }
         finalizeMissingExtra(table, post);
     }
 
-    // Defensive: no submitted hash task may still be running when the sink is
-    // taken (each batch above already ends with a waitAll, so this is normally a
-    // no-op, but it guarantees the invariant even if a future path submits more).
+    // No submitted hash task may still be running when the sink is taken.
     hashPool.waitAll();
+
+    // Final progress: after waitAll every discovered candidate has been hashed,
+    // so done == total. Only emitted for a clean Content run; otherwise the
+    // count would legitimately be partial because leftovers were never hashed.
+    if (clean && mode_ == ScanMode::Content && onHashProgress_) {
+        std::lock_guard<std::mutex> lk(hashProgressMutex_);
+        onHashProgress_(hashDone_.load(std::memory_order_relaxed),
+                        totalCandidates_.load(std::memory_order_relaxed));
+    }
 
     r.results = sink.take();
     AddStats(r.results.stats, post.stats);
@@ -207,8 +211,9 @@ void ConcurrentComparer::onEntry(int side, FileEntry e, MatchTable& table, Concu
         totalCandidates_.fetch_add(1, std::memory_order_relaxed);
         // Once a full batch of same-size pairs has accumulated, push it to the
         // hash pool so SHA-256 work overlaps with the enumeration that is still
-        // running (the other side, in a live-live scan). waitAll() per batch
-        // keeps the number of outstanding tasks bounded. Called from the worker
+        // running (the other side, in a live-live scan). FlushHashCandidates
+        // bounds the outstanding tasks instead of stopping the worker per batch,
+        // and the submitted tasks count themselves done. Called from the worker
         // thread, never under a table shard lock.
         if (candidates.size() >= kHashBatchSize) {
             FlushHashCandidates(candidates, sink);
@@ -219,16 +224,24 @@ void ConcurrentComparer::onEntry(int side, FileEntry e, MatchTable& table, Concu
 void ConcurrentComparer::FlushHashCandidates(std::vector<ContentCandidate>& pending,
                                              ConcurrentSink& sink) {
     while (!pending.empty()) {
+        // Backpressure without stalling enumeration for a whole batch: block
+        // only while the pool is genuinely backed up (kHashMaxOutstanding is the
+        // pool-wide bound shared by both workers, so a fast scanner can never
+        // flood the queue). Safe from any worker thread; never blocks forever
+        // because hash tasks always terminate on their own.
+        hashPool_->waitOutstandingBelow(kHashMaxOutstanding);
         const size_t n = std::min(kHashBatchSize, pending.size());
         const size_t start = pending.size() - n;
         std::vector<ContentCandidate> batch(pending.begin() + start, pending.end());
         pending.resize(start);
         SubmitHashCandidates(batch, *hashPool_, offlineSource_,
                              offlineSource_ ? fromIndex_ : nullptr, sourceRoot_, destRoot_, sink,
-                             cancel_, cache_, cacheHits_);
-        hashPool_->waitAll(); // bound outstanding work; safe from an external thread
-        hashDone_.fetch_add(n, std::memory_order_relaxed);
+                             cancel_, cache_, cacheHits_, &hashDone_);
+        // The submitted tasks count themselves done as they finish; report
+        // completion so far so progress keeps moving while the workers are still
+        // enumerating.
         if (onHashProgress_) {
+            std::lock_guard<std::mutex> lk(hashProgressMutex_);
             onHashProgress_(hashDone_.load(std::memory_order_relaxed),
                             totalCandidates_.load(std::memory_order_relaxed));
         }

@@ -137,15 +137,26 @@ void SubmitHashCandidates(const std::vector<ContentCandidate>& candidates, Threa
                           bool offlineSource, FileIndex* index,
                           const std::wstring& sourceRoot, const std::wstring& destRoot,
                           ConcurrentSink& sink, const std::atomic_bool* cancel,
-                          hashing::HashCache* cache, std::atomic<size_t>& cacheHits) {
+                          hashing::HashCache* cache, std::atomic<size_t>& cacheHits,
+                          std::atomic<uint64_t>* hashDone) {
     for (const ContentCandidate& c : candidates) {
         // The candidate is captured BY VALUE: the batch vector may be reused or
         // destroyed as soon as this call returns, and a task can never confuse
         // one candidate with a neighbouring element.
         pool.submit([c, offlineSource, index, &sourceRoot, &destRoot, &sink, cancel, cache,
-                     &cacheHits] {
-            HashOneCandidateInto(c, offlineSource, index, sourceRoot, destRoot, sink, cancel,
-                                 cache, cacheHits);
+                     &cacheHits, hashDone] {
+            // HashOneCandidateInto never throws in practice (every failure is
+            // folded into the sink), but if it did the candidate would still be
+            // counted as done so progress can reach 100%; the pool also records
+            // the throw as a task error for the caller.
+            try {
+                HashOneCandidateInto(c, offlineSource, index, sourceRoot, destRoot, sink, cancel,
+                                     cache, cacheHits);
+            } catch (...) {
+                if (hashDone) hashDone->fetch_add(1, std::memory_order_relaxed);
+                throw;
+            }
+            if (hashDone) hashDone->fetch_add(1, std::memory_order_relaxed);
         });
     }
 }

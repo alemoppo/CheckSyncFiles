@@ -61,6 +61,15 @@ public:
     // call from any external thread (e.g. the GUI / UI thread).
     void waitAll();
 
+    // Bounded backpressure for producers that submit in bursts: blocks until
+    // at most `maxOutstanding` tasks are submitted-but-not-finished, then
+    // returns. This lets a producer submit work and keep going without ever
+    // draining the pool (unlike waitAll), while still keeping the internal
+    // queue size bounded. Safe to call from any external thread, including
+    // several producers at once (each waits for the shared in-flight count to
+    // drop); must NOT be called from inside a task (would deadlock).
+    void waitOutstandingBelow(uint64_t maxOutstanding);
+
     unsigned int threadCount() const { return nThreads_; }
 
     // Number of tasks that threw while running. Exceptions never kill a worker;

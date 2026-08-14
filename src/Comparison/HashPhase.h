@@ -38,16 +38,23 @@ namespace bv {
 // SubmitHashCandidates() submits one task per candidate; each task captures its
 // candidate by value, so the input vector can be reused/destroyed as soon as
 // the call returns. It performs NO synchronization: the caller is responsible
-// for bounding outstanding work (submit at most kHashBatchSize candidates and
-// then pool.waitAll()) and for ensuring no task can still touch `sink` before
-// it is read (a final pool.waitAll()).
-constexpr size_t kHashBatchSize = 256; // candidates per bounded batch
+// for bounding outstanding work and for ensuring no task can still touch
+// `sink` before it is read (a final pool.waitAll()).
+//
+// `hashDone` (optional) is a completion counter: each task increments it after
+// it hashes its candidate (even if the task throws, so progress can still reach
+// 100%). It lets a concurrent producer report accurate "completed" progress
+// without waiting for batches to drain. Pass nullptr when progress is tracked
+// elsewhere (e.g. RunHashPhase counts its own batches).
+constexpr size_t kHashBatchSize = 256;      // candidates per submission batch
+constexpr size_t kHashMaxOutstanding = 1024; // cap on submitted-but-not-finished tasks
 
 void SubmitHashCandidates(const std::vector<ContentCandidate>& candidates, ThreadPool& pool,
                           bool offlineSource, FileIndex* index,
                           const std::wstring& sourceRoot, const std::wstring& destRoot,
                           ConcurrentSink& sink, const std::atomic_bool* cancel,
-                          hashing::HashCache* cache, std::atomic<size_t>& cacheHits);
+                          hashing::HashCache* cache, std::atomic<size_t>& cacheHits,
+                          std::atomic<uint64_t>* hashDone = nullptr);
 
 // Legacy whole-phase entry point (serial comparator): hashes `candidates` in
 // bounded batches of kHashBatchSize and folds the outcomes into `out`.
