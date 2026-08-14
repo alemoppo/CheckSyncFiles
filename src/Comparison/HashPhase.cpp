@@ -39,9 +39,13 @@ void RunHashPhase(const std::vector<ContentCandidate>& candidates, ThreadPool& p
         const size_t n = std::min(kHashBatch, total - done);
         std::vector<Outcome> outcomes(n);
         for (size_t i = 0; i < n; ++i) {
-            const ContentCandidate& c = candidates[done + i];
-            pool.submit([&c, offlineSource, index, &sourceRoot, &destRoot, &outcomes, i, cache,
-                         &cacheHits, cancel] {
+            // Capture the stable vector index, not a reference to the element:
+            // `candidates` is const and untouched until pool.waitAll() drains
+            // this batch, so the element stays valid for the whole task lifetime.
+            const size_t candidate = done + i;
+            pool.submit([&candidates, candidate, offlineSource, index, &sourceRoot, &destRoot,
+                         &outcomes, i, cache, &cacheHits, cancel] {
+                const ContentCandidate& c = candidates[candidate];
                 Outcome& o = outcomes[i];
                 if (cancel && cancel->load(std::memory_order_relaxed)) return;
                 if (offlineSource) {

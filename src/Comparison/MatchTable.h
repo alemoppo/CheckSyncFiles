@@ -97,13 +97,19 @@ public:
     }
 
     // Marks `side` as fully enumerated so throttle waiters on the other side
-    // are released (no future peer can arrive from a finished side).
-    void setSideDone(int side, const std::atomic_bool* cancel = nullptr) {
-        if (cancel) cancel_ = cancel;
+    // are released (no future peer can arrive from a finished side). Only the
+    // per-side completion state is touched; the cancellation pointer is
+    // configured once via setCancel() before any worker starts, so it is never
+    // written concurrently with worker reads.
+    void setSideDone(int side) {
         done_[side].store(true, std::memory_order_release);
         cv_.notify_all();
     }
 
+    // Establishes the cancellation pointer exactly once, before the workers
+    // start. After this point the workers only ever READ cancel_ (in insert(),
+    // while throttling) and never write it, so there is no concurrent
+    // read/write of this object.
     void setCancel(const std::atomic_bool* cancel) { cancel_ = cancel; }
 
     // Snapshot of every entry still in the table (unmatched). Not thread-safe

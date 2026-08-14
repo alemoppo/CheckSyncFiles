@@ -95,6 +95,7 @@ ConcurrentComparer::Result ConcurrentComparer::runImpl(
     totalDirs_.store(0, std::memory_order_relaxed);
 
     MatchTable table(6);
+    table.setCancel(cancel_); // set once here, before any worker starts (see setCancel)
     ConcurrentSink sink;
     std::vector<ContentCandidate> candidatesA;
     std::vector<ContentCandidate> candidatesB;
@@ -202,7 +203,7 @@ ConcurrentComparer::WorkerStatus ConcurrentComparer::runEnumWorker(
 
     for (const auto& factory : factories) {
         if (canceled) {
-            table.setSideDone(side, cancel_);
+            table.setSideDone(side);
             return WorkerStatus::Cancelled;
         }
         std::unique_ptr<IFileEnumerator> enumerator = factory();
@@ -234,7 +235,7 @@ ConcurrentComparer::WorkerStatus ConcurrentComparer::runEnumWorker(
             cancel_);
 
         if (ok) {
-            table.setSideDone(side, cancel_);
+            table.setSideDone(side);
             // An enumerator that polls `cancel` itself may abort before the entry
             // callback ever fires and still return true; such a side was not
             // scanned and must be reported Cancelled, never as a clean Success.
@@ -250,14 +251,14 @@ ConcurrentComparer::WorkerStatus ConcurrentComparer::runEnumWorker(
         // table may have matched the other side. The side is marked failed and
         // nothing is reported as missing/extra.
         if (emitted) {
-            table.setSideDone(side, cancel_);
+            table.setSideDone(side);
             return WorkerStatus::Failed;
         }
         // Pre-stream failure with zero entries (root access, not NTFS, ...):
         // safe to try the next enumerator (MFT -> Win32 fallback).
     }
 
-    table.setSideDone(side, cancel_);
+    table.setSideDone(side);
     return canceled ? WorkerStatus::Cancelled : WorkerStatus::Failed;
 }
 
@@ -272,7 +273,7 @@ ConcurrentComparer::WorkerStatus ConcurrentComparer::runIndexWorker(
             onEntry(0, kv.second, table, sink, candidates);
         }
     }
-    table.setSideDone(0, cancel_);
+    table.setSideDone(0);
     return cancel_ && cancel_->load(std::memory_order_relaxed) ? WorkerStatus::Cancelled
                                                               : WorkerStatus::Success;
 }

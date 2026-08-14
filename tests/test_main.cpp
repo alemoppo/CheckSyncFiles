@@ -1647,6 +1647,48 @@ TEST("concurrent comparer: async hashing verifies a large identical tree", [] {
     CHECK(r.results.problems.empty());
 });
 
+TEST("concurrent comparer: hash workers always use their own candidate", [] {
+    // Guards against hash-phase tasks that lose track of which candidate they
+    // were submitted for (e.g. by capturing a loop-local reference). Every file
+    // has a distinct path AND a distinct payload of the SAME size, so every
+    // pair becomes a Content-mode candidate; a task hashing the wrong file
+    // would flip identical/contentMismatch counts or report the wrong path.
+    const auto dir = MakeTempDir();
+    const std::wstring src = dir + L"\\src";
+    const std::wstring dst = dir + L"\\dst";
+    fs::create_directories(src);
+    fs::create_directories(dst);
+    const size_t count = 600; // > two 256-candidate batches: real parallel overlap
+    const size_t size = 4096; // uniform size -> every pair is a candidate
+    std::vector<std::string> payloads(count);
+    for (size_t i = 0; i < count; ++i) {
+        std::string body = "file-" + std::to_string(i) + "-|";
+        while (body.size() < size) body += static_cast<char>('a' + ((i + body.size()) % 26));
+        payloads[i] = std::move(body);
+        const std::wstring name = L"f" + std::to_wstring(i) + L".dat";
+        CHECK(WriteFileBytes(src + L"\\" + name, payloads[i].data(), payloads[i].size()));
+        CHECK(WriteFileBytes(dst + L"\\" + name, payloads[i].data(), payloads[i].size()));
+    }
+    // Corrupt exactly one destination file (same size) so exactly one pair is
+    // a content mismatch and its path is known in advance.
+    std::string broken = payloads[0];
+    broken[broken.size() / 2] = 'X';
+    CHECK(WriteFileBytes(dst + L"\\f0.dat", broken.data(), broken.size()));
+
+    const auto r = RunConcurrent(src, dst, ScanMode::Content, false, 4);
+    CHECK(r.sourceStatus == ConcurrentComparer::WorkerStatus::Success);
+    CHECK(r.destinationStatus == ConcurrentComparer::WorkerStatus::Success);
+    CHECK_EQ(r.results.stats.identicalFiles, count - 1);
+    CHECK_EQ(r.results.stats.contentMismatch, 1ull);
+    CHECK_EQ(r.results.stats.sizeMismatch, 0ull);
+    CHECK_EQ(r.results.stats.missingFiles + r.results.stats.extraFiles, 0ull);
+    CHECK_EQ(r.results.problems.size(), 1ull);
+    if (r.results.problems.size() == 1) {
+        CHECK(r.results.problems[0].status == Status::ContentMismatch);
+        CHECK(r.results.problems[0].relativePath == L"f0.dat");
+    }
+});
+
 TEST("concurrent comparer: FromIndex source verifies against a live destination", [] {
     const auto dir = MakeTempDir();
     testgen::CreateDifferingTrees(dir);
