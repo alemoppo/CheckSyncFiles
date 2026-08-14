@@ -100,6 +100,14 @@ ConcurrentComparer::Result ConcurrentComparer::runImpl(
     totalFiles_.store(0, std::memory_order_relaxed);
     totalDirs_.store(0, std::memory_order_relaxed);
 
+    // Content-hash overlap context for the workers (set before they start, then
+    // only read, except for the two atomic counters).
+    hashPool_ = &hashPool;
+    offlineSource_ = (sourceKind_ == SourceKind::FromIndex);
+    cache_ = cache;
+    hashDone_.store(0, std::memory_order_relaxed);
+    totalCandidates_.store(0, std::memory_order_relaxed);
+
     MatchTable table(6);
     table.setCancel(cancel_); // set once here, before any worker starts (see setCancel)
     ConcurrentSink sink;
@@ -136,21 +144,27 @@ ConcurrentComparer::Result ConcurrentComparer::runImpl(
     for (auto& n : notesB) r.notes.push_back(std::move(n));
 
     const bool clean = sourceStatus == WorkerStatus::Success && destStatus == WorkerStatus::Success;
-    ResultSet post; // results produced after both workers have stopped
+    ResultSet post; // results produced after both workers have stopped (missing/extra)
 
     if (clean) {
         if (mode_ == ScanMode::Content) {
-            std::vector<ContentCandidate> all;
-            all.reserve(candidatesA.size() + candidatesB.size());
-            for (auto& c : candidatesA) all.push_back(std::move(c));
-            for (auto& c : candidatesB) all.push_back(std::move(c));
-
-            const bool offline = (sourceKind_ == SourceKind::FromIndex);
-            RunHashPhase(all, hashPool, offline, offline ? fromIndex_ : nullptr, sourceRoot_,
-                         destRoot_, post, cancel_, onHashProgress_, cache, cacheHits_);
+            // Full batches were hashed while the workers were still enumerating;
+            // flush whatever is left and then wait for the last batch. After this
+            // no hash task can still touch the sink.
+            FlushHashCandidates(candidatesA, sink);
+            FlushHashCandidates(candidatesB, sink);
+            if (onHashProgress_) {
+                onHashProgress_(hashDone_.load(std::memory_order_relaxed),
+                                totalCandidates_.load(std::memory_order_relaxed));
+            }
         }
         finalizeMissingExtra(table, post);
     }
+
+    // Defensive: no submitted hash task may still be running when the sink is
+    // taken (each batch above already ends with a waitAll, so this is normally a
+    // no-op, but it guarantees the invariant even if a future path submits more).
+    hashPool.waitAll();
 
     r.results = sink.take();
     AddStats(r.results.stats, post.stats);
@@ -188,7 +202,37 @@ void ConcurrentComparer::onEntry(int side, FileEntry e, MatchTable& table, Concu
         src = std::move(peer);
         dst = std::move(e);
     }
-    ClassifyMatched(src, dst, mode_, sink, candidates);
+    const bool addedCandidate = ClassifyMatched(src, dst, mode_, sink, candidates);
+    if (addedCandidate) {
+        totalCandidates_.fetch_add(1, std::memory_order_relaxed);
+        // Once a full batch of same-size pairs has accumulated, push it to the
+        // hash pool so SHA-256 work overlaps with the enumeration that is still
+        // running (the other side, in a live-live scan). waitAll() per batch
+        // keeps the number of outstanding tasks bounded. Called from the worker
+        // thread, never under a table shard lock.
+        if (candidates.size() >= kHashBatchSize) {
+            FlushHashCandidates(candidates, sink);
+        }
+    }
+}
+
+void ConcurrentComparer::FlushHashCandidates(std::vector<ContentCandidate>& pending,
+                                             ConcurrentSink& sink) {
+    while (!pending.empty()) {
+        const size_t n = std::min(kHashBatchSize, pending.size());
+        const size_t start = pending.size() - n;
+        std::vector<ContentCandidate> batch(pending.begin() + start, pending.end());
+        pending.resize(start);
+        SubmitHashCandidates(batch, *hashPool_, offlineSource_,
+                             offlineSource_ ? fromIndex_ : nullptr, sourceRoot_, destRoot_, sink,
+                             cancel_, cache_, cacheHits_);
+        hashPool_->waitAll(); // bound outstanding work; safe from an external thread
+        hashDone_.fetch_add(n, std::memory_order_relaxed);
+        if (onHashProgress_) {
+            onHashProgress_(hashDone_.load(std::memory_order_relaxed),
+                            totalCandidates_.load(std::memory_order_relaxed));
+        }
+    }
 }
 
 void ConcurrentComparer::onError(const ScanError& err, ConcurrentSink& sink) {

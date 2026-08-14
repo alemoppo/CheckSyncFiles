@@ -2,7 +2,7 @@
 
 namespace bv {
 
-void ClassifyMatched(const FileEntry& src, const FileEntry& dst, ScanMode mode,
+bool ClassifyMatched(const FileEntry& src, const FileEntry& dst, ScanMode mode,
                      ConcurrentSink& sink, std::vector<ContentCandidate>& candidates) {
     auto& stats = sink.stats();
     const auto inc = [&stats](std::atomic<uint64_t>& c) {
@@ -14,7 +14,7 @@ void ClassifyMatched(const FileEntry& src, const FileEntry& dst, ScanMode mode,
 
     if (srcDir && dstDir) {
         inc(stats.identicalDirs);
-        return;
+        return false;
     }
     if (srcDir != dstDir) {
         // File where a directory is expected (or vice versa): definitely
@@ -27,7 +27,7 @@ void ClassifyMatched(const FileEntry& src, const FileEntry& dst, ScanMode mode,
         r.sizeDest = dst.size;
         r.isDirectory = false;
         sink.addProblem(std::move(r));
-        return;
+        return false;
     }
 
     auto recordSizeMismatch = [&](const FileEntry& s, const FileEntry& d) {
@@ -63,11 +63,13 @@ void ClassifyMatched(const FileEntry& src, const FileEntry& dst, ScanMode mode,
                 c.srcMtime = src.lastWriteTime; // for change detection + cache key
                 c.dstMtime = dst.lastWriteTime;
                 candidates.push_back(std::move(c));
+                return true; // a content candidate was added
             } else {
                 recordSizeMismatch(src, dst);
             }
             break;
     }
+    return false; // no content candidate added
 }
 
 } // namespace bv

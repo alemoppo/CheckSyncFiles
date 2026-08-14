@@ -157,6 +157,11 @@ private:
                              std::vector<std::wstring>& notes);
     void finalizeMissingExtra(MatchTable& table, ResultSet& out);
     void sortProblems(ResultSet& out);
+    // Content mode: hashes pending same-size pairs through the shared pool as
+    // soon as a full batch accumulates (overlapping hashing with enumeration),
+    // and drains whatever remains at finalization. waitAll() per batch keeps the
+    // number of outstanding SHA-256 tasks bounded.
+    void FlushHashCandidates(std::vector<ContentCandidate>& pending, ConcurrentSink& sink);
 
     bool caseSensitive_;
     ScanMode mode_;
@@ -172,6 +177,15 @@ private:
     std::atomic<uint64_t> totalDirs_{0};
     ProgressCallback onProgress_;
     HashProgressCallback onHashProgress_;
+
+    // Content-hash overlap context, set once in runImpl before any worker starts
+    // and only read afterwards (the atomics below are written by the workers and
+    // the final drain).
+    ThreadPool* hashPool_ = nullptr;
+    bool offlineSource_ = false; // source digests come from fromIndex_
+    hashing::HashCache* cache_ = nullptr;
+    std::atomic<uint64_t> hashDone_{0};       // candidates hashed so far
+    std::atomic<uint64_t> totalCandidates_{0}; // candidates discovered so far
 };
 
 } // namespace bv

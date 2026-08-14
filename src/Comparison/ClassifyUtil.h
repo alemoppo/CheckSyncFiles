@@ -27,8 +27,10 @@ struct ContentCandidate {
 // In Content mode, same-size file pairs are appended to `candidates` (the
 // caller owns the vector; the concurrent comparer guards its own instance);
 // every other outcome updates `sink` stats and possibly appends a problem.
+// Returns true when a content candidate was appended (and false otherwise), so
+// the caller can count/drain pending hash work.
 // Thread-safe: callable from the enumeration workers, which share `sink`.
-void ClassifyMatched(const FileEntry& src, const FileEntry& dst, ScanMode mode,
+bool ClassifyMatched(const FileEntry& src, const FileEntry& dst, ScanMode mode,
                      ConcurrentSink& sink, std::vector<ContentCandidate>& candidates);
 
 } // namespace bv
