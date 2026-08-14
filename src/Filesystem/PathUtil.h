@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <vector>
 
 namespace bv {
 namespace pathutil {
@@ -26,6 +27,11 @@ std::wstring AddLongPathPrefix(const std::wstring& abs);
 // case-insensitive; this mirrors NTFS behaviour (uppercase, invariant locale).
 // Used as the key normalization for case-insensitive matching.
 std::wstring FoldForCompare(const std::wstring& s);
+
+// True if the sorted (ascending) `keys` list contains an entry that is a strict
+// descendant of `dirKey`, i.e. starts with dirKey + "\\". Used to suppress
+// redundant "directory" lines when the whole subtree is already reported.
+bool HasDescendant(const std::vector<std::wstring>& keys, const std::wstring& dirKey);
 
 // Wide (UTF-16 on Windows) <-> UTF-8 conversion via CP_UTF8, used by the
 // exporters and the binary snapshot / hash-cache formats.

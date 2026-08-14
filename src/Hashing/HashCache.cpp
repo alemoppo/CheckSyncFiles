@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <fstream>
+#include <mutex>
 
 #include "Filesystem/PathUtil.h"
 
@@ -77,6 +78,7 @@ HashCache::HashCache(const std::wstring& filePath, std::wstring& error) {
 
 bool HashCache::Lookup(const std::wstring& absPath, uint64_t size, uint64_t mtime,
                        std::array<uint8_t, 32>& digest) const {
+    std::lock_guard<std::mutex> lock(mutex_);
     const auto it = map_.find(MakeKey(absPath, size, mtime));
     if (it == map_.end()) return false;
     digest = it->second;
@@ -85,10 +87,17 @@ bool HashCache::Lookup(const std::wstring& absPath, uint64_t size, uint64_t mtim
 
 void HashCache::Store(const std::wstring& absPath, uint64_t size, uint64_t mtime,
                       const std::array<uint8_t, 32>& digest) {
+    std::lock_guard<std::mutex> lock(mutex_);
     map_[MakeKey(absPath, size, mtime)] = digest;
 }
 
+size_t HashCache::size() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return map_.size();
+}
+
 bool HashCache::Save(std::wstring& error) const {
+    std::lock_guard<std::mutex> lock(mutex_);
     std::ofstream out(pathutil::AddLongPathPrefix(pathutil::FromUtf8(filePath_)).c_str(),
                       std::ios::binary | std::ios::out | std::ios::trunc);
     if (!out) {

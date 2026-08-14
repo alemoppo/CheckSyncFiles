@@ -7,8 +7,12 @@ add_library(bv_core STATIC
   Filesystem/MftEnumerator.cpp
   Filesystem/PathUtil.cpp
   Filesystem/Win32Enumerator.cpp
+  Comparison/ClassifyUtil.cpp
+  Comparison/ConcurrentComparer.cpp
   Comparison/FileComparator.cpp
+  Comparison/HashPhase.cpp
   Hashing/HashCache.cpp
+  Hashing/HashUtil.cpp
   Hashing/Sha256.cpp
   ScanController.cpp
   Threading/ThreadPool.cpp

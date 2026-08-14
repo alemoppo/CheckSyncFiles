@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 
+#include "Comparison/ClassifyUtil.h"
 #include "Comparison/ComparisonResult.h"
 #include "Comparison/ScanMode.h"
 #include "Filesystem/FileEnumerator.h"
@@ -73,14 +74,6 @@ public:
     size_t cacheHits() const { return cacheHits_.load(std::memory_order_relaxed); }
 
 private:
-    struct HashPair {
-        std::wstring relativePath;
-        uint64_t sizeSource = 0;
-        uint64_t sizeDest = 0;
-        uint64_t srcMtime = 0; // last-write FILETIME at enumeration time
-        uint64_t dstMtime = 0;
-    };
-
     void classifyMatched(FileEntry& src, FileEntry& dst, ResultSet& out);
     void recordMissing(ResultSet& out);
 
@@ -88,7 +81,7 @@ private:
     ScanMode mode_;
     std::wstring sourceRoot_; // empty == source digests come from the index
     std::wstring destRoot_;
-    std::vector<HashPair> pendingHashes_;
+    std::vector<ContentCandidate> pendingHashes_;
     std::atomic<size_t> cacheHits_{0};
 };
 

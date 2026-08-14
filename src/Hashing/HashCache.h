@@ -2,6 +2,7 @@
 
 #include <array>
 #include <cstdint>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 
@@ -14,9 +15,10 @@ namespace hashing {
 // and never changes a verdict, it only shortens a re-verification of a tree
 // that has not changed.
 //
-// Threading contract: Lookup() is const and safe to call from the hash worker
-// threads; Store() must only be called from the single thread that drains a
-// batch of hash results (the workers never mutate the map).
+// Threading contract: Lookup() and Store() may be called concurrently from any
+// number of hash worker threads (the map is mutex-protected). Save() must not
+// overlap with in-flight Store() calls (in practice it runs after the workers
+// have been drained).
 class HashCache {
 public:
     // Loads `filePath` if present and valid. A missing file is fine (empty
@@ -32,7 +34,7 @@ public:
     // Writes the whole cache back. Returns false and fills `error` on I/O error.
     bool Save(std::wstring& error) const;
 
-    size_t size() const { return map_.size(); }
+    size_t size() const;
 
     // Combined key (path \x01 size \x01 mtime). The separator is a control
     // character, which NTFS forbids inside file names, so it cannot collide.
@@ -41,6 +43,9 @@ public:
 private:
     std::string filePath_; // UTF-8
     std::unordered_map<std::string, std::array<uint8_t, 32>> map_;
+
+    // Guards map_ against concurrent Lookup()/Store() from hash worker threads.
+    mutable std::mutex mutex_;
 };
 
 } // namespace hashing

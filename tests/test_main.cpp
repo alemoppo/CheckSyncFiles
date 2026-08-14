@@ -25,7 +25,9 @@
 #include <thread>
 
 #include "Comparison/ScanMode.h"
+#include "Comparison/ConcurrentComparer.h"
 #include "Comparison/FileComparator.h"
+#include "Comparison/MatchTable.h"
 #include "Errors.h"
 #include "Export/CsvExporter.h"
 #include "Export/JsonExporter.h"
@@ -651,11 +653,14 @@ TEST("progress: onProgress reports files and emits a Done phase", [] {
     opts.destination = dir;
     opts.mode = bv::ScanMode::Presence;
 
-    bool sawSource = false, sawDone = false;
+    // A live-live comparison enumerates both sides CONCURRENTLY: there is no
+    // separate EnumerateSource phase; the combined totals are reported during
+    // CompareDestination (source files + destination files).
+    bool sawCompare = false, sawDone = false;
     uint64_t maxFiles = 0;
     opts.onProgress = [&](const bv::ScanProgress& p) {
-        if (p.phase == bv::ScanPhase::EnumerateSource) {
-            sawSource = true;
+        if (p.phase == bv::ScanPhase::CompareDestination) {
+            sawCompare = true;
             maxFiles = std::max(maxFiles, p.files);
         } else if (p.phase == bv::ScanPhase::Done) {
             sawDone = true;
@@ -664,9 +669,9 @@ TEST("progress: onProgress reports files and emits a Done phase", [] {
 
     bv::ScanController controller(false);
     controller.run(opts);
-    CHECK(sawSource);
+    CHECK(sawCompare);
     CHECK(sawDone);
-    CHECK(maxFiles >= 500);
+    CHECK(maxFiles >= 500); // both sides have 500 files; totals exceed this
 });
 
 TEST("cancel: pre-set cancel stops the scan before it completes", [] {
@@ -1249,6 +1254,520 @@ TEST("comparator: file changed between enumeration and hash is flagged", [] {
         CHECK(out.problems[0].status == Status::ChangedDuringScan);
         CHECK(out.problems[0].relativePath == L"a.txt");
     }
+});
+
+// ---------------------------------------------------------------------------
+// Concurrent comparer: sharded match table, dual workers, outcome gating
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Captures every entry Win32 finds under `root` (relative paths), for replaying
+// through the fake enumerators below in any desired order.
+std::vector<FileEntry> CaptureEntries(const std::wstring& root) {
+    std::vector<FileEntry> out;
+    Win32Enumerator en;
+    const bool ok = en.enumerate(
+        root, [&](FileEntry&& e) { out.push_back(std::move(e)); return true; },
+        [](const ScanError&) {});
+    CHECK(ok);
+    return out;
+}
+
+std::unique_ptr<IFileEnumerator> MakeWin32Factory() {
+    return std::unique_ptr<IFileEnumerator>(new Win32Enumerator());
+}
+
+// Plays a captured entry list back through the comparer. `before`/`after` run
+// around the stream so tests can force a deterministic discovery order.
+class ReplayEnumerator : public bv::IFileEnumerator {
+public:
+    ReplayEnumerator(std::vector<FileEntry> entries, std::function<void()> before = {},
+                     std::function<void()> after = {})
+        : entries_(std::move(entries)), before_(std::move(before)), after_(std::move(after)) {}
+    bool enumerate(const std::wstring&, const EntryCallback& onEntry, const ErrorCallback&,
+                   const ProgressCallback& onProgress, const std::atomic_bool* cancel) override {
+        if (before_) before_();
+        uint64_t files = 0, dirs = 0;
+        for (FileEntry& e : entries_) {
+            if (cancel && cancel->load(std::memory_order_relaxed)) return false;
+            if (e.isDirectory) {
+                ++dirs;
+            } else {
+                ++files;
+            }
+            if (!onEntry(FileEntry(e))) return false;
+            if (onProgress) onProgress(files, dirs, L"");
+        }
+        if (after_) after_();
+        return true;
+    }
+
+private:
+    std::vector<FileEntry> entries_;
+    std::function<void()> before_, after_;
+};
+
+// Fails before emitting anything (stands in for the MFT back-end on a volume it
+// cannot read). The comparer must fall back to the next factory, not fail.
+class FailImmediatelyEnumerator : public bv::IFileEnumerator {
+public:
+    bool enumerate(const std::wstring&, const EntryCallback&, const ErrorCallback&,
+                   const ProgressCallback&, const std::atomic_bool*) override {
+        return false;
+    }
+};
+
+// Emits the first `emitCount` captured entries, then reports a failure -- the
+// incomplete-MFT shape: a stream produced before the scan went bad.
+class FailAfterNEnumerator : public bv::IFileEnumerator {
+public:
+    FailAfterNEnumerator(std::vector<FileEntry> entries, size_t emitCount)
+        : entries_(std::move(entries)), emitCount_(emitCount) {}
+    bool enumerate(const std::wstring&, const EntryCallback& onEntry, const ErrorCallback&,
+                   const ProgressCallback&, const std::atomic_bool*) override {
+        size_t n = 0;
+        for (FileEntry& e : entries_) {
+            if (n >= emitCount_) break;
+            ++n;
+            if (!onEntry(FileEntry(e))) return false;
+        }
+        return false;
+    }
+
+private:
+    std::vector<FileEntry> entries_;
+    size_t emitCount_;
+};
+
+// Runs the concurrent comparer against two real trees. Both sides default to
+// Win32; callers can inject custom enumerator factories / a whole fallback chain.
+ConcurrentComparer::Result RunConcurrent(
+    const std::wstring& src, const std::wstring& dst, ScanMode mode,
+    bool caseSensitive = false, unsigned int hashThreads = 2,
+    ConcurrentComparer::SourceKind sourceKind = ConcurrentComparer::SourceKind::Live,
+    std::vector<ConcurrentComparer::EnumeratorFactory> srcFactories = {},
+    std::vector<ConcurrentComparer::EnumeratorFactory> dstFactories = {},
+    FileIndex* fromIndex = nullptr, const std::atomic_bool* cancel = nullptr) {
+    if (srcFactories.empty()) srcFactories.push_back(MakeWin32Factory);
+    if (dstFactories.empty()) dstFactories.push_back(MakeWin32Factory);
+    bv::ThreadPool pool(hashThreads);
+    ConcurrentComparer cmp(caseSensitive, mode, /*acceptMft=*/false, src, dst, sourceKind,
+                           fromIndex, cancel);
+    return cmp.runWithFactories(std::move(srcFactories), std::move(dstFactories), pool);
+}
+
+bool SameResults(const ResultSet& a, const ResultSet& b) {
+    const Stats& x = a.stats;
+    const Stats& y = b.stats;
+    if (x.sourceFiles != y.sourceFiles || x.sourceDirs != y.sourceDirs) return false;
+    if (x.destFiles != y.destFiles || x.destDirs != y.destDirs) return false;
+    if (x.identicalFiles != y.identicalFiles || x.identicalDirs != y.identicalDirs) return false;
+    if (x.missingFiles != y.missingFiles || x.missingDirs != y.missingDirs) return false;
+    if (x.extraFiles != y.extraFiles || x.extraDirs != y.extraDirs) return false;
+    if (x.sizeMismatch != y.sizeMismatch || x.contentMismatch != y.contentMismatch) return false;
+    if (x.readErrors != y.readErrors || x.accessDenied != y.accessDenied) return false;
+    if (x.changedDuringScan != y.changedDuringScan) return false;
+    if (x.bytesSource != y.bytesSource || x.bytesDest != y.bytesDest) return false;
+    if (a.problems.size() != b.problems.size()) return false;
+    for (size_t i = 0; i < a.problems.size(); ++i) {
+        const FileResult& p = a.problems[i];
+        const FileResult& q = b.problems[i];
+        if (p.status != q.status || p.isDirectory != q.isDirectory) return false;
+        if (p.relativePath != q.relativePath) return false;
+        if (p.sizeSource != q.sizeSource || p.sizeDest != q.sizeDest) return false;
+    }
+    return true;
+}
+
+} // namespace
+
+TEST("matchtable: paired inserts match and remove, and both orders converge", [] {
+    // shardBits=2 -> 4 shards; 40 keys force several entries per shard, so the
+    // same-shard lock path and intra-map matching are exercised.
+    std::vector<std::wstring> keys;
+    for (int i = 0; i < 40; ++i) keys.push_back(L"k" + std::to_wstring(i));
+
+    bv::MatchTable t(2);
+    std::vector<bv::MatchTable::Outcome> outcomes;
+    for (const auto& k : keys) {
+        FileEntry e;
+        e.relativePath = k;
+        FileEntry peer;
+        outcomes.push_back(t.insert(k, 0, std::move(e), peer));
+    }
+    for (const auto& k : keys) {
+        FileEntry e;
+        e.relativePath = k;
+        FileEntry peer;
+        outcomes.push_back(t.insert(k, 1, std::move(e), peer));
+    }
+    CHECK_EQ(t.remaining().size(), 0ull);
+    CHECK_EQ(std::count(outcomes.begin(), outcomes.end(), bv::MatchTable::Outcome::Inserted), 40);
+    CHECK_EQ(std::count(outcomes.begin(), outcomes.end(), bv::MatchTable::Outcome::Matched), 40);
+
+    // Reverse order (destination first): same net outcome.
+    bv::MatchTable t2(2);
+    for (const auto& k : keys) {
+        FileEntry e;
+        e.relativePath = k;
+        FileEntry peer;
+        t2.insert(k, 1, std::move(e), peer);
+    }
+    for (const auto& k : keys) {
+        FileEntry e;
+        e.relativePath = k;
+        FileEntry peer;
+        t2.insert(k, 0, std::move(e), peer);
+    }
+    CHECK_EQ(t2.remaining().size(), 0ull);
+});
+
+TEST("matchtable: same-side duplicate key replaces (last wins, like FileIndex)", [] {
+    bv::MatchTable t(2);
+    FileEntry a;
+    a.relativePath = L"x";
+    FileEntry peer;
+    CHECK(t.insert(L"x", 0, std::move(a), peer) == bv::MatchTable::Outcome::Inserted);
+    FileEntry b;
+    b.relativePath = L"x";
+    CHECK(t.insert(L"x", 0, std::move(b), peer) == bv::MatchTable::Outcome::Replaced);
+    CHECK_EQ(t.pendingCount(), 1ull);
+    const auto rem = t.remaining();
+    CHECK_EQ(rem.size(), 1ull);
+    if (rem.size() == 1) CHECK(rem[0].second.relativePath == L"x");
+});
+
+TEST("matchtable: one-sided backpressure never deadlocks while matching (tight high-water)", [] {
+    // highWater=1 forces the source worker (side 0) to park at essentially every
+    // insert and rely on the destination (side 1) - which is never gated - to
+    // release it. If the old two-sided gate were still present this would hang.
+    const int N = 2000;
+    bv::MatchTable t(6, /*highWater=*/1);
+    std::thread src([&] {
+        for (int i = 0; i < N; ++i) {
+            const std::wstring k = L"k" + std::to_wstring(i);
+            FileEntry e;
+            e.relativePath = k;
+            FileEntry peer;
+            t.insert(k, 0, std::move(e), peer);
+        }
+        t.setSideDone(0); // worker finished: signal completion (as runEnumWorker does)
+    });
+    std::thread dst([&] {
+        for (int i = 0; i < N; ++i) {
+            const std::wstring k = L"k" + std::to_wstring(i);
+            FileEntry e;
+            e.relativePath = k;
+            FileEntry peer;
+            t.insert(k, 1, std::move(e), peer);
+        }
+        t.setSideDone(1);
+    });
+    src.join();
+    dst.join();
+    CHECK_EQ(t.remaining().size(), 0ull); // every key matched and removed
+});
+
+TEST("matchtable: source flooded past limit with no peer still completes (no deadlock)", [] {
+    // Both sides hold the SAME fully disjoint key sets, far above the high-water
+    // mark, with the source likely to flood first: the source parks on the gate,
+    // the destination - never gated - finishes and releases it via setSideDone.
+    // This is the exact scenario that would deadlock a symmetric gate.
+    const int N = 5000;
+    bv::MatchTable t(6, /*highWater=*/4);
+    std::thread src([&] {
+        for (int i = 0; i < N; ++i) {
+            const std::wstring k = L"s" + std::to_wstring(i);
+            FileEntry e;
+            e.relativePath = k;
+            FileEntry peer;
+            t.insert(k, 0, std::move(e), peer);
+        }
+        t.setSideDone(0);
+    });
+    std::thread dst([&] {
+        for (int i = 0; i < N; ++i) {
+            const std::wstring k = L"d" + std::to_wstring(i);
+            FileEntry e;
+            e.relativePath = k;
+            FileEntry peer;
+            t.insert(k, 1, std::move(e), peer);
+        }
+        t.setSideDone(1);
+    });
+    src.join();
+    dst.join();
+    CHECK_EQ(t.remaining().size(), size_t{2} * N); // all entries persisted (missing+extra)
+});
+
+TEST("concurrent comparer: identical fixtures are all-identical, no errors", [] {
+    const auto dir = MakeTempDir();
+    testgen::CreateFixture(dir);
+    const auto r = RunConcurrent(dir, dir, ScanMode::Presence);
+    CHECK(r.sourceStatus == ConcurrentComparer::WorkerStatus::Success);
+    CHECK(r.destinationStatus == ConcurrentComparer::WorkerStatus::Success);
+    const auto& s = r.results.stats;
+    CHECK_EQ(s.identicalFiles, 6ull);
+    CHECK_EQ(s.identicalDirs, 24ull);
+    CHECK_EQ(s.missingFiles + s.extraFiles + s.missingDirs + s.extraDirs, 0ull);
+    CHECK(r.results.problems.empty());
+});
+
+TEST("concurrent comparer: differing trees report missing and extra", [] {
+    const auto dir = MakeTempDir();
+    testgen::CreateDifferingTrees(dir);
+    const auto r = RunConcurrent(dir + L"\\src", dir + L"\\dst", ScanMode::Presence);
+    const auto& s = r.results.stats;
+    CHECK_EQ(s.identicalFiles, 4ull);
+    CHECK_EQ(s.identicalDirs, 1ull);
+    CHECK_EQ(s.missingFiles, 1ull);
+    CHECK_EQ(s.missingDirs, 1ull);
+    CHECK_EQ(s.extraFiles, 1ull);
+    CHECK_EQ(s.extraDirs, 1ull);
+    CHECK_EQ(s.sizeMismatch, 0ull);
+    CHECK_EQ(s.readErrors + s.accessDenied, 0ull);
+});
+
+TEST("concurrent comparer: size mode flags size mismatches", [] {
+    const auto dir = MakeTempDir();
+    testgen::CreateDifferingTrees(dir);
+    const auto r = RunConcurrent(dir + L"\\src", dir + L"\\dst", ScanMode::Size);
+    const auto& s = r.results.stats;
+    CHECK_EQ(s.identicalFiles, 3ull);
+    CHECK_EQ(s.sizeMismatch, 1ull);
+    CHECK_EQ(s.missingFiles, 1ull);
+    CHECK_EQ(s.extraFiles, 1ull);
+    CHECK_EQ(s.missingDirs, 1ull);
+    CHECK_EQ(s.extraDirs, 1ull);
+});
+
+TEST("concurrent comparer: content mode hashes and detects same-size mismatch", [] {
+    const auto dir = MakeTempDir();
+    testgen::CreateDifferingTrees(dir);
+    const auto r = RunConcurrent(dir + L"\\src", dir + L"\\dst", ScanMode::Content);
+    const auto& s = r.results.stats;
+    CHECK_EQ(s.identicalFiles, 2ull);
+    CHECK_EQ(s.contentMismatch, 1ull);
+    CHECK_EQ(s.sizeMismatch, 1ull);
+    CHECK_EQ(s.missingFiles, 1ull);
+    CHECK_EQ(s.extraFiles, 1ull);
+    CHECK_EQ(s.missingDirs, 1ull);
+    CHECK_EQ(s.extraDirs, 1ull);
+});
+
+TEST("concurrent comparer: thousands of files pair across shards", [] {
+    const auto dir = MakeTempDir();
+    testgen::CreateStressTree(dir + L"\\src", 1000);
+    fs::copy(dir + L"\\src", dir + L"\\dst", fs::copy_options::recursive);
+    const auto r = RunConcurrent(dir + L"\\src", dir + L"\\dst", ScanMode::Presence);
+    CHECK_EQ(r.results.stats.identicalFiles, 1000ull);
+    CHECK_EQ(r.results.stats.identicalDirs, 100ull);
+    CHECK_EQ(r.results.stats.missingFiles + r.results.stats.extraFiles +
+                 r.results.stats.missingDirs + r.results.stats.extraDirs, 0ull);
+});
+
+TEST("concurrent comparer: discovery order does not change the outcome", [] {
+    const auto dir = MakeTempDir();
+    testgen::CreateDifferingTrees(dir);
+    const std::wstring src = dir + L"\\src";
+    const std::wstring dst = dir + L"\\dst";
+    const auto srcEntries = CaptureEntries(src);
+    const auto dstEntries = CaptureEntries(dst);
+
+    ConcurrentComparer::Result first;
+    ConcurrentComparer::Result second;
+    bv::ThreadPool pool(0);
+
+    {
+        // Order 1: the source is fully enumerated (and inserted) before the
+        // destination worker may emit a single entry.
+        std::atomic<bool> srcDone{false};
+        auto srcFac = [&] {
+            return std::unique_ptr<IFileEnumerator>(new ReplayEnumerator(
+                srcEntries, {},
+                [&] { srcDone.store(true, std::memory_order_release); }));
+        };
+        auto dstFac = [&] {
+            return std::unique_ptr<IFileEnumerator>(new ReplayEnumerator(
+                dstEntries,
+                [&] {
+                    while (!srcDone.load(std::memory_order_acquire))
+                        std::this_thread::yield();
+                },
+                {}));
+        };
+        ConcurrentComparer cmp(false, ScanMode::Presence, false, src, dst,
+                               ConcurrentComparer::SourceKind::Live, nullptr);
+        first = cmp.runWithFactories(srcFac, dstFac, pool);
+    }
+    {
+        // Order 2: symmetric, destination fully inserted before source.
+        std::atomic<bool> dstDone{false};
+        auto srcFac = [&] {
+            return std::unique_ptr<IFileEnumerator>(new ReplayEnumerator(
+                srcEntries,
+                [&] {
+                    while (!dstDone.load(std::memory_order_acquire))
+                        std::this_thread::yield();
+                },
+                {}));
+        };
+        auto dstFac = [&] {
+            return std::unique_ptr<IFileEnumerator>(new ReplayEnumerator(
+                dstEntries, {},
+                [&] { dstDone.store(true, std::memory_order_release); }));
+        };
+        ConcurrentComparer cmp(false, ScanMode::Presence, false, src, dst,
+                               ConcurrentComparer::SourceKind::Live, nullptr);
+        second = cmp.runWithFactories(srcFac, dstFac, pool);
+    }
+
+    CHECK(first.sourceStatus == ConcurrentComparer::WorkerStatus::Success);
+    CHECK(first.destinationStatus == ConcurrentComparer::WorkerStatus::Success);
+    CHECK(second.sourceStatus == ConcurrentComparer::WorkerStatus::Success);
+    CHECK(second.destinationStatus == ConcurrentComparer::WorkerStatus::Success);
+    CHECK_MSG(SameResults(first.results, second.results),
+              "order must not affect the logical results");
+    CHECK_EQ(first.results.stats.missingFiles, 1ull);
+    CHECK_EQ(first.results.stats.extraFiles, 1ull);
+});
+
+TEST("concurrent comparer: async hashing verifies a large identical tree", [] {
+    const auto dir = MakeTempDir();
+    const size_t count = 300; // > one 256-candidate hash batch: two waitAll rounds
+    testgen::CreateStressTree(dir + L"\\src", count);
+    fs::copy(dir + L"\\src", dir + L"\\dst", fs::copy_options::recursive);
+    const auto r = RunConcurrent(dir + L"\\src", dir + L"\\dst", ScanMode::Content,
+                                 false, 2);
+    CHECK(r.sourceStatus == ConcurrentComparer::WorkerStatus::Success);
+    CHECK(r.destinationStatus == ConcurrentComparer::WorkerStatus::Success);
+    CHECK_EQ(r.results.stats.identicalFiles, count);
+    CHECK_EQ(r.results.stats.contentMismatch, 0ull);
+    CHECK(r.results.problems.empty());
+});
+
+TEST("concurrent comparer: FromIndex source verifies against a live destination", [] {
+    const auto dir = MakeTempDir();
+    testgen::CreateDifferingTrees(dir);
+    const std::wstring src = dir + L"\\src";
+    const std::wstring dst = dir + L"\\dst";
+
+    FileIndex idx(false);
+    {
+        Win32Enumerator en;
+        const auto br = idx.build(src, en);
+        CHECK(br.ok);
+    }
+    const auto r = RunConcurrent(src, dst, ScanMode::Presence,
+                                 false, 0, ConcurrentComparer::SourceKind::FromIndex,
+                                 {}, {}, &idx);
+    CHECK(r.sourceStatus == ConcurrentComparer::WorkerStatus::Success);
+    CHECK(r.destinationStatus == ConcurrentComparer::WorkerStatus::Success);
+    const auto& s = r.results.stats;
+    CHECK_EQ(s.identicalFiles, 4ull);
+    CHECK_EQ(s.missingFiles, 1ull);
+    CHECK_EQ(s.missingDirs, 1ull);
+    CHECK_EQ(s.extraFiles, 1ull);
+    CHECK_EQ(s.extraDirs, 1ull);
+});
+
+TEST("concurrent comparer: pre-emission failure falls back to the next enumerator", [] {
+    const auto dir = MakeTempDir();
+    testgen::CreateDifferingTrees(dir);
+    const std::wstring src = dir + L"\\src";
+    const std::wstring dst = dir + L"\\dst";
+
+    // Stands in for "MFT unusable": fails before emitting anything, so the side
+    // must transparently retry with the Win32 enumerator that follows it.
+    std::vector<ConcurrentComparer::EnumeratorFactory> srcFacs;
+    srcFacs.push_back([] { return std::unique_ptr<IFileEnumerator>(new FailImmediatelyEnumerator()); });
+    srcFacs.push_back(MakeWin32Factory);
+    std::vector<ConcurrentComparer::EnumeratorFactory> dstFacs;
+    dstFacs.push_back(MakeWin32Factory);
+
+    bv::ThreadPool pool(0);
+    ConcurrentComparer cmp(false, ScanMode::Presence, false, src, dst,
+                           ConcurrentComparer::SourceKind::Live, nullptr);
+    const auto r = cmp.runWithFactories(std::move(srcFacs), std::move(dstFacs), pool);
+
+    CHECK(r.sourceStatus == ConcurrentComparer::WorkerStatus::Success);
+    CHECK(r.destinationStatus == ConcurrentComparer::WorkerStatus::Success);
+    const auto& s = r.results.stats;
+    CHECK_EQ(s.identicalFiles, 4ull);
+    CHECK_EQ(s.missingFiles, 1ull);
+    CHECK_EQ(s.missingDirs, 1ull);
+    CHECK_EQ(s.extraFiles, 1ull);
+    CHECK_EQ(s.extraDirs, 1ull);
+});
+
+TEST("concurrent comparer: emitted-then-failed side reports no missing/extra", [] {
+    const auto dir = MakeTempDir();
+    testgen::CreateDifferingTrees(dir);
+    const std::wstring src = dir + L"\\src";
+    const std::wstring dst = dir + L"\\dst";
+    const auto srcEntries = CaptureEntries(src);
+    const auto dstEntries = CaptureEntries(dst);
+
+    // Source emits its whole stream, then reports an incomplete scan. The pairs
+    // already matched are retained, but nothing may be reported missing/extra.
+    bv::ThreadPool pool(0);
+    ConcurrentComparer cmp(false, ScanMode::Presence, false, src, dst,
+                           ConcurrentComparer::SourceKind::Live, nullptr);
+    auto srcFac = [&] {
+        return std::unique_ptr<IFileEnumerator>(
+            new FailAfterNEnumerator(srcEntries, srcEntries.size()));
+    };
+    const auto r = cmp.runWithFactories(std::move(srcFac), MakeWin32Factory, pool);
+
+    CHECK(r.sourceStatus == ConcurrentComparer::WorkerStatus::Failed);
+    CHECK(r.destinationStatus == ConcurrentComparer::WorkerStatus::Success);
+    CHECK_EQ(r.results.stats.identicalFiles, 4ull); // a, d, e, sub\f
+    CHECK_EQ(r.results.stats.missingFiles, 0ull);
+    CHECK_EQ(r.results.stats.missingDirs, 0ull);
+    CHECK_EQ(r.results.stats.extraFiles, 0ull);
+    CHECK_EQ(r.results.stats.extraDirs, 0ull);
+    CHECK(r.results.problems.empty());
+});
+
+TEST("concurrent comparer: failed destination after emitting reports no missing/extra", [] {
+    const auto dir = MakeTempDir();
+    testgen::CreateDifferingTrees(dir);
+    const std::wstring src = dir + L"\\src";
+    const std::wstring dst = dir + L"\\dst";
+    const auto dstEntries = CaptureEntries(dst);
+
+    bv::ThreadPool pool(0);
+    ConcurrentComparer cmp(false, ScanMode::Presence, false, src, dst,
+                           ConcurrentComparer::SourceKind::Live, nullptr);
+    auto dstFac = [&] {
+        return std::unique_ptr<IFileEnumerator>(
+            new FailAfterNEnumerator(dstEntries, dstEntries.size()));
+    };
+    const auto r = cmp.runWithFactories(MakeWin32Factory, std::move(dstFac), pool);
+
+    CHECK(r.sourceStatus == ConcurrentComparer::WorkerStatus::Success);
+    CHECK(r.destinationStatus == ConcurrentComparer::WorkerStatus::Failed);
+    CHECK_EQ(r.results.stats.identicalFiles, 4ull);
+    CHECK_EQ(r.results.stats.missingFiles + r.results.stats.missingDirs +
+                 r.results.stats.extraFiles + r.results.stats.extraDirs, 0ull);
+});
+
+TEST("concurrent comparer: cancel before start skips missing/extra reporting", [] {
+    const auto dir = MakeTempDir();
+    testgen::CreateStressTree(dir + L"\\src", 60);
+    fs::copy(dir + L"\\src", dir + L"\\dst", fs::copy_options::recursive);
+
+    std::atomic_bool cancel{true};
+    bv::ThreadPool pool(0);
+    ConcurrentComparer cmp(false, ScanMode::Presence, false, dir + L"\\src", dir + L"\\dst",
+                           ConcurrentComparer::SourceKind::Live, nullptr, &cancel);
+    const auto r = cmp.runWithFactories(MakeWin32Factory, MakeWin32Factory, pool);
+
+    CHECK(r.sourceStatus == ConcurrentComparer::WorkerStatus::Cancelled);
+    CHECK(r.destinationStatus == ConcurrentComparer::WorkerStatus::Cancelled);
+    CHECK_EQ(r.results.stats.missingFiles + r.results.stats.missingDirs +
+                 r.results.stats.extraFiles + r.results.stats.extraDirs, 0ull);
 });
 
 // ---------------------------------------------------------------------------

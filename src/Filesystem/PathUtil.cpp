@@ -1,5 +1,7 @@
 #include "PathUtil.h"
 
+#include <algorithm>
+
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
@@ -58,6 +60,17 @@ std::wstring FoldForCompare(const std::wstring& s) {
         if (c >= L'a' && c <= L'z') c = static_cast<wchar_t>(c - L'a' + L'A');
     }
     return out;
+}
+
+bool HasDescendant(const std::vector<std::wstring>& keys, const std::wstring& dirKey) {
+    const std::wstring prefix = dirKey + L"\\";
+    auto it = std::lower_bound(keys.begin(), keys.end(), prefix);
+    for (; it != keys.end() && it->size() >= prefix.size() &&
+                it->compare(0, prefix.size(), prefix) == 0;
+         ++it) {
+        return true;
+    }
+    return false;
 }
 
 std::string ToUtf8(const std::wstring& w) {

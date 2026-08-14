@@ -4,7 +4,7 @@
 #include <functional>
 #include <memory>
 
-#include "Comparison/FileComparator.h"
+#include "Comparison/ConcurrentComparer.h"
 #include "Export/CsvExporter.h"
 #include "Export/JsonExporter.h"
 #include "Filesystem/FileIndex.h"
@@ -28,7 +28,7 @@ double NowSeconds() {
 
 // Computes the digest of every file in `index` (all under `root`), storing them
 // back in the index. Used by the snapshot-capture path in Content mode so the
-// snapshot embeds source digests and the live comparison can reuse them (the
+// snapshot embeds source digests and the offline comparison can reuse them (the
 // source is then never read twice). Optionally feeds/reads the hash cache.
 void HashSourceIndex(FileIndex& index, const std::wstring& root, ThreadPool& pool,
                      const std::atomic_bool* cancel, hashing::HashCache* cache,
@@ -112,7 +112,7 @@ ScanReport ScanController::run(const ScanOptions& options) {
 
     // Live count of hash workers, reported in ScanProgress during the Hashing
     // phase so a UI can show the actual pool size while it runs (0 elsewhere).
-    unsigned int hashThreadsActive = 0;
+    std::atomic<unsigned int> hashThreadsActive{0};
 
     const auto emitProgress = [&](ScanPhase phase, uint64_t files, uint64_t dirs,
                                   const std::wstring& path) {
@@ -122,50 +122,29 @@ ScanReport ScanController::run(const ScanOptions& options) {
             p.files = files;
             p.dirs = dirs;
             p.currentPath = path;
-            p.threads = hashThreadsActive;
+            p.threads = hashThreadsActive.load(std::memory_order_relaxed);
             options.onProgress(p);
         }
     };
 
-    // Enumeration back-end selection (MFT scans the raw NTFS index and falls
-    // back to Win32 if it cannot run). Used by both the source pass (when
-    // enumerating live) and the destination pass.
-    bool wantMft = false;
-    switch (options.backend) {
-        case EnumeratorBackend::Mft:
-            wantMft = true;
-            break;
-        case EnumeratorBackend::Win32:
-            wantMft = false;
-            break;
-        case EnumeratorBackend::Auto:
-            wantMft = MftEnumerator::IsSupported(options.source) &&
-                     MftEnumerator::IsSupported(options.destination);
-            break;
-    }
-    std::unique_ptr<IFileEnumerator> primary =
-        wantMft ? std::unique_ptr<IFileEnumerator>(new MftEnumerator())
-                : std::unique_ptr<IFileEnumerator>(new Win32Enumerator());
-    std::unique_ptr<IFileEnumerator> fallback(new Win32Enumerator());
-
-    const auto runWithFallback =
-        [&](const std::function<bool(IFileEnumerator&)>& pass) -> bool {
-        if (wantMft) {
-            if (pass(*primary)) {
-                report.backendUsed = EnumeratorBackend::Mft;
+    // MFT backend decision. Auto picks MFT only when BOTH roots are on a local
+    // NTFS volume; in offline mode the source root is never touched, so only the
+    // destination is checked (matches the old "compareFrom means no source pass").
+    const bool acceptMft = [&]() -> bool {
+        switch (options.backend) {
+            case EnumeratorBackend::Mft:
                 return true;
+            case EnumeratorBackend::Win32:
+                return false;
+            case EnumeratorBackend::Auto: {
+                const bool destMft = MftEnumerator::IsSupported(options.destination);
+                if (haveCompare) return destMft; // source device not consulted
+                return destMft && MftEnumerator::IsSupported(options.source);
             }
-            if (fallback.get() != primary.get()) {
-                if (pass(*fallback)) {
-                    report.backendUsed = EnumeratorBackend::Win32;
-                    return true;
-                }
-            }
-            report.backendUsed = EnumeratorBackend::Win32;
-            return false;
         }
-        return pass(*primary);
-    };
+        return false;
+    }();
+    report.backendUsed = acceptMft ? EnumeratorBackend::Mft : EnumeratorBackend::Win32;
 
     const auto resolveHashThreads = [&]() -> unsigned int {
         return options.hashThreads == 0
@@ -173,11 +152,15 @@ ScanReport ScanController::run(const ScanOptions& options) {
                    : options.hashThreads;
     };
 
+    // The source side is pre-built (snapshot loaded, or index captured for
+    // --snapshot-out); a pure live-live scan has no source pass at all.
+    const bool sourceFromIndex = haveCompare || haveSnapshot;
     FileIndex sourceIndex(caseSensitive_);
-    bool sourceHashesReady = false; // comparator trusts the digests in the index
 
     // ---------------------------------------------------------------------
-    // 1. Source side: enumerate it live or load it from a snapshot.
+    // 1. Source side: load it from a snapshot, or capture it for the snapshot
+    //    output. A plain live-live comparison skips this phase entirely: the
+    //    source is enumerated concurrently with the destination below.
     // ---------------------------------------------------------------------
     const double t1 = NowSeconds();
     if (haveCompare) {
@@ -190,7 +173,6 @@ ScanReport ScanController::run(const ScanOptions& options) {
             report.results.stats.bytesSource = sourceIndex.stats().bytes;
             report.sourceOk = true;
             report.secondsEnumerateSource = NowSeconds() - t1;
-            sourceHashesReady = true;
             if (mode == ScanMode::Content && sourceIndex.hashCount() == 0 &&
                 sourceIndex.size() > 0) {
                 mode = ScanMode::Size; // snapshot has no digests: cannot verify content
@@ -206,24 +188,47 @@ ScanReport ScanController::run(const ScanOptions& options) {
             report.results.problems.push_back(std::move(r));
             ++report.results.stats.readErrors;
         }
-    } else {
+    } else if (haveSnapshot) {
         const IFileEnumerator::ProgressCallback sourceProgress =
             [&](uint64_t files, uint64_t dirs, const std::wstring& path) {
                 emitProgress(ScanPhase::EnumerateSource, files, dirs, path);
             };
         FileIndex::BuildResult build;
-        const bool sourceOk = runWithFallback([&](IFileEnumerator& it) {
-            build = sourceIndex.build(options.source, it, sourceProgress, options.cancel);
-            return build.ok;
-        });
+        bool sourceOk = false;
+        if (acceptMft) {
+            // MFT first, Win32 as a full rebuild on any failure (the index is
+            // only populated through this single pass, so a fallback is safe).
+            MftEnumerator mft;
+            Win32Enumerator win32;
+            if (MftEnumerator::IsSupported(options.source)) {
+                build = sourceIndex.build(options.source, mft, sourceProgress, options.cancel);
+                sourceOk = build.ok;
+                if (!sourceOk) {
+                    build = sourceIndex.build(options.source, win32, sourceProgress,
+                                              options.cancel);
+                    sourceOk = build.ok;
+                    report.backendUsed = sourceOk ? EnumeratorBackend::Win32
+                                                  : EnumeratorBackend::Mft;
+                } else {
+                    report.backendUsed = EnumeratorBackend::Mft;
+                }
+            } else {
+                build = sourceIndex.build(options.source, win32, sourceProgress, options.cancel);
+                sourceOk = build.ok;
+                report.backendUsed = EnumeratorBackend::Win32;
+            }
+        } else {
+            Win32Enumerator win32;
+            build = sourceIndex.build(options.source, win32, sourceProgress, options.cancel);
+            sourceOk = build.ok;
+        }
         report.sourceOk = sourceOk;
         report.results.stats.sourceFiles = build.stats.files;
         report.results.stats.sourceDirs = build.stats.dirs;
         report.results.stats.bytesSource = build.stats.bytes;
         report.secondsEnumerateSource = NowSeconds() - t1;
 
-        // Source enumeration errors become result entries (only the back-end
-        // that actually ran reports them; a fallback rebuilds the index).
+        // Source enumeration errors become result entries.
         for (const ScanError& err : build.errors) {
             FileResult r;
             r.status = (err.winError == 5) ? Status::AccessDenied : Status::ReadError;
@@ -245,14 +250,14 @@ ScanReport ScanController::run(const ScanOptions& options) {
             report.sourceOk = false;
         }
 
-        // 1b. Capture the source index as a snapshot (optional). In Content mode
-        // the source files are hashed first so the snapshot embeds their
-        // digests; the comparison below then reuses them instead of reading the
-        // source a second time.
+        // Capture the source index as a snapshot (optional). In Content mode the
+        // source files are hashed first so the snapshot embeds their digests;
+        // the comparison below then reuses them instead of reading the source a
+        // second time.
         if (haveSnapshot && report.sourceOk) {
             if (mode == ScanMode::Content) {
                 const unsigned int srcThreads = resolveHashThreads();
-                hashThreadsActive = srcThreads;
+                hashThreadsActive.store(srcThreads, std::memory_order_relaxed);
                 ThreadPool sourcePool(srcThreads);
                 std::atomic<size_t> hits{0};
                 const auto hashProgress = [&](uint64_t done, uint64_t total) {
@@ -261,11 +266,10 @@ ScanReport ScanController::run(const ScanOptions& options) {
                 const double th0 = NowSeconds();
                 HashSourceIndex(sourceIndex, options.source, sourcePool, options.cancel,
                                 cache.get(), hits, hashProgress);
-                hashThreadsActive = 0;
+                hashThreadsActive.store(0, std::memory_order_relaxed);
                 report.secondsHashing += NowSeconds() - th0;
                 report.hashCacheHits += hits.load();
                 report.hashThreadsUsed = srcThreads;
-                sourceHashesReady = true;
             }
             std::wstring werr;
             report.snapshotWritten =
@@ -282,43 +286,52 @@ ScanReport ScanController::run(const ScanOptions& options) {
     }
 
     // ---------------------------------------------------------------------
-    // 2. Destination pass: enumerate + compare against the source index.
+    // 2. Destination pass: enumerate + compare against the source, CONCURRENTLY.
+    //    When the source was pre-built (offline / snapshot capture) it is fed
+    //    from the index; otherwise the two drives are enumerated in parallel.
     // ---------------------------------------------------------------------
     if (haveDest && report.sourceOk && !(options.cancel && options.cancel->load())) {
-        const IFileEnumerator::ProgressCallback destProgress =
+        ThreadPool hashPool(mode == ScanMode::Content ? resolveHashThreads() : 0);
+        if (mode == ScanMode::Content) report.hashThreadsUsed = hashPool.threadCount();
+
+        const IFileEnumerator::ProgressCallback enumProgress =
             [&](uint64_t files, uint64_t dirs, const std::wstring& path) {
                 emitProgress(ScanPhase::CompareDestination, files, dirs, path);
             };
+        double hashStart = 0.0;
+        double compareHashSeconds = 0.0;
+        bool hashing = false;
+        const auto hashProgress = [&](uint64_t done, uint64_t total) {
+            if (!hashing) {
+                hashing = true;
+                hashStart = NowSeconds();
+                hashThreadsActive.store(hashPool.threadCount(), std::memory_order_relaxed);
+            }
+            emitProgress(ScanPhase::Hashing, done, total, L"");
+            if (done >= total) {
+                hashing = false;
+                hashThreadsActive.store(0, std::memory_order_relaxed);
+                compareHashSeconds += NowSeconds() - hashStart;
+            }
+        };
 
-        std::unique_ptr<FileComparator> comparator;
-        if (mode == ScanMode::Content && sourceHashesReady) {
-            comparator.reset(new FileComparator(sourceIndex, mode));
-        } else {
-            comparator.reset(new FileComparator(sourceIndex, mode, options.source));
+        ConcurrentComparer comparer(caseSensitive_, mode, acceptMft, options.source,
+                                    options.destination,
+                                    sourceFromIndex ? ConcurrentComparer::SourceKind::FromIndex
+                                                    : ConcurrentComparer::SourceKind::Live,
+                                    sourceFromIndex ? &sourceIndex : nullptr, options.cancel);
+
+        ConcurrentComparer::Result cr = comparer.run(hashPool, enumProgress, hashProgress,
+                                                     cache.get());
+        hashThreadsActive.store(0, std::memory_order_relaxed);
+
+        if (!sourceFromIndex) {
+            report.sourceOk = cr.sourceStatus == ConcurrentComparer::WorkerStatus::Success;
         }
-
-        const bool destOk = runWithFallback([&](IFileEnumerator& it) {
-            return comparator->run(options.destination, it, report.results, destProgress,
-                                   options.cancel);
-        });
-        report.destinationOk = destOk;
-
-        if (mode == ScanMode::Content && destOk &&
-            !(options.cancel && options.cancel->load())) {
-            const unsigned int destThreads = resolveHashThreads();
-            report.hashThreadsUsed = destThreads;
-            hashThreadsActive = destThreads;
-            ThreadPool hashPool(destThreads);
-            const auto hashProgress = [&](uint64_t done, uint64_t total) {
-                emitProgress(ScanPhase::Hashing, done, total, L"");
-            };
-            const double th1 = NowSeconds();
-            comparator->runHashing(hashPool, report.results, options.cancel, hashProgress,
-                                   cache.get());
-            hashThreadsActive = 0;
-            report.secondsHashing += NowSeconds() - th1;
-            report.hashCacheHits += comparator->cacheHits();
-        }
+        report.destinationOk = cr.destinationStatus == ConcurrentComparer::WorkerStatus::Success;
+        report.results = std::move(cr.results);
+        report.secondsHashing += compareHashSeconds;
+        report.hashCacheHits += comparer.cacheHits();
 
         if (cache) {
             std::wstring werr;
@@ -357,7 +370,8 @@ ScanReport ScanController::run(const ScanOptions& options) {
     }
 
     const double t3 = NowSeconds();
-    report.secondsDestinationPass = t3 - t1 - report.secondsEnumerateSource;
+    report.secondsDestinationPass = t3 - t0 - report.secondsEnumerateSource -
+                                    report.secondsHashing;
     report.secondsTotal = t3 - t0;
 
     return report;
