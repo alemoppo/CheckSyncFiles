@@ -178,6 +178,39 @@ Lo stesso confronto offline è disponibile nella **GUI** con il pulsante **CARIC
 (il campo sorgente viene disabilitato e mostrato come `[snap] <file>`; un secondo clic
 ripristina la modalità online).
 
+##### Specifica del formato binario `BVSI` (v1)
+
+Tutti gli interi sono **little-endian**. `uN` = intero senza segno a N bit; una stringa è
+`u64 lunghezza + lunghezza byte UTF-8` (mai `\0` terminatore).
+
+```text
+Header:
+  magic            u32  0x49535642            ("BVSI")
+  version          u32  1
+  caseSensitive    u8   0 = case-insensitive, 1 = case-sensitive
+  sourceRoot       str  radice sorgente assoluta (UTF-8)
+  files            u64  numero file (informativo; ricalcolato in lettura)
+  dirs             u64  numero directory (informativo)
+  bytes            u64  somma dimensioni (informativo)
+  count            u64  numero di voci (deve essere ≤ 2^31)
+
+Voci (ripetute `count` volte):
+  path             str  percorso relativo alla root (UTF-8, ≤ 2^24 byte)
+  size             u64  dimensione file
+  lastWriteTime    u64  FILETIME ultima modifica
+  attributes       u32  attributi Win32 (FILE_ATTRIBUTE_*)
+  fileId           u64  FileId (solo informativo)
+  isDirectory      u8   0/1
+  hasHash          u8   0/1
+  digest           32 byte SHA-256 (solo se hasHash == 1)
+```
+
+Vincoli di robustezza applicati in lettura: `magic`/`version` devono combaciare, ogni
+`count` e `pathLen` ha un bound di sanità (voci e path sproporzionati fanno rifiutare il
+file come corrotto); un file troncato a metà voce è rifiutato. Le statistiche di header
+sono informative: all'`addEntry` di ogni voce vengono ricalcolate. Il formato è inteso
+stabile, ma la `version` permette evoluzioni future non retrocompatibili.
+
 ### Export CSV / JSON
 
 `--export <file>` scrive le voci non identiche dopo la scansione. Formato dedotto

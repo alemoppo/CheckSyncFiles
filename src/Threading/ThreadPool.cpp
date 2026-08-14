@@ -25,7 +25,8 @@ ThreadPool::~ThreadPool() {
 void ThreadPool::waitAll() {
     if (nThreads_ == 0) return;
     std::unique_lock<std::mutex> lk(mutex_);
-    doneCv_.wait(lk, [&] { return pending_ == 0 && tasks_.empty(); });
+    const uint64_t target = issued_; // only tasks submitted before this call
+    doneCv_.wait(lk, [&] { return completed_ >= target; });
 }
 
 void ThreadPool::workerLoop() {
@@ -41,12 +42,14 @@ void ThreadPool::workerLoop() {
         try {
             task();
         } catch (...) {
-            // Never let an exception escape a worker thread.
+            // Never let an exception escape a worker; record it so the caller
+            // can warn instead of the failure being invisible.
+            taskErrors_.fetch_add(1, std::memory_order_relaxed);
         }
         {
             std::lock_guard<std::mutex> lk(mutex_);
-            if (pending_ > 0) --pending_;
-            if (pending_ == 0) doneCv_.notify_all();
+            ++completed_;
+            doneCv_.notify_all();
         }
     }
 }

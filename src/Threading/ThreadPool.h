@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <condition_variable>
 #include <cstdint>
 #include <functional>
@@ -17,8 +18,17 @@ namespace bv {
 // submitted task. Tasks are type-erased callables (std::function<void()>).
 //
 // Thread-safety: submit() may be called from any thread. waitAll() blocks until
-// every task submitted so far has completed; it must NOT be called from inside
-// a task (would deadlock).
+// every task submitted before the call has completed; it must NOT be called
+// from inside a task (would deadlock).
+//
+// Completion tracking uses a monotonic generation counter: submit() bumps
+// `issued_`, a worker bumps `completed_` after each task finishes, and waitAll()
+// snapshots `issued_` at entry and waits until `completed_` reaches it. Both
+// are only touched under `mutex_`, so a submit racing a worker's completion can
+// never make waitAll() return while a task is still queued or running -- and
+// several threads may call waitAll() concurrently, each waiting for its own
+// snapshot. A task that throws is counted by taskErrors() (the caller can warn)
+// instead of escaping the worker.
 //
 // The destructor joins all workers, finishing any queued/running task. Tasks
 // are never interrupted between submit and the thread shutdown.
@@ -42,16 +52,21 @@ public:
             std::lock_guard<std::mutex> lk(mutex_);
             if (stopping_) return;
             tasks_.emplace(std::forward<F>(f));
-            ++pending_;
+            ++issued_;
         }
         cv_.notify_one();
     }
 
-    // Blocks until all tasks submitted up to now have finished. Safe to call
-    // from any external thread (e.g. the GUI / UI thread).
+    // Blocks until every task submitted before the call has finished. Safe to
+    // call from any external thread (e.g. the GUI / UI thread).
     void waitAll();
 
     unsigned int threadCount() const { return nThreads_; }
+
+    // Number of tasks that threw while running. Exceptions never kill a worker;
+    // this counter lets a caller surface the failure (e.g. as a read error in
+    // the final report) instead of swallowing it silently.
+    uint64_t taskErrors() const { return taskErrors_.load(std::memory_order_relaxed); }
 
 private:
     void workerLoop();
@@ -62,7 +77,9 @@ private:
     std::vector<std::thread> workers_;
     std::queue<std::function<void()>> tasks_;
     bool stopping_ = false;
-    unsigned int pending_ = 0;
+    uint64_t issued_ = 0;     // total tasks submitted
+    uint64_t completed_ = 0;  // total tasks finished (issued_ - completed_ = in flight)
+    std::atomic<uint64_t> taskErrors_{0};
     unsigned int nThreads_;
 };
 

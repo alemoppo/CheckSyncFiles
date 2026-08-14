@@ -15,6 +15,7 @@ FileIndex::BuildResult FileIndex::build(const std::wstring& root, IFileEnumerato
     map_.clear();
     hashes_.clear();
     stats_ = {};
+    collisionCount_ = 0;
 
     const bool ok = enumerator.enumerate(
         root,
@@ -47,6 +48,7 @@ void FileIndex::addEntry(FileEntry&& e) {
     if (it == map_.end()) {
         map_.emplace(k, std::move(e));
     } else {
+        ++collisionCount_; // last-wins: an existing folded key is being replaced
         if (it->second.isDirectory) {
             --stats_.dirs;
         } else {

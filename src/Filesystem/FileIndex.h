@@ -75,6 +75,12 @@ public:
     bool empty() const { return map_.empty(); }
     bool isCaseSensitive() const { return caseSensitive_; }
 
+    // Number of addEntry() calls that hit an already-present folded key and were
+    // resolved by the documented last-wins policy. A non-zero count means two
+    // distinct paths (e.g. "Foo.txt" and "foo.TXT") collapse to one record; the
+    // caller should surface a warning so the user knows a name was dropped.
+    size_t collisionCount() const { return collisionCount_; }
+
     const Map& entries() const { return map_; }
     const BuildStats& stats() const { return stats_; }
 
@@ -85,6 +91,7 @@ private:
     HashMap hashes_;
     BuildStats stats_;
     bool caseSensitive_;
+    size_t collisionCount_ = 0;
 };
 
 } // namespace bv

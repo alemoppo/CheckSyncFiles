@@ -50,27 +50,27 @@ std::unique_ptr<IFileEnumerator> MakeMft() {
 ConcurrentComparer::Result ConcurrentComparer::run(
     ThreadPool& hashPool, const ProgressCallback& onProgress,
     const HashProgressCallback& onHashProgress, hashing::HashCache* cache) {
-    std::vector<EnumeratorFactory> srcFactories;
-    std::vector<EnumeratorFactory> dstFactories;
+    std::vector<EnumeratorStep> srcSteps;
+    std::vector<EnumeratorStep> dstSteps;
     if (acceptMft_) {
-        srcFactories = {MakeMft, MakeWin32};
-        dstFactories = {MakeMft, MakeWin32};
+        srcSteps = {{L"MFT", MakeMft}, {L"Win32", MakeWin32}};
+        dstSteps = {{L"MFT", MakeMft}, {L"Win32", MakeWin32}};
     } else {
-        srcFactories = {MakeWin32};
-        dstFactories = {MakeWin32};
+        srcSteps = {{L"Win32", MakeWin32}};
+        dstSteps = {{L"Win32", MakeWin32}};
     }
-    return runImpl(std::move(srcFactories), std::move(dstFactories), hashPool, onProgress,
-                   onHashProgress, cache);
+    return runImpl(std::move(srcSteps), std::move(dstSteps), hashPool, onProgress, onHashProgress,
+                   cache);
 }
 
 ConcurrentComparer::Result ConcurrentComparer::runWithFactories(
     EnumeratorFactory sourceFactory, EnumeratorFactory destFactory, ThreadPool& hashPool,
     const ProgressCallback& onProgress, const HashProgressCallback& onHashProgress,
     hashing::HashCache* cache) {
-    std::vector<EnumeratorFactory> src;
-    src.push_back(std::move(sourceFactory));
-    std::vector<EnumeratorFactory> dst;
-    dst.push_back(std::move(destFactory));
+    std::vector<EnumeratorStep> src;
+    src.push_back({L"factory", std::move(sourceFactory)});
+    std::vector<EnumeratorStep> dst;
+    dst.push_back({L"factory", std::move(destFactory)});
     return runImpl(std::move(src), std::move(dst), hashPool, onProgress, onHashProgress, cache);
 }
 
@@ -79,15 +79,21 @@ ConcurrentComparer::Result ConcurrentComparer::runWithFactories(
     std::vector<EnumeratorFactory> destFactories, ThreadPool& hashPool,
     const ProgressCallback& onProgress, const HashProgressCallback& onHashProgress,
     hashing::HashCache* cache) {
-    return runImpl(std::move(sourceFactories), std::move(destFactories), hashPool, onProgress,
-                   onHashProgress, cache);
+    std::vector<EnumeratorStep> src;
+    std::vector<EnumeratorStep> dst;
+    for (size_t i = 0; i < sourceFactories.size(); ++i) {
+        src.push_back({L"factory-" + std::to_wstring(i), std::move(sourceFactories[i])});
+    }
+    for (size_t i = 0; i < destFactories.size(); ++i) {
+        dst.push_back({L"factory-" + std::to_wstring(i), std::move(destFactories[i])});
+    }
+    return runImpl(std::move(src), std::move(dst), hashPool, onProgress, onHashProgress, cache);
 }
 
 ConcurrentComparer::Result ConcurrentComparer::runImpl(
-    std::vector<EnumeratorFactory> sourceFactories,
-    std::vector<EnumeratorFactory> destFactories, ThreadPool& hashPool,
-    const ProgressCallback& onProgress, const HashProgressCallback& onHashProgress,
-    hashing::HashCache* cache) {
+    std::vector<EnumeratorStep> sourceSteps, std::vector<EnumeratorStep> destSteps,
+    ThreadPool& hashPool, const ProgressCallback& onProgress,
+    const HashProgressCallback& onHashProgress, hashing::HashCache* cache) {
     onProgress_ = onProgress;
     onHashProgress_ = onHashProgress;
     cacheHits_.store(0, std::memory_order_relaxed);
@@ -103,16 +109,21 @@ ConcurrentComparer::Result ConcurrentComparer::runImpl(
     WorkerState stateB;
     WorkerStatus sourceStatus = WorkerStatus::Failed;
     WorkerStatus destStatus = WorkerStatus::Failed;
+    // Each worker appends to its own vector; they are merged after join, so the
+    // notes need no locking.
+    std::vector<std::wstring> notesA;
+    std::vector<std::wstring> notesB;
 
     std::thread workerA([&] {
         if (sourceKind_ == SourceKind::FromIndex) {
             sourceStatus = runIndexWorker(table, sink, candidatesA);
         } else {
-            sourceStatus = runEnumWorker(0, sourceFactories, table, sink, candidatesA, stateA);
+            sourceStatus = runEnumWorker(0, sourceSteps, table, sink, candidatesA, stateA,
+                                         notesA);
         }
     });
     std::thread workerB([&] {
-        destStatus = runEnumWorker(1, destFactories, table, sink, candidatesB, stateB);
+        destStatus = runEnumWorker(1, destSteps, table, sink, candidatesB, stateB, notesB);
     });
     workerA.join();
     workerB.join();
@@ -120,6 +131,9 @@ ConcurrentComparer::Result ConcurrentComparer::runImpl(
     Result r;
     r.sourceStatus = sourceStatus;
     r.destinationStatus = destStatus;
+    r.notes.reserve(notesA.size() + notesB.size());
+    for (auto& n : notesA) r.notes.push_back(std::move(n));
+    for (auto& n : notesB) r.notes.push_back(std::move(n));
 
     const bool clean = sourceStatus == WorkerStatus::Success && destStatus == WorkerStatus::Success;
     ResultSet post; // results produced after both workers have stopped
@@ -196,70 +210,102 @@ void ConcurrentComparer::onError(const ScanError& err, ConcurrentSink& sink) {
 }
 
 ConcurrentComparer::WorkerStatus ConcurrentComparer::runEnumWorker(
-    int side, const std::vector<EnumeratorFactory>& factories, MatchTable& table,
-    ConcurrentSink& sink, std::vector<ContentCandidate>& candidates, WorkerState& state) {
-    bool canceled = false;
+    int side, const std::vector<EnumeratorStep>& steps, MatchTable& table,
+    ConcurrentSink& sink, std::vector<ContentCandidate>& candidates, WorkerState& state,
+    std::vector<std::wstring>& notes) {
     const std::wstring& root = (side == 0) ? sourceRoot_ : destRoot_;
+    const std::wstring sideName = (side == 0) ? L"sorgente" : L"destinazione";
 
-    for (const auto& factory : factories) {
-        if (canceled) {
+    for (size_t idx = 0; idx < steps.size(); ++idx) {
+        const EnumeratorStep& step = steps[idx];
+        if (cancel_ && cancel_->load(std::memory_order_relaxed)) {
             table.setSideDone(side);
             return WorkerStatus::Cancelled;
         }
-        std::unique_ptr<IFileEnumerator> enumerator = factory();
-        if (!enumerator) continue;
 
-        bool emitted = false;
-        const bool ok = enumerator->enumerate(
-            root,
-            [&](FileEntry&& e) -> bool {
-                if (cancel_ && cancel_->load(std::memory_order_relaxed)) {
-                    canceled = true;
-                    return false; // stop this side early (same as the serial path)
-                }
-                emitted = true;
-                onEntry(side, std::move(e), table, sink, candidates);
-                return true;
-            },
-            [&](const ScanError& err) { onError(err, sink); },
-            [&](uint64_t files, uint64_t dirs, const std::wstring& path) {
-                totalFiles_.fetch_add(files - state.lastFiles, std::memory_order_relaxed);
-                state.lastFiles = files;
-                totalDirs_.fetch_add(dirs - state.lastDirs, std::memory_order_relaxed);
-                state.lastDirs = dirs;
-                if (onProgress_) {
-                    onProgress_(totalFiles_.load(std::memory_order_relaxed),
-                                totalDirs_.load(std::memory_order_relaxed), path);
-                }
-            },
-            cancel_);
-
-        if (ok) {
-            table.setSideDone(side);
-            // An enumerator that polls `cancel` itself may abort before the entry
-            // callback ever fires and still return true; such a side was not
-            // scanned and must be reported Cancelled, never as a clean Success.
-            if (canceled ||
-                (cancel_ && cancel_->load(std::memory_order_relaxed))) {
-                return WorkerStatus::Cancelled;
+        std::unique_ptr<IFileEnumerator> enumerator = step.factory();
+        if (!enumerator) {
+            if (idx + 1 < steps.size()) {
+                notes.push_back(L"backend '" + step.name + L"' non disponibile su '" + root +
+                                L"' (" + sideName + L"); uso '" + steps[idx + 1].name + L"'");
+                continue;
             }
-            return WorkerStatus::Success;
+            break; // no step left to build: falls through to Failed below
         }
-        // The enumerator failed. If it emited entries before failing (an MFT
-        // scan that went incomplete mid-walk), the result is not trustworthy:
-        // fall back is impossible because entries already streamed into the
-        // table may have matched the other side. The side is marked failed and
-        // nothing is reported as missing/extra.
-        if (emitted) {
-            table.setSideDone(side);
-            return WorkerStatus::Failed;
+
+        const EnumAttemptResult attempt =
+            runOneStep(side, root, *enumerator, table, sink, candidates, state);
+        switch (attempt) {
+            case EnumAttemptResult::Finished:
+                table.setSideDone(side);
+                return WorkerStatus::Success;
+            case EnumAttemptResult::Cancelled:
+                table.setSideDone(side);
+                return WorkerStatus::Cancelled;
+            case EnumAttemptResult::FailedWithEntries:
+                // Entries already streamed into the table may have matched the
+                // other side: falling back would double-count them or fabricate
+                // verdicts, so the side is marked failed and nothing is reported
+                // as missing/extra.
+                notes.push_back(L"backend '" + step.name + L"' su '" + root + L"' (" +
+                                sideName +
+                                L") ha prodotto un albero incompleto; il confronto e "
+                                L"incompleto (le voci gia emesse restano valide)");
+                table.setSideDone(side);
+                return WorkerStatus::Failed;
+            case EnumAttemptResult::FailedEmpty:
+                // Clean pre-stream failure (root inaccessible, volume not NTFS,
+                // no privileges): safe to try the next back-end.
+                if (idx + 1 < steps.size()) {
+                    notes.push_back(L"backend '" + step.name + L"' non utilizzabile su '" + root +
+                                    L"' (" + sideName + L"); ripiego su '" +
+                                    steps[idx + 1].name + L"'");
+                    continue;
+                }
+                break; // no fallback left: falls through to Failed below
         }
-        // Pre-stream failure with zero entries (root access, not NTFS, ...):
-        // safe to try the next enumerator (MFT -> Win32 fallback).
     }
 
     table.setSideDone(side);
-    return canceled ? WorkerStatus::Cancelled : WorkerStatus::Failed;
+    return cancel_ && cancel_->load(std::memory_order_relaxed) ? WorkerStatus::Cancelled
+                                                               : WorkerStatus::Failed;
+}
+
+ConcurrentComparer::EnumAttemptResult ConcurrentComparer::runOneStep(
+    int side, const std::wstring& root, IFileEnumerator& enumerator, MatchTable& table,
+    ConcurrentSink& sink, std::vector<ContentCandidate>& candidates, WorkerState& state) {
+    bool emitted = false;
+    const bool ok = enumerator.enumerate(
+        root,
+        [&](FileEntry&& e) -> bool {
+            if (cancel_ && cancel_->load(std::memory_order_relaxed)) {
+                return false; // stop this side early (same as the serial path)
+            }
+            emitted = true;
+            onEntry(side, std::move(e), table, sink, candidates);
+            return true;
+        },
+        [&](const ScanError& err) { onError(err, sink); },
+        [&](uint64_t files, uint64_t dirs, const std::wstring& path) {
+            totalFiles_.fetch_add(files - state.lastFiles, std::memory_order_relaxed);
+            state.lastFiles = files;
+            totalDirs_.fetch_add(dirs - state.lastDirs, std::memory_order_relaxed);
+            state.lastDirs = dirs;
+            if (onProgress_) {
+                onProgress_(totalFiles_.load(std::memory_order_relaxed),
+                            totalDirs_.load(std::memory_order_relaxed), path);
+            }
+        },
+        cancel_);
+
+    // An enumerator that polls `cancel` itself may abort before the entry
+    // callback ever fires and still return true; such a side was not scanned
+    // and must be reported Cancelled, never as a clean Success.
+    if (cancel_ && cancel_->load(std::memory_order_relaxed)) {
+        return EnumAttemptResult::Cancelled;
+    }
+    if (ok) return EnumAttemptResult::Finished;
+    return emitted ? EnumAttemptResult::FailedWithEntries : EnumAttemptResult::FailedEmpty;
 }
 
 ConcurrentComparer::WorkerStatus ConcurrentComparer::runIndexWorker(

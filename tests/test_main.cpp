@@ -21,7 +21,10 @@
 
 #include <atomic>
 #include <array>
+#include <chrono>
 #include <cstdio>
+#include <future>
+#include <stdexcept>
 #include <thread>
 
 #include "Comparison/ScanMode.h"
@@ -332,6 +335,34 @@ TEST("file index: duplicate folded keys are last-wins with consistent stats", []
     CHECK(e.relativePath == L"foo.TXT"); // and it is the last reported one
 });
 
+TEST("file index: folded-key collisions are counted for the last-wins policy", [] {
+    FileIndex idx(false); // case-insensitive: "Foo.txt" and "foo.TXT" fold to one key
+    FileEntry a;
+    a.relativePath = L"Foo.txt";
+    a.size = 10;
+    FileEntry b;
+    b.relativePath = L"foo.TXT";
+    b.size = 20;
+
+    idx.addEntry(std::move(a));
+    CHECK_EQ(idx.collisionCount(), 0ull);
+    idx.addEntry(std::move(b)); // same folded key -> last-wins, counted
+    CHECK_EQ(idx.collisionCount(), 1ull);
+
+    FileEntry got;
+    CHECK(idx.find(L"Foo.txt", got));
+    CHECK(got.size == 20); // the later entry won
+    CHECK_EQ(idx.size(), 1ull);
+
+    // A rebuild resets the counter so a report reflects only the last build.
+    FileIndex idx2(false);
+    FileEntry c;
+    c.relativePath = L"x.txt";
+    idx2.addEntry(std::move(c));
+    CHECK_EQ(idx2.collisionCount(), 0ull);
+    CHECK_EQ(idx2.size(), 1ull);
+});
+
 // ---------------------------------------------------------------------------
 // Full scans
 // ---------------------------------------------------------------------------
@@ -631,6 +662,75 @@ TEST("threadpool: destructor drains queued tasks", [] {
         }
     }
     CHECK_EQ(count.load(), 500);
+});
+
+TEST("threadpool: waitAll() does not return while a task is still running", [] {
+    // Deterministic gate: the single worker parks inside the first task; a
+    // second task is queued behind it. waitAll() must not return until BOTH
+    // have run, even though the first is blocked on a promise.
+    bv::ThreadPool pool(1);
+    std::atomic<int> completed{0};
+    std::atomic<bool> taskStarted{false};
+    std::atomic<bool> waitReturned{false};
+    std::promise<void> gate;
+
+    pool.submit([&] {
+        taskStarted.store(true, std::memory_order_release);
+        gate.get_future().wait(); // block until the main thread releases us
+        completed.fetch_add(1, std::memory_order_relaxed);
+    });
+    while (!taskStarted.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+    pool.submit([&] { completed.fetch_add(1, std::memory_order_relaxed); });
+
+    std::thread waiter([&] {
+        pool.waitAll();
+        waitReturned.store(true, std::memory_order_release);
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    CHECK_MSG(!waitReturned.load(std::memory_order_acquire),
+              "waitAll() returned while the first task was still blocked");
+    gate.set_value();
+    waiter.join();
+    CHECK(waitReturned.load(std::memory_order_acquire));
+    CHECK_EQ(completed.load(), 2);
+});
+
+TEST("threadpool: concurrent submit/waitAll batches all complete before returning", [] {
+    // Several threads submit their own batch and wait for it concurrently. Each
+    // waitAll() must cover every task submitted before it -- including the other
+    // threads' tasks -- so nothing can be left running when one producer sees its
+    // waitAll() return.
+    bv::ThreadPool pool(4);
+    std::atomic<int> completed{0};
+    const int kProducers = 4;
+    const int kTasksEach = 500;
+    std::vector<std::thread> producers;
+    for (int p = 0; p < kProducers; ++p) {
+        producers.emplace_back([&] {
+            for (int i = 0; i < kTasksEach; ++i) {
+                pool.submit([&] { completed.fetch_add(1, std::memory_order_relaxed); });
+            }
+            pool.waitAll();
+        });
+    }
+    for (auto& t : producers) t.join();
+    CHECK_EQ(completed.load(), kProducers * kTasksEach);
+});
+
+TEST("threadpool: task exceptions are counted, never kill the pool", [] {
+    bv::ThreadPool pool(2);
+    pool.submit([] { throw std::runtime_error("boom"); });
+    pool.submit([] {});
+    pool.waitAll();
+    CHECK_MSG(pool.taskErrors() == 1, "throwing task must be counted, not silent");
+    // The pool stays usable afterwards and the counter is sticky.
+    std::atomic<int> ok{0};
+    pool.submit([&] { ok.fetch_add(1); });
+    pool.waitAll();
+    CHECK_EQ(ok.load(), 1);
+    CHECK_EQ(pool.taskErrors(), 1ull);
 });
 
 TEST("ioclass: classify local vs network", [] {
@@ -1215,6 +1315,66 @@ TEST("cache: second run reuses stored hashes without re-reading", [] {
     std::wstring err;
     hashing::HashCache loaded(cache, err);
     CHECK_MSG(loaded.size() > 0, "cache reloaded from disk");
+});
+
+TEST("cache: persistence round-trip preserves digests and key semantics", [] {
+    const std::wstring file = MakeTempDir() + L"\\hash_rt.bin";
+    std::array<uint8_t, 32> d0;
+    std::array<uint8_t, 32> d1;
+    for (size_t i = 0; i < d0.size(); ++i) {
+        d0[i] = static_cast<uint8_t>(i);
+        d1[i] = static_cast<uint8_t>(255 - i);
+    }
+    {
+        std::wstring err;
+        hashing::HashCache c(file, err);
+        CHECK(err.empty());
+        c.Store(L"C:\\a\\b.txt", 100, 12345, d0);
+        c.Store(L"C:\\a\\c.txt", 200, 99999, d1);
+        CHECK_EQ(c.size(), 2ull);
+        CHECK(c.Save(err));
+        CHECK(err.empty());
+    }
+    // A fresh instance must reload exactly what was stored.
+    std::wstring err;
+    hashing::HashCache c2(file, err);
+    CHECK(err.empty());
+    CHECK_EQ(c2.size(), 2ull);
+    std::array<uint8_t, 32> got{};
+    CHECK(c2.Lookup(L"C:\\a\\b.txt", 100, 12345, got));
+    CHECK(got == d0);
+    CHECK(c2.Lookup(L"C:\\a\\c.txt", 200, 99999, got));
+    CHECK(got == d1);
+    // The key is (path, size, mtime): changing any component must miss.
+    CHECK(!c2.Lookup(L"C:\\a\\b.txt", 101, 12345, got));
+    CHECK(!c2.Lookup(L"C:\\a\\b.txt", 100, 12346, got));
+    CHECK(!c2.Lookup(L"C:\\a\\other.txt", 100, 12345, got));
+});
+
+TEST("cache: corrupt file is rejected cleanly and can be rebuilt", [] {
+    const std::wstring file = MakeTempDir() + L"\\hash_corrupt.bin";
+    const char junk[] = "this-is-not-a-BVHC-cache-file-at-all-0123456789";
+    CHECK(WriteFileBytes(file, junk, sizeof(junk) - 1));
+
+    std::wstring err;
+    hashing::HashCache c(file, err);
+    CHECK_MSG(!err.empty(), "corrupt cache must be reported, not loaded");
+    CHECK_EQ(c.size(), 0ull);
+
+    // The cache is still usable and rewrites a valid file from scratch.
+    std::array<uint8_t, 32> d{};
+    d[0] = 0xAB;
+    c.Store(L"C:\\x\\y.bin", 7, 42, d);
+    CHECK(c.Save(err));
+    CHECK(err.empty());
+
+    std::wstring err2;
+    hashing::HashCache c2(file, err2);
+    CHECK(err2.empty());
+    CHECK_EQ(c2.size(), 1ull);
+    std::array<uint8_t, 32> got{};
+    CHECK(c2.Lookup(L"C:\\x\\y.bin", 7, 42, got));
+    CHECK(got[0] == 0xAB);
 });
 
 TEST("comparator: file changed between enumeration and hash is flagged", [] {
@@ -1810,6 +1970,50 @@ TEST("concurrent comparer: cancel before start skips missing/extra reporting", [
     CHECK(r.destinationStatus == ConcurrentComparer::WorkerStatus::Cancelled);
     CHECK_EQ(r.results.stats.missingFiles + r.results.stats.missingDirs +
                  r.results.stats.extraFiles + r.results.stats.extraDirs, 0ull);
+});
+
+TEST("concurrent comparer: fallback and partial scans produce user-facing notes", [] {
+    const auto dir = MakeTempDir();
+    testgen::CreateDifferingTrees(dir);
+    const std::wstring src = dir + L"\\src";
+    const std::wstring dst = dir + L"\\dst";
+
+    // (1) Pre-emission failure (MFT stand-in) -> transparent Win32 fallback.
+    {
+        std::vector<ConcurrentComparer::EnumeratorFactory> srcFacs;
+        srcFacs.push_back(
+            [] { return std::unique_ptr<IFileEnumerator>(new FailImmediatelyEnumerator()); });
+        srcFacs.push_back(MakeWin32Factory);
+        std::vector<ConcurrentComparer::EnumeratorFactory> dstFacs;
+        dstFacs.push_back(MakeWin32Factory);
+
+        bv::ThreadPool pool(0);
+        ConcurrentComparer cmp(false, ScanMode::Presence, false, src, dst,
+                               ConcurrentComparer::SourceKind::Live, nullptr);
+        const auto r = cmp.runWithFactories(std::move(srcFacs), std::move(dstFacs), pool);
+        CHECK(r.sourceStatus == ConcurrentComparer::WorkerStatus::Success);
+        CHECK_MSG(!r.notes.empty(), "a transparent fallback must be reported to the user");
+    }
+
+    // (2) Emitted-then-failed (incomplete MFT shape) -> Failed with a note, and
+    //     still no missing/extra fabricated verdicts.
+    {
+        const auto srcEntries = CaptureEntries(src);
+        const auto dstEntries = CaptureEntries(dst);
+        bv::ThreadPool pool(0);
+        ConcurrentComparer cmp(false, ScanMode::Presence, false, src, dst,
+                               ConcurrentComparer::SourceKind::Live, nullptr);
+        auto srcFac = [&] {
+            return std::unique_ptr<IFileEnumerator>(
+                new FailAfterNEnumerator(srcEntries, srcEntries.size()));
+        };
+        const auto r = cmp.runWithFactories(std::move(srcFac), MakeWin32Factory, pool);
+        CHECK(r.sourceStatus == ConcurrentComparer::WorkerStatus::Failed);
+        CHECK_MSG(!r.notes.empty(), "an incomplete scan must be reported to the user");
+        CHECK_EQ(r.results.stats.missingFiles + r.results.stats.missingDirs +
+                     r.results.stats.extraFiles + r.results.stats.extraDirs, 0ull);
+        (void)dstEntries;
+    }
 });
 
 // ---------------------------------------------------------------------------

@@ -45,9 +45,16 @@ void HashSourceIndex(FileIndex& index, const std::wstring& root, ThreadPool& poo
         const size_t n = std::min<size_t>(256, total - done);
         std::vector<std::array<uint8_t, 32>> digests(n);
         for (size_t i = 0; i < n; ++i) {
-            const std::wstring& rel = files[done + i];
-            pool.submit([&root, &rel, &d = digests[i], cache, &cacheHits, cancel] {
+            // Capture the stable vector index, not a reference to the element:
+            // `files` is fully built before the loop and never modified, and the
+            // batch-local `digests` below is drained by pool.waitAll() before the
+            // batch scope ends, so both stay valid for the whole task lifetime.
+            // `root` is a const reference parameter alive through this call.
+            const size_t relIndex = done + i;
+            pool.submit([&files, &digests, relIndex, i, &root, cache, &cacheHits, cancel] {
                 if (cancel && cancel->load(std::memory_order_relaxed)) return;
+                const std::wstring& rel = files[relIndex];
+                std::array<uint8_t, 32>& d = digests[i];
                 const std::wstring abs = pathutil::MakeAbsolute(root, rel);
                 uint64_t sz = 0;
                 uint64_t mt = 0;
@@ -285,6 +292,11 @@ ScanReport ScanController::run(const ScanOptions& options) {
         }
     }
 
+    // Distinct paths that folded to the same case-insensitive key were resolved
+    // last-wins while building the source index; surface it so the caller can
+    // warn the user that a name was dropped.
+    report.pathCollisions = sourceIndex.collisionCount();
+
     // ---------------------------------------------------------------------
     // 2. Destination pass: enumerate + compare against the source, CONCURRENTLY.
     //    When the source was pre-built (offline / snapshot capture) it is fed
@@ -332,6 +344,7 @@ ScanReport ScanController::run(const ScanOptions& options) {
         report.results = std::move(cr.results);
         report.secondsHashing += compareHashSeconds;
         report.hashCacheHits += comparer.cacheHits();
+        for (std::wstring& n : cr.notes) report.notes.push_back(std::move(n));
 
         if (cache) {
             std::wstring werr;

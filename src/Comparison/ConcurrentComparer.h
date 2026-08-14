@@ -52,12 +52,23 @@ public:
         ResultSet results;
         WorkerStatus sourceStatus = WorkerStatus::Failed;
         WorkerStatus destinationStatus = WorkerStatus::Failed;
+        // Human-readable notices for the user: e.g. "MFT non utilizzabile su 'C:';
+        // ripiego su Win32". Empty when nothing noteworthy happened.
+        std::vector<std::wstring> notes;
     };
 
     using ProgressCallback =
         std::function<void(uint64_t files, uint64_t dirs, const std::wstring& currentPath)>;
     using HashProgressCallback = std::function<void(uint64_t done, uint64_t total)>;
     using EnumeratorFactory = std::function<std::unique_ptr<IFileEnumerator>()>;
+
+    // One entry in a side's enumeration plan: a named back-end (e.g. "MFT",
+    // "Win32") plus the factory that builds it. The name is used only for the
+    // user-facing fallback notice.
+    struct EnumeratorStep {
+        std::wstring name;
+        EnumeratorFactory factory;
+    };
 
     // `acceptMft` allows the MFT scanner on each local NTFS root (with automatic
     // Win32 fallback only when the MFT fails before emitting any entry).
@@ -99,15 +110,29 @@ private:
         uint64_t lastDirs = 0;
     };
 
-    Result runImpl(std::vector<EnumeratorFactory> sourceFactories,
-                   std::vector<EnumeratorFactory> destFactories, ThreadPool& hashPool,
-                   const ProgressCallback& onProgress,
+    // Outcome of a single enumerator run, used to decide the fallback
+    // explicitly instead of inferring it from an entry count.
+    enum class EnumAttemptResult : uint8_t {
+        Finished,          // enumerator returned success
+        Cancelled,         // cancellation requested before/during the walk
+        FailedWithEntries, // failed AFTER emitting entries: too late to fall back
+        FailedEmpty,       // failed BEFORE emitting any entry: safe to fall back
+    };
+
+    Result runImpl(std::vector<EnumeratorStep> sourceSteps, std::vector<EnumeratorStep> destSteps,
+                   ThreadPool& hashPool, const ProgressCallback& onProgress,
                    const HashProgressCallback& onHashProgress, hashing::HashCache* cache);
-    WorkerStatus runEnumWorker(int side, const std::vector<EnumeratorFactory>& factories,
+    WorkerStatus runEnumWorker(int side, const std::vector<EnumeratorStep>& steps,
                                MatchTable& table, ConcurrentSink& sink,
-                               std::vector<ContentCandidate>& candidates, WorkerState& state);
+                               std::vector<ContentCandidate>& candidates, WorkerState& state,
+                               std::vector<std::wstring>& notes);
     WorkerStatus runIndexWorker(MatchTable& table, ConcurrentSink& sink,
                                 std::vector<ContentCandidate>& candidates);
+    // Runs one enumerator to completion and reports WHY it stopped; emits
+    // progress and classifies entries through the table.
+    EnumAttemptResult runOneStep(int side, const std::wstring& root, IFileEnumerator& enumerator,
+                                 MatchTable& table, ConcurrentSink& sink,
+                                 std::vector<ContentCandidate>& candidates, WorkerState& state);
     void onEntry(int side, FileEntry e, MatchTable& table, ConcurrentSink& sink,
                  std::vector<ContentCandidate>& candidates);
     void onError(const ScanError& err, ConcurrentSink& sink);

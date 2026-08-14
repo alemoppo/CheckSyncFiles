@@ -311,6 +311,10 @@ bv::ScanController controller(options.caseSensitive);
                     : report.backendUsed == bv::EnumeratorBackend::Win32 ? L"Win32"
                                                                           : L"?") << L"\n";
 
+    for (const std::wstring& note : report.notes) {
+        std::wcout << L"NOTA: " << note << L"\n";
+    }
+
     if (report.usedSnapshot) {
         std::wcout << L"Sorgente offline:     snapshot caricato (" << report.results.stats.sourceFiles
                    << L" voci)\n";
@@ -350,6 +354,11 @@ bv::ScanController controller(options.caseSensitive);
     }
     if (!report.destinationOk) {
         std::wcout << L"\nATTENZIONE: la radice destinazione non e accessibile.\n";
+    }
+    if (report.pathCollisions > 0) {
+        std::wcout << L"ATTENZIONE: " << Group(report.pathCollisions)
+                   << L" percorsi distinti coincidono dopo il case-fold (policy last-wins: "
+                      L"resta l'ultima voce incontrata).\n";
     }
 
     if (args.listProblems) {

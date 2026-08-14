@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <vector>
 
 #include "Comparison/ComparisonResult.h"
 #include "Comparison/ScanMode.h"
@@ -92,6 +93,14 @@ struct ScanReport {
     bool exportWritten = false;             // `exportPath` was produced
     std::wstring exportError;
     size_t hashCacheHits = 0;               // files skipped thanks to the cache
+
+    // Human-readable notices to show the user (e.g. back-end fallbacks, or a
+    // warning that distinct paths folded to the same case-insensitive key).
+    std::vector<std::wstring> notes;
+    // Distinct paths that collapsed to one record under the case policy
+    // (last-wins). Non-zero means the user should be warned that a name was
+    // dropped from the source index.
+    size_t pathCollisions = 0;
 };
 
 // Orchestrates a comparison run:
