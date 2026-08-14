@@ -119,6 +119,15 @@ private:
         FailedEmpty,       // failed BEFORE emitting any entry: safe to fall back
     };
 
+    // Result of one enumerator attempt: why it stopped plus every error it
+    // reported along the way. Errors are STAGED here instead of being written
+    // straight into the result sink so a discarded attempt (FailedEmpty followed
+    // by a fallback) cannot leave stale permanent results behind.
+    struct EnumAttempt {
+        EnumAttemptResult result = EnumAttemptResult::FailedEmpty;
+        std::vector<ScanError> errors;
+    };
+
     Result runImpl(std::vector<EnumeratorStep> sourceSteps, std::vector<EnumeratorStep> destSteps,
                    ThreadPool& hashPool, const ProgressCallback& onProgress,
                    const HashProgressCallback& onHashProgress, hashing::HashCache* cache);
@@ -129,13 +138,23 @@ private:
     WorkerStatus runIndexWorker(MatchTable& table, ConcurrentSink& sink,
                                 std::vector<ContentCandidate>& candidates);
     // Runs one enumerator to completion and reports WHY it stopped; emits
-    // progress and classifies entries through the table.
-    EnumAttemptResult runOneStep(int side, const std::wstring& root, IFileEnumerator& enumerator,
-                                 MatchTable& table, ConcurrentSink& sink,
-                                 std::vector<ContentCandidate>& candidates, WorkerState& state);
+    // progress and classifies entries through the table. Errors reported by the
+    // enumerator are collected in the returned EnumAttempt (not written to the
+    // sink): the caller decides whether the attempt's outcome is retained.
+    EnumAttempt runOneStep(int side, const std::wstring& root, IFileEnumerator& enumerator,
+                           MatchTable& table, ConcurrentSink& sink,
+                           std::vector<ContentCandidate>& candidates, WorkerState& state);
     void onEntry(int side, FileEntry e, MatchTable& table, ConcurrentSink& sink,
                  std::vector<ContentCandidate>& candidates);
     void onError(const ScanError& err, ConcurrentSink& sink);
+    // Writes a retained attempt's staged errors into the sink (a real outcome:
+    // success, incomplete scan, cancellation, or terminal failure).
+    void flushErrors(const std::vector<ScanError>& errors, ConcurrentSink& sink);
+    // Turns an ABANDONED attempt's errors into user-facing notes: the attempt
+    // was fully discarded in favour of a later back-end, so its errors must not
+    // survive as permanent results, but the reason is still worth reporting.
+    void noteAbandonedErrors(const std::vector<ScanError>& errors,
+                             std::vector<std::wstring>& notes);
     void finalizeMissingExtra(MatchTable& table, ResultSet& out);
     void sortProblems(ResultSet& out);
 

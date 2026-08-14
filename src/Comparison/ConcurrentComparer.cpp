@@ -233,20 +233,24 @@ ConcurrentComparer::WorkerStatus ConcurrentComparer::runEnumWorker(
             break; // no step left to build: falls through to Failed below
         }
 
-        const EnumAttemptResult attempt =
+        const EnumAttempt attempt =
             runOneStep(side, root, *enumerator, table, sink, candidates, state);
-        switch (attempt) {
+        switch (attempt.result) {
             case EnumAttemptResult::Finished:
+                flushErrors(attempt.errors, sink);
                 table.setSideDone(side);
                 return WorkerStatus::Success;
             case EnumAttemptResult::Cancelled:
+                flushErrors(attempt.errors, sink);
                 table.setSideDone(side);
                 return WorkerStatus::Cancelled;
             case EnumAttemptResult::FailedWithEntries:
                 // Entries already streamed into the table may have matched the
                 // other side: falling back would double-count them or fabricate
                 // verdicts, so the side is marked failed and nothing is reported
-                // as missing/extra.
+                // as missing/extra. The attempt is retained (it is the final
+                // outcome), so its errors describe a real, incomplete scan.
+                flushErrors(attempt.errors, sink);
                 notes.push_back(L"backend '" + step.name + L"' su '" + root + L"' (" +
                                 sideName +
                                 L") ha prodotto un albero incompleto; il confronto e "
@@ -255,14 +259,20 @@ ConcurrentComparer::WorkerStatus ConcurrentComparer::runEnumWorker(
                 return WorkerStatus::Failed;
             case EnumAttemptResult::FailedEmpty:
                 // Clean pre-stream failure (root inaccessible, volume not NTFS,
-                // no privileges): safe to try the next back-end.
+                // no privileges): safe to try the next back-end. The whole attempt
+                // is discarded, so its staged errors must NOT survive as
+                // permanent results; keep them only as diagnostic notes.
                 if (idx + 1 < steps.size()) {
+                    noteAbandonedErrors(attempt.errors, notes);
                     notes.push_back(L"backend '" + step.name + L"' non utilizzabile su '" + root +
                                     L"' (" + sideName + L"); ripiego su '" +
                                     steps[idx + 1].name + L"'");
                     continue;
                 }
-                break; // no fallback left: falls through to Failed below
+                // No fallback left: the attempt IS the final outcome, and its
+                // errors are the only explanation for the failure: keep them.
+                flushErrors(attempt.errors, sink);
+                break; // falls through to Failed below
         }
     }
 
@@ -271,10 +281,14 @@ ConcurrentComparer::WorkerStatus ConcurrentComparer::runEnumWorker(
                                                                : WorkerStatus::Failed;
 }
 
-ConcurrentComparer::EnumAttemptResult ConcurrentComparer::runOneStep(
+ConcurrentComparer::EnumAttempt ConcurrentComparer::runOneStep(
     int side, const std::wstring& root, IFileEnumerator& enumerator, MatchTable& table,
     ConcurrentSink& sink, std::vector<ContentCandidate>& candidates, WorkerState& state) {
     bool emitted = false;
+    // Errors are staged here, NOT pushed into the sink: whether they are kept
+    // (success/incomplete/terminal failure) or discarded (fallback) is decided
+    // by the caller once the attempt's outcome is known.
+    std::vector<ScanError> stagedErrors;
     const bool ok = enumerator.enumerate(
         root,
         [&](FileEntry&& e) -> bool {
@@ -285,7 +299,7 @@ ConcurrentComparer::EnumAttemptResult ConcurrentComparer::runOneStep(
             onEntry(side, std::move(e), table, sink, candidates);
             return true;
         },
-        [&](const ScanError& err) { onError(err, sink); },
+        [&](const ScanError& err) { stagedErrors.push_back(err); },
         [&](uint64_t files, uint64_t dirs, const std::wstring& path) {
             totalFiles_.fetch_add(files - state.lastFiles, std::memory_order_relaxed);
             state.lastFiles = files;
@@ -298,14 +312,31 @@ ConcurrentComparer::EnumAttemptResult ConcurrentComparer::runOneStep(
         },
         cancel_);
 
+    EnumAttempt out;
     // An enumerator that polls `cancel` itself may abort before the entry
     // callback ever fires and still return true; such a side was not scanned
     // and must be reported Cancelled, never as a clean Success.
     if (cancel_ && cancel_->load(std::memory_order_relaxed)) {
-        return EnumAttemptResult::Cancelled;
+        out.result = EnumAttemptResult::Cancelled;
+    } else if (ok) {
+        out.result = EnumAttemptResult::Finished;
+    } else {
+        out.result = emitted ? EnumAttemptResult::FailedWithEntries
+                             : EnumAttemptResult::FailedEmpty;
     }
-    if (ok) return EnumAttemptResult::Finished;
-    return emitted ? EnumAttemptResult::FailedWithEntries : EnumAttemptResult::FailedEmpty;
+    out.errors = std::move(stagedErrors);
+    return out;
+}
+
+void ConcurrentComparer::flushErrors(const std::vector<ScanError>& errors, ConcurrentSink& sink) {
+    for (const ScanError& e : errors) onError(e, sink);
+}
+
+void ConcurrentComparer::noteAbandonedErrors(const std::vector<ScanError>& errors,
+                                             std::vector<std::wstring>& notes) {
+    for (const ScanError& e : errors) {
+        notes.push_back(L"  " + e.message);
+    }
 }
 
 ConcurrentComparer::WorkerStatus ConcurrentComparer::runIndexWorker(

@@ -1550,6 +1550,49 @@ private:
     size_t emitCount_;
 };
 
+// Fails before emitting anything, but reports an error first -- the exact MFT
+// shape that triggered the stale-error bug: the failed attempt's onError is
+// staged and must be DROPPED when a Win32 fallback then succeeds.
+class FailImmediatelyWithErrorEnumerator : public bv::IFileEnumerator {
+public:
+    explicit FailImmediatelyWithErrorEnumerator(bv::ScanError err)
+        : err_(std::move(err)) {}
+    bool enumerate(const std::wstring&, const EntryCallback&, const ErrorCallback& onError,
+                   const ProgressCallback&, const std::atomic_bool*) override {
+        onError(err_);
+        return false;
+    }
+
+private:
+    bv::ScanError err_;
+};
+
+// Emits `emitCount` entries, reports an error, then fails -- the incomplete-MFT
+// shape that ALSO leaves an error behind (the attempt is the final outcome, so
+// its error must stay visible in the sink).
+class FailAfterNWithErrorEnumerator : public bv::IFileEnumerator {
+public:
+    FailAfterNWithErrorEnumerator(std::vector<FileEntry> entries, size_t emitCount,
+                                  bv::ScanError err)
+        : entries_(std::move(entries)), emitCount_(emitCount), err_(std::move(err)) {}
+    bool enumerate(const std::wstring&, const EntryCallback& onEntry, const ErrorCallback& onError,
+                   const ProgressCallback&, const std::atomic_bool*) override {
+        size_t n = 0;
+        for (FileEntry& e : entries_) {
+            if (n >= emitCount_) break;
+            ++n;
+            if (!onEntry(FileEntry(e))) return false;
+        }
+        onError(err_);
+        return false;
+    }
+
+private:
+    std::vector<FileEntry> entries_;
+    size_t emitCount_;
+    bv::ScanError err_;
+};
+
 // Runs the concurrent comparer against two real trees. Both sides default to
 // Win32; callers can inject custom enumerator factories / a whole fallback chain.
 ConcurrentComparer::Result RunConcurrent(
@@ -1951,6 +1994,127 @@ TEST("concurrent comparer: pre-emission failure falls back to the next enumerato
     CHECK_EQ(s.missingDirs, 1ull);
     CHECK_EQ(s.extraFiles, 1ull);
     CHECK_EQ(s.extraDirs, 1ull);
+});
+
+TEST("concurrent comparer: discarded failed attempt leaves no stale error in the sink", [] {
+    // Regression test for the MFT -> Win32 fallback: an MFT-like enumerator that
+    // reports an error and then fails BEFORE emitting any entry is completely
+    // discarded in favour of the Win32 back-end that follows it. Its error must
+    // NOT survive as a permanent result after the Win32 fallback succeeds --
+    // otherwise a healthy filesystem would look like it failed.
+    const auto dir = MakeTempDir();
+    testgen::CreateDifferingTrees(dir);
+    const std::wstring src = dir + L"\\src";
+    const std::wstring dst = dir + L"\\dst";
+
+    bv::ScanError mftErr;
+    mftErr.path = L"";
+    mftErr.message = L"MFT scan incomplete: directory $INDEX_ALLOCATION unreadable (record 5)";
+    mftErr.winError = ERROR_INVALID_DATA;
+
+    std::vector<ConcurrentComparer::EnumeratorFactory> srcFacs;
+    srcFacs.push_back([&] {
+        return std::unique_ptr<IFileEnumerator>(new FailImmediatelyWithErrorEnumerator(mftErr));
+    });
+    srcFacs.push_back(MakeWin32Factory);
+    std::vector<ConcurrentComparer::EnumeratorFactory> dstFacs;
+    dstFacs.push_back(MakeWin32Factory);
+
+    bv::ThreadPool pool(0);
+    ConcurrentComparer cmp(false, ScanMode::Presence, false, src, dst,
+                           ConcurrentComparer::SourceKind::Live, nullptr);
+    const auto r = cmp.runWithFactories(std::move(srcFacs), std::move(dstFacs), pool);
+
+    CHECK(r.sourceStatus == ConcurrentComparer::WorkerStatus::Success);
+    CHECK(r.destinationStatus == ConcurrentComparer::WorkerStatus::Success);
+    const auto& s = r.results.stats;
+    CHECK_EQ(s.identicalFiles, 4ull);
+    CHECK_EQ(s.missingFiles, 1ull);
+    CHECK_EQ(s.missingDirs, 1ull);
+    CHECK_EQ(s.extraFiles, 1ull);
+    CHECK_EQ(s.extraDirs, 1ull);
+    CHECK_MSG(s.readErrors == 0 && s.accessDenied == 0,
+              "the discarded MFT attempt's error must not survive a Win32 fallback");
+    for (const FileResult& p : r.results.problems) {
+        CHECK_MSG(p.status != Status::ReadError && p.status != Status::AccessDenied,
+                  "no stale error from the discarded attempt may reach the results");
+    }
+});
+
+TEST("concurrent comparer: terminal failure keeps its error in the sink", [] {
+    // The counterpart: when a FailedEmpty attempt has NO fallback left, the
+    // side genuinely failed and its error is the only explanation -- it MUST be
+    // kept in the sink.
+    const auto dir = MakeTempDir();
+    testgen::CreateDifferingTrees(dir);
+    const std::wstring src = dir + L"\\src";
+    const std::wstring dst = dir + L"\\dst";
+
+    bv::ScanError err;
+    err.path = L"";
+    err.message = L"root path is not accessible";
+    err.winError = ERROR_PATH_NOT_FOUND;
+
+    bv::ThreadPool pool(0);
+    ConcurrentComparer cmp(false, ScanMode::Presence, false, src, dst,
+                           ConcurrentComparer::SourceKind::Live, nullptr);
+    auto srcFac = [&] {
+        return std::unique_ptr<IFileEnumerator>(new FailImmediatelyWithErrorEnumerator(err));
+    };
+    const auto r = cmp.runWithFactories(std::move(srcFac), MakeWin32Factory, pool);
+
+    CHECK(r.sourceStatus == ConcurrentComparer::WorkerStatus::Failed);
+    CHECK(r.destinationStatus == ConcurrentComparer::WorkerStatus::Success);
+    CHECK_EQ(r.results.stats.readErrors, 1ull);
+    CHECK_EQ(r.results.stats.accessDenied, 0ull);
+    bool found = false;
+    for (const FileResult& p : r.results.problems) {
+        if (p.status == Status::ReadError) {
+            found = true;
+            CHECK(p.relativePath == L"");
+        }
+    }
+    CHECK_MSG(found, "the terminal failure's error must be visible in the results");
+});
+
+TEST("concurrent comparer: emitted-then-failed attempt keeps its error in the sink", [] {
+    // FailedWithEntries: the attempt emitted entries (too late to fall back), so
+    // it is the final outcome and its error describes a real, incomplete scan.
+    // The error must stay visible, and no missing/extra may be fabricated.
+    const auto dir = MakeTempDir();
+    testgen::CreateDifferingTrees(dir);
+    const std::wstring src = dir + L"\\src";
+    const std::wstring dst = dir + L"\\dst";
+    const auto srcEntries = CaptureEntries(src);
+
+    bv::ScanError err;
+    err.path = L"sub";
+    err.message = L"MFT scan incomplete: index child record missing or sequence mismatch";
+    err.winError = ERROR_INVALID_DATA;
+
+    bv::ThreadPool pool(0);
+    ConcurrentComparer cmp(false, ScanMode::Presence, false, src, dst,
+                           ConcurrentComparer::SourceKind::Live, nullptr);
+    auto srcFac = [&] {
+        return std::unique_ptr<IFileEnumerator>(
+            new FailAfterNWithErrorEnumerator(srcEntries, srcEntries.size(), err));
+    };
+    const auto r = cmp.runWithFactories(std::move(srcFac), MakeWin32Factory, pool);
+
+    CHECK(r.sourceStatus == ConcurrentComparer::WorkerStatus::Failed);
+    CHECK(r.destinationStatus == ConcurrentComparer::WorkerStatus::Success);
+    CHECK_EQ(r.results.stats.identicalFiles, 4ull);
+    CHECK_EQ(r.results.stats.missingFiles + r.results.stats.missingDirs +
+                 r.results.stats.extraFiles + r.results.stats.extraDirs, 0ull);
+    CHECK_EQ(r.results.stats.readErrors, 1ull);
+    bool found = false;
+    for (const FileResult& p : r.results.problems) {
+        if (p.status == Status::ReadError) {
+            found = true;
+            CHECK(p.relativePath == L"sub");
+        }
+    }
+    CHECK_MSG(found, "the incomplete scan's error must be visible in the results");
 });
 
 TEST("concurrent comparer: emitted-then-failed side reports no missing/extra", [] {
