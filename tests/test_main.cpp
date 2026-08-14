@@ -1871,6 +1871,108 @@ TEST("matchtable: source flooded past limit with no peer still completes (no dea
     CHECK_EQ(t.remaining().size(), size_t{2} * N); // all entries persisted (missing+extra)
 });
 
+TEST("matchtable: parked source wakes on a match (capacity freed without setSideDone)", [] {
+    // highWater=1: the source stores "a" (pending=1), then its very next insert
+    // parks. The destination then matches "a" (pending -> 0); that match must
+    // wake the parked source WITHOUT setSideDone - the source proceeds, stores
+    // "b", and only then is done. The park is observed deterministically via
+    // throttleWaiters() (the source is "parked" exactly while that counter is
+    // 1), never via a sleep, so this has no timing race. A lost wakeup or a
+    // notify issued under the shard lock would hang the source here.
+    bv::MatchTable t(2, /*highWater=*/1);
+    std::atomic<bool> dstMatched{false};
+    std::atomic<bool> srcStoredB{false};
+
+    std::thread src([&] {
+        FileEntry a;
+        a.relativePath = L"a";
+        FileEntry peer;
+        t.insert(L"a", 0, std::move(a), peer); // pending 1 -> next insert parks
+        FileEntry b;
+        b.relativePath = L"b";
+        t.insert(L"b", 0, std::move(b), peer); // parked until pending drops below 1
+        srcStoredB.store(true, std::memory_order_release);
+        t.setSideDone(0);
+    });
+    std::thread dst([&] {
+        while (t.throttleWaiters() == 0) std::this_thread::yield();
+        // Deterministic: the source is parked before the match happens, so the
+        // wake must come from the match's notify_one, not from completion.
+        FileEntry a;
+        a.relativePath = L"a";
+        FileEntry peer;
+        dstMatched.store(t.insert(L"a", 1, std::move(a), peer) == bv::MatchTable::Outcome::Matched,
+                         std::memory_order_release);
+        // Intentionally delay setSideDone(1) until the source resumed: the wake
+        // had to come from the match, proving capacity release wakes a waiter.
+        while (!srcStoredB.load(std::memory_order_acquire)) std::this_thread::yield();
+        t.setSideDone(1);
+    });
+    src.join();
+    dst.join();
+
+    CHECK(dstMatched.load(std::memory_order_acquire));
+    CHECK(srcStoredB.load(std::memory_order_acquire));
+    // "a" was consumed; "b" (source-only) remains pending until finalization.
+    CHECK_EQ(t.pendingCount(), 1ull);
+    const auto rem = t.remaining();
+    CHECK_EQ(rem.size(), 1ull);
+    if (rem.size() == 1) CHECK(rem[0].second.relativePath == L"b");
+});
+
+TEST("matchtable: cancellation wakes a parked source (destination setSideDone path)", [] {
+    // The source fills the table (highWater=1, stored "a") and parks on "b".
+    // Cancellation is then requested while it is parked; the destination
+    // observes the flag and stops, calling setSideDone - the existing
+    // cancellation path - which must wake the source (its predicate sees
+    // cancel_), so it finishes instead of blocking on backpressure forever.
+    bv::MatchTable t(2, /*highWater=*/1);
+    std::atomic_bool cancel{false};
+    t.setCancel(&cancel);
+    std::atomic<bool> srcCompleted{false};
+
+    std::thread src([&] {
+        FileEntry a;
+        a.relativePath = L"a";
+        FileEntry peer;
+        t.insert(L"a", 0, std::move(a), peer); // pending 1
+        FileEntry b;
+        b.relativePath = L"b";
+        t.insert(L"b", 0, std::move(b), peer); // parks
+        srcCompleted.store(true, std::memory_order_release);
+        t.setSideDone(0);
+    });
+    std::thread dst([&] {
+        while (t.throttleWaiters() == 0) std::this_thread::yield();
+        cancel.store(true, std::memory_order_release);
+        t.setSideDone(1); // destination sees cancellation and stops
+    });
+    src.join();
+    dst.join();
+
+    CHECK(srcCompleted.load(std::memory_order_acquire)); // no hang: source woke and finished
+});
+
+TEST("matchtable: match-and-remove decreases pending by exactly one", [] {
+    // Accounting property: a cross-side match consumes the stored peer without
+    // ever temporarily bumping the counter (old_count -> old_count - 1), and
+    // the incoming entry is not stored.
+    bv::MatchTable t(2);
+    FileEntry e;
+    e.relativePath = L"a";
+    FileEntry peer;
+    CHECK(t.insert(L"a", 0, std::move(e), peer) == bv::MatchTable::Outcome::Inserted);
+    CHECK_EQ(t.pendingCount(), 1ull);
+    e.relativePath = L"b";
+    CHECK(t.insert(L"b", 0, std::move(e), peer) == bv::MatchTable::Outcome::Inserted);
+    CHECK_EQ(t.pendingCount(), 2ull);
+    e.relativePath = L"a";
+    CHECK(t.insert(L"a", 1, std::move(e), peer) == bv::MatchTable::Outcome::Matched);
+    CHECK(peer.relativePath == L"a");
+    CHECK_EQ(t.pendingCount(), 1ull);
+    CHECK_EQ(t.remaining().size(), 1ull);
+});
+
 TEST("concurrent comparer: identical fixtures are all-identical, no errors", [] {
     const auto dir = MakeTempDir();
     testgen::CreateFixture(dir);
