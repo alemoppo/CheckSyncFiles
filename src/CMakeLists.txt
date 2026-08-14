@@ -15,6 +15,7 @@ add_library(bv_core STATIC
   Hashing/HashUtil.cpp
   Hashing/Sha256.cpp
   ScanController.cpp
+  ScanOrchestrator.cpp
   Threading/ThreadPool.cpp
 )
 target_include_directories(bv_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})

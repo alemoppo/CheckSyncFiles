@@ -277,6 +277,7 @@ ScanReport ScanController::run(const ScanOptions& options) {
                 report.secondsHashing += NowSeconds() - th0;
                 report.hashCacheHits += hits.load();
                 report.hashThreadsUsed = srcThreads;
+                report.hashingErrors += sourcePool.taskErrors();
             }
             std::wstring werr;
             report.snapshotWritten =
@@ -344,6 +345,7 @@ ScanReport ScanController::run(const ScanOptions& options) {
         report.results = std::move(cr.results);
         report.secondsHashing += compareHashSeconds;
         report.hashCacheHits += comparer.cacheHits();
+        report.hashingErrors += hashPool.taskErrors();
         for (std::wstring& n : cr.notes) report.notes.push_back(std::move(n));
 
         if (cache) {

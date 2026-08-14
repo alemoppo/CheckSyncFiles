@@ -17,9 +17,8 @@
 #include <SDL3/SDL.h>
 #include <SDL3_ttf/SDL_ttf.h>
 
+#include "ScanController.h"
 #include "UI/Utf.h"
-#include "Threading/ThreadPool.h"
-#include "Export/CsvExporter.h"
 
 namespace bv::ui {
 
@@ -424,29 +423,24 @@ std::wstring BaseName(const std::wstring& p) {
 int AppUI::run() {
     if (!init()) return 1;
 
+    // The orchestrator notifies us on progress; the flag triggers a repaint.
+    orch_.setProgressCallback([this] { dirty_.store(true); });
+
     while (!quit_) {
         processEvents();
 
         // The indeterminate progress bar animates continuously while running,
         // so keep repainting during a scan. Otherwise only repaint on demand
         // (state changes set dirty_) so an idle window costs ~0% GPU.
-        bool running = false;
-        {
-            std::lock_guard<std::mutex> lk(mtx_);
-            running = running_;
-        }
-        if (running) dirty_ = true;
-
-        if (dirty_) {
-            render();
+        bv::ScanOrchestrator::UiSnapshot st = orch_.snapshot();
+        if (st.running) dirty_.store(true);
+        if (dirty_.load()) {
+            render(st);
         }
         SDL_Delay(10);
     }
 
-    if (worker_.joinable()) {
-        cancel_.store(true);
-        worker_.join();
-    }
+    orch_.shutdown();
     shutdown();
     return 0;
 }
@@ -505,7 +499,7 @@ void AppUI::processEvents() {
         switch (ev.type) {
             case SDL_EVENT_QUIT:
                 quit_ = true;
-                cancel_.store(true); // let the worker wind down before the join
+                orch_.stop(); // let the worker wind down before the join
                 break;
             case SDL_EVENT_WINDOW_RESIZED:
                 winW_ = ev.window.data1;
@@ -541,53 +535,50 @@ void AppUI::processEvents() {
 void AppUI::OnMouseDown(int mx, int my) {
     const Layout L = ComputeLayout(winW_, winH_);
 
-    bool running = false;
-    {
-        std::lock_guard<std::mutex> lk(mtx_);
-        running = running_;
-    }
+    const bv::ScanOrchestrator::UiSnapshot st = orch_.snapshot();
+    const bool running = st.running;
+    const bool offline = st.useSnapshot;
 
     // Browse buttons first (they should not steal focus).
     if (hit(mx, my, L.sourceBrowse)) {
         std::wstring picked;
         if (BrowseFolder(picked)) {
-            source_ = picked;
-            useSnapshot_ = false; // manual source: back to live enumeration
-            snapshotFile_.clear();
-            statusNote_.clear();
-            dirty_ = true;
+            orch_.setSource(picked);
+            orch_.useLiveSource(); // manual source: back to live enumeration
+            dirty_.store(true);
         }
         return;
     }
     if (hit(mx, my, L.destBrowse)) {
         std::wstring picked;
         if (BrowseFolder(picked)) {
-            dest_ = picked;
-            dirty_ = true;
+            orch_.setDest(picked);
+            dirty_.store(true);
         }
         return;
     }
 
     // Path fields: focus.
     if (hit(mx, my, L.sourceField)) {
-        if (useSnapshot_) return; // source field is disabled while offline
-        sourceFocus_ = true;
-        destFocus_ = false;
+        if (offline) return; // source field is disabled while offline
+        orch_.setSourceFocus(true);
+        orch_.setDestFocus(false);
         SDL_StartTextInput(window_);
-        dirty_ = true;
+        dirty_.store(true);
         return;
     }
     if (hit(mx, my, L.destField)) {
-        destFocus_ = true;
-        sourceFocus_ = false;
+        orch_.setDestFocus(true);
+        orch_.setSourceFocus(false);
         SDL_StartTextInput(window_);
-        dirty_ = true;
+        dirty_.store(true);
         return;
     }
-    if (sourceFocus_ || destFocus_) {
-        sourceFocus_ = destFocus_ = false;
+    if (st.sourceFocus || st.destFocus) {
+        orch_.setSourceFocus(false);
+        orch_.setDestFocus(false);
         SDL_StopTextInput(window_);
-        dirty_ = true;
+        dirty_.store(true);
     }
 
     // Mode radios.
@@ -597,8 +588,8 @@ void AppUI::OnMouseDown(int mx, int my) {
         const SDL_FRect r{static_cast<float>(x), static_cast<float>(L.y3 + 2),
                           static_cast<float>(mr - 12), 22.0f};
         if (hit(mx, my, r)) {
-            mode_ = static_cast<ScanMode>(i);
-            dirty_ = true;
+            orch_.setMode(static_cast<ScanMode>(i));
+            dirty_.store(true);
         }
     }
 
@@ -607,8 +598,8 @@ void AppUI::OnMouseDown(int mx, int my) {
         const int x = kMargin + 100 + 3 * mr;
         const SDL_FRect r{static_cast<float>(x), static_cast<float>(L.y3 + 2), 104.0f, 22.0f};
         if (hit(mx, my, r)) {
-            caseSensitive_ = !caseSensitive_;
-            dirty_ = true;
+            orch_.setCaseSensitive(!st.caseSensitive);
+            dirty_.store(true);
         }
     }
 
@@ -624,8 +615,8 @@ void AppUI::OnMouseDown(int mx, int my) {
             const SDL_FRect r{static_cast<float>(x), static_cast<float>(L.y3b + 2),
                               static_cast<float>(br - 12), 22.0f};
             if (hit(mx, my, r)) {
-                backend_ = bes[i].v;
-                dirty_ = true;
+                orch_.setBackend(bes[i].v);
+                dirty_.store(true);
             }
         }
     }
@@ -637,30 +628,36 @@ void AppUI::OnMouseDown(int mx, int my) {
         const SDL_FRect r{static_cast<float>(x), static_cast<float>(L.y4 + 2),
                           static_cast<float>(tr - 10), 22.0f};
         if (hit(mx, my, r)) {
-            threadSel_ = i;
-            dirty_ = true;
+            orch_.setThreadSel(i);
+            dirty_.store(true);
         }
     }
 
     if (hit(mx, my, L.startBtn) && !running) {
-        startScan();
-        dirty_ = true;
+        startScanFromUi();
+        dirty_.store(true);
     }
     if (hit(mx, my, L.stopBtn) && running) {
-        stopScan();
-        dirty_ = true;
+        orch_.stop();
+        dirty_.store(true);
     }
     if (hit(mx, my, L.snapBtn) && !running) {
-        startSnapshotScan();
-        dirty_ = true;
+        std::wstring file;
+        if (BrowseSaveFile(file, L"backup_index.bin")) {
+            orch_.startSnapshotScan(file); // sets the note if no source is set
+        }
+        dirty_.store(true);
     }
     if (hit(mx, my, L.exportBtn) && !running) {
-        onExportCsv();
-        dirty_ = true;
+        std::wstring file;
+        if (BrowseSaveFile(file, L"risultati.csv")) {
+            orch_.exportCsv(file);
+        }
+        dirty_.store(true);
     }
     if (hit(mx, my, L.caricaBtn) && !running) {
         onLoadSnapshot();
-        dirty_ = true;
+        dirty_.store(true);
     }
 
     // Filters.
@@ -672,11 +669,11 @@ void AppUI::OnMouseDown(int mx, int my) {
         if (hit(mx, my, r)) {
             filter_ = static_cast<uint8_t>(i);
             scroll_ = 0;
-            dirty_ = true;
+            dirty_.store(true);
         }
     }
 
-    dirty_ = true;
+    dirty_.store(true);
 }
 
 bool AppUI::isPointerOverList(float wx, float wy) {
@@ -688,104 +685,62 @@ bool AppUI::isPointerOverList(float wx, float wy) {
 void AppUI::OnKeyDown(unsigned int key, bool repeat) {
     (void)repeat;
     if (key == SDLK_BACKSPACE) {
-        if (sourceFocus_) {
-            RemoveLastCodepoint(source_);
-            dirty_ = true;
-        } else if (destFocus_) {
-            RemoveLastCodepoint(dest_);
-            dirty_ = true;
+        bv::ScanOrchestrator::UiSnapshot st = orch_.snapshot();
+        if (st.sourceFocus) {
+            RemoveLastCodepoint(st.source);
+            orch_.setSource(st.source);
+            dirty_.store(true);
+        } else if (st.destFocus) {
+            RemoveLastCodepoint(st.dest);
+            orch_.setDest(st.dest);
+            dirty_.store(true);
         }
     } else if (key == SDLK_RETURN) {
-        startScan();
+        startScanFromUi();
     } else if (key == SDLK_ESCAPE) {
-        if (sourceFocus_ || destFocus_) {
-            sourceFocus_ = destFocus_ = false;
+        if (orch_.snapshot().sourceFocus || orch_.snapshot().destFocus) {
+            orch_.setSourceFocus(false);
+            orch_.setDestFocus(false);
             SDL_StopTextInput(window_);
-            dirty_ = true;
+            dirty_.store(true);
         }
     }
 }
 
 void AppUI::OnTextInput(const char* text) {
-    if (!sourceFocus_ && !destFocus_) return;
+    bv::ScanOrchestrator::UiSnapshot st = orch_.snapshot();
+    if (!st.sourceFocus && !st.destFocus) return;
     const std::wstring ws = FromUtf8(text);
-    if (sourceFocus_) {
-        source_ += ws;
+    if (st.sourceFocus) {
+        orch_.setSource(st.source + ws);
     } else {
-        dest_ += ws;
+        orch_.setDest(st.dest + ws);
     }
-    dirty_ = true;
+    dirty_.store(true);
 }
 
-void AppUI::startScan() {
-    std::lock_guard<std::mutex> lk(mtx_);
-    if (running_) return;
-    if (useSnapshot_) {
-        if (snapshotFile_.empty() || dest_.empty()) {
-            return;
-        }
-    } else if (source_.empty() || dest_.empty()) {
-        return;
-    }
-
-    // The previous run's worker has finished (running_ == false) but its
-    // std::thread object is still joinable. Joining it reaps the OS thread
-    // before we reuse worker_. Assigning a new thread over an un-joined one
-    // would call std::terminate() and crash on the second run.
-    if (worker_.joinable()) {
-        worker_.join();
-    }
-
-    cancel_.store(false);
-    resultsReady_ = false;
-    results_ = {};
-    progress_ = {};
-    running_ = true;
-    scroll_ = 0;
-    statusNote_.clear();
-    lastSnapshotWritten_ = false;
-    lastUsedSnapshot_ = false;
-    lastDegraded_ = false;
-
-    ScanOptions options;
-    options.source = source_;
-    options.destination = dest_;
-    options.mode = mode_;
-    options.caseSensitive = caseSensitive_;
-    options.hashThreads = threadToCount();
-    options.backend = backend_;
-    options.cancel = &cancel_;
-    options.onProgress = [this](const ScanProgress& p) {
-        std::lock_guard<std::mutex> lk(mtx_);
-        progress_ = p;
-    };
-    if (useSnapshot_) {
-        // Offline comparison: the source index is loaded from the snapshot,
-        // the source device is not touched (options.source stays empty).
-        options.compareFrom = snapshotFile_;
-        progress_.phase = ScanPhase::CompareDestination; // no source pass
-    }
-    worker_ = std::thread(&AppUI::workerThread, this, std::move(options));
+void AppUI::startScanFromUi() {
+    // startLiveScan ignores invalid inputs (no source/destination), mirroring
+    // the previous behaviour of silently doing nothing on an empty AVVIA click.
+    orch_.startLiveScan();
 }
 
 // Toggle the offline comparison mode: load a snapshot (the source field is
 // then disabled and the scan uses "compareFrom"), or switch back to a live
 // source when a snapshot is already selected.
 void AppUI::onLoadSnapshot() {
-    std::lock_guard<std::mutex> lk(mtx_);
-    if (running_) return;
+    if (orch_.snapshot().running) return;
 
-    if (useSnapshot_) {
+    if (orch_.snapshot().useSnapshot) {
         // Second click: back to a live source enumeration.
-        useSnapshot_ = false;
-        snapshotFile_.clear();
-        statusNote_ = L"Modalita online: sorgente da enumerare.";
-        dirty_ = true;
+        orch_.clearSnapshot();
+        dirty_.store(true);
         return;
     }
 
-    if (sourceFocus_ || destFocus_) {
-        sourceFocus_ = destFocus_ = false;
+    if (orch_.snapshot().sourceFocus || orch_.snapshot().destFocus) {
+        orch_.setSourceFocus(false);
+        orch_.setDestFocus(false);
         SDL_StopTextInput(window_);
     }
 
@@ -794,123 +749,21 @@ void AppUI::onLoadSnapshot() {
         return; // user cancelled the dialog
     }
 
-    snapshotFile_ = file;
-    useSnapshot_ = true;
-    source_.clear(); // the device is no longer needed
-    statusNote_ = L"Sorgente da snapshot. Impostare la destinazione e premere AVVIA.";
-    dirty_ = true;
+    orch_.loadSnapshot(file);
+    dirty_.store(true);
 }
 
-void AppUI::startSnapshotScan() {
-    std::lock_guard<std::mutex> lk(mtx_);
-    if (running_) return;
-    if (source_.empty()) {
-        statusNote_ = L"Specificare la sorgente prima di creare uno snapshot.";
-        dirty_ = true;
-        return;
+void AppUI::syncResultsCache(const bv::ScanOrchestrator::UiSnapshot& st) {
+    if (st.resultsReady && !resultsReadySeen_) {
+        uiResults_ = orch_.results();
+        resultsReadySeen_ = true;
     }
-
-    std::wstring file;
-    if (!BrowseSaveFile(file, L"backup_index.bin")) {
-        return; // user cancelled the dialog
-    }
-
-    // The previous run's worker has finished; join before reusing worker_.
-    if (worker_.joinable()) {
-        worker_.join();
-    }
-
-    cancel_.store(false);
-    resultsReady_ = false;
-    results_ = {};
-    progress_ = {};
-    running_ = true;
-    scroll_ = 0;
-    lastSnapshotWritten_ = false;
-    lastUsedSnapshot_ = false;
-    lastDegraded_ = false;
-    lastSnapshotPath_ = file;
-
-    ScanOptions options;
-    options.source = source_;
-    options.destination.clear();
-    options.mode = mode_;
-    options.caseSensitive = caseSensitive_;
-    options.hashThreads = threadToCount();
-    options.backend = backend_;
-    options.snapshotOut = file;
-    options.cancel = &cancel_;
-    options.onProgress = [this](const ScanProgress& p) {
-        std::lock_guard<std::mutex> lk(mtx_);
-        progress_ = p;
-    };
-    worker_ = std::thread(&AppUI::workerThread, this, std::move(options));
-}
-
-void AppUI::onExportCsv() {
-    std::lock_guard<std::mutex> lk(mtx_);
-    if (running_ || !resultsReady_) {
-        statusNote_ = L"Eseguire prima una scansione.";
-        dirty_ = true;
-        return;
-    }
-
-    std::wstring file;
-    if (!BrowseSaveFile(file, L"risultati.csv")) {
-        return; // user cancelled the dialog
-    }
-
-    std::wstring err;
-    if (exporting::WriteCsv(file, results_, err)) {
-        statusNote_ = L"Esportazione salvata: " + file;
-    } else {
-        statusNote_ = L"Esportazione fallita: " + err;
-    }
-    dirty_ = true;
-}
-
-void AppUI::stopScan() {
-    cancel_.store(true);
-}
-
-unsigned int AppUI::threadToCount() const {
-    static constexpr unsigned int kChoices[] = {0u, 1u, 2u, 4u, 8u, 16u};
-    const int i = threadSel_;
-    return (i >= 0 && i < 6) ? kChoices[i] : 0u;
-}
-
-void AppUI::workerThread(ScanOptions options) {
-    ScanController controller(options.caseSensitive);
-    ScanReport report = controller.run(options);
-
-    std::lock_guard<std::mutex> lk(mtx_);
-    results_ = std::move(report.results);
-    resultsReady_ = true;
-    running_ = false;
-    threadCountUsed_ = report.hashThreadsUsed;
-    lastSecondsTotal_ = report.secondsTotal;
-    progress_.phase = ScanPhase::Done;
-    progress_.files = results_.stats.sourceFiles;
-    progress_.dirs = results_.stats.sourceDirs;
-    lastSnapshotWritten_ = report.snapshotWritten;
-    lastUsedSnapshot_ = report.usedSnapshot;
-    lastDegraded_ = report.contentDegradedToSize;
-    if (lastSnapshotWritten_ && !lastSnapshotPath_.empty()) {
-        statusNote_ = L"Snapshot salvato: " + lastSnapshotPath_;
-    } else if (lastDegraded_) {
-        statusNote_ = L"Snapshot senza contenuti: confronto degradato alla dimensione.";
-    } else if (lastUsedSnapshot_) {
-        statusNote_ = L"Sorgente caricata da snapshot (" +
-                      std::to_wstring(results_.stats.sourceFiles) + L" voci).";
-    } else {
-        statusNote_.clear();
-    }
-    dirty_ = true;
+    if (!st.resultsReady) resultsReadySeen_ = false;
 }
 
 std::vector<const bv::FileResult*> AppUI::FilteredRows() const {
     std::vector<const FileResult*> rows;
-    const auto& ps = results_.problems;
+    const auto& ps = uiResults_.problems;
     rows.reserve(ps.size());
     for (const FileResult& p : ps) {
         switch (filter_) {
@@ -933,23 +786,18 @@ std::vector<const bv::FileResult*> AppUI::FilteredRows() const {
     return rows;
 }
 
-void AppUI::render() {
+void AppUI::render(const bv::ScanOrchestrator::UiSnapshot& st) {
     SDL_SetRenderDrawColor(renderer_, kBg.r, kBg.g, kBg.b, kBg.a);
     SDL_RenderClear(renderer_);
 
+    syncResultsCache(st);
+
     const Layout L = ComputeLayout(winW_, winH_);
 
-    bool running = false;
-    ScanProgress progress;
-    unsigned int threadCountUsed = 0;
-    std::wstring statusNote;
-    {
-        std::lock_guard<std::mutex> lk(mtx_);
-        running = running_;
-        progress = progress_;
-        threadCountUsed = threadCountUsed_;
-        statusNote = statusNote_;
-    }
+    const bool running = st.running;
+    const ScanProgress& progress = st.progress;
+    const unsigned int threadCountUsed = st.threadCountUsed;
+    const std::wstring& statusNote = st.statusNote;
 
     // Title
     DrawText(renderer_, fontBold_, "Backup Verifier — Verifica backup (sola lettura)",
@@ -958,14 +806,14 @@ void AppUI::render() {
     // ---- Sorgente row ----
     DrawTextVCenter(renderer_, fontBody_, "Sorgente:", L.labelX, L.y1, kFieldH, kTextLo);
     FillRect(renderer_, L.fieldX, L.y1, L.fieldW, kFieldH, kField);
-    std::wstring srcText = source_;
+    std::wstring srcText = st.source;
     RGBA srcCol = kTextHi;
-    if (useSnapshot_) {
-        srcText = L"[snap] " + BaseName(snapshotFile_);
+    if (st.useSnapshot) {
+        srcText = L"[snap] " + BaseName(st.snapshotFile);
         srcCol = kTextLo;
     }
     DrawRect(renderer_, L.fieldX, L.y1, L.fieldW, kFieldH,
-             useSnapshot_ ? kBorder : (sourceFocus_ ? kAccent : kBorder));
+             st.useSnapshot ? kBorder : (st.sourceFocus ? kAccent : kBorder));
     DrawTextVCenter(renderer_, fontBody_, ToUtf8(srcText), L.fieldX + 6, L.y1, kFieldH, srcCol);
     float mx = 0, my = 0;
     SDL_GetMouseState(&mx, &my);
@@ -975,8 +823,8 @@ void AppUI::render() {
     // ---- Destinazione row ----
     DrawTextVCenter(renderer_, fontBody_, "Destinaz.:", L.labelX, L.y2, kFieldH, kTextLo);
     FillRect(renderer_, L.fieldX, L.y2, L.fieldW, kFieldH, kField);
-    DrawRect(renderer_, L.fieldX, L.y2, L.fieldW, kFieldH, destFocus_ ? kAccent : kBorder);
-    DrawTextVCenter(renderer_, fontBody_, ToUtf8(dest_), L.fieldX + 6, L.y2, kFieldH, kTextHi);
+    DrawRect(renderer_, L.fieldX, L.y2, L.fieldW, kFieldH, st.destFocus ? kAccent : kBorder);
+    DrawTextVCenter(renderer_, fontBody_, ToUtf8(st.dest), L.fieldX + 6, L.y2, kFieldH, kTextHi);
     const bool overDstBrowse = hit(static_cast<int>(mx), static_cast<int>(my), L.destBrowse);
     DrawPickerButton(renderer_, fontBody_, L.destBrowse, overDstBrowse);
 
@@ -986,10 +834,10 @@ void AppUI::render() {
     const int mr = 110;
     for (int i = 0; i < 3; ++i) {
         DrawToggle(renderer_, fontBody_, modeNames[i], kMargin + 100 + i * mr, L.y3 + 2,
-                   mr - 12, 22, static_cast<int>(mode_) == i);
+                   mr - 12, 22, static_cast<int>(st.mode) == i);
     }
     DrawToggle(renderer_, fontBody_, "Case-sens.", kMargin + 100 + 3 * mr, L.y3 + 2,
-               104, 22, caseSensitive_);
+               104, 22, st.caseSensitive);
 
     // ---- Back-end ----
     DrawTextVCenter(renderer_, fontBody_, "Back-end:", L.labelX, L.y3b, 26, kTextLo);
@@ -997,7 +845,7 @@ void AppUI::render() {
     const int br = 90;
     for (int i = 0; i < 3; ++i) {
         DrawToggle(renderer_, fontBody_, beNames[i], kMargin + 100 + i * br, L.y3b + 2,
-                   br - 12, 22, static_cast<int>(backend_) == i);
+                   br - 12, 22, static_cast<int>(st.backend) == i);
     }
 
     // ---- Thread ----
@@ -1006,13 +854,13 @@ void AppUI::render() {
     const int tr = 66;
     for (int i = 0; i < 6; ++i) {
         DrawToggle(renderer_, fontBody_, threadNames[i], kMargin + 60 + i * tr, L.y4 + 2,
-                   tr - 10, 22, threadSel_ == i);
+                   tr - 10, 22, st.threadSel == i);
     }
     // Number of hash workers actually launched (resolved "auto" too), live
     // while the Hashing phase is running.
     {
         std::wstring thrInfo;
-        if (mode_ == ScanMode::Content) {
+        if (st.mode == ScanMode::Content) {
             if (running) {
                 if (progress.phase == ScanPhase::Hashing) {
                     if (progress.threads > 0) {
@@ -1021,7 +869,7 @@ void AppUI::render() {
                         thrInfo = L"(hashing in avvio...)";
                     }
                 }
-            } else if (resultsReady_) {
+            } else if (st.resultsReady) {
                 thrInfo = L"→ " + std::to_wstring(threadCountUsed) + L" thread hash";
             } else {
                 thrInfo = L"(auto: stimato al lancio)";
@@ -1078,11 +926,11 @@ void AppUI::render() {
     const bool overCarica = !running && hit(static_cast<int>(mx), static_cast<int>(my), L.caricaBtn);
     FillRect(renderer_, static_cast<int>(L.caricaBtn.x), static_cast<int>(L.caricaBtn.y),
              static_cast<int>(L.caricaBtn.w), static_cast<int>(L.caricaBtn.h),
-             overCarica ? kAccentHover : (useSnapshot_ ? kAccent : kPanel));
+             overCarica ? kAccentHover : (st.useSnapshot ? kAccent : kPanel));
     DrawRect(renderer_, static_cast<int>(L.caricaBtn.x), static_cast<int>(L.caricaBtn.y),
              static_cast<int>(L.caricaBtn.w), static_cast<int>(L.caricaBtn.h), kBorder);
     {
-        std::wstring carLab = useSnapshot_ ? BaseName(snapshotFile_) : L"CARICA SNAP.";
+        std::wstring carLab = st.useSnapshot ? BaseName(st.snapshotFile) : L"CARICA SNAP.";
         if (carLab.size() > 14) carLab = L"..." + carLab.substr(carLab.size() - 11);
         DrawTextCenterIn(renderer_, fontBold_, ToUtf8(carLab),
                          static_cast<int>(L.caricaBtn.x), static_cast<int>(L.caricaBtn.y),
@@ -1114,11 +962,11 @@ void AppUI::render() {
             if (shortP.size() > 60) shortP = L"..." + shortP.substr(shortP.size() - 57);
             status += L"  [" + shortP + L"]";
         }
-    } else if (resultsReady_ && cancel_.load()) {
+    } else if (st.resultsReady && st.cancelled) {
         status = L"Scansione interrotta dall'utente.";
-    } else if (resultsReady_) {
+    } else if (st.resultsReady) {
         status = L"Scansione completata.  Velocita: " +
-                 FormatRateW(results_.stats.bytesSource, lastSecondsTotal_);
+                 FormatRateW(uiResults_.stats.bytesSource, st.lastSecondsTotal);
     }
     if (!statusNote.empty()) {
         status += (status == L"Pronto. Specificare sorgente e destinazione." ? L"" : L"   —  ") +
@@ -1136,7 +984,7 @@ void AppUI::render() {
         const int seg = static_cast<int>(barW * 0.25f);
         const int x = kMargin + static_cast<int>(frac * (barW - seg));
         FillRect(renderer_, x, L.y7 + 1, seg, 12, kAccent);
-    } else if (resultsReady_) {
+    } else if (st.resultsReady) {
         FillRect(renderer_, kMargin, L.y7 + 1, barW, 12, kOk);
     }
 
@@ -1151,10 +999,10 @@ void AppUI::render() {
 
     // ---- Results list ----
     DrawResultsList(L.yList, L.listBottom);
-    DrawSummary(L.summaryY);
+    DrawSummary(L.summaryY, st.hashingErrors);
 
     SDL_RenderPresent(renderer_);
-    dirty_ = false;
+    dirty_.store(false);
 }
 
 void AppUI::DrawResultsList(int yList, int listBottom) {
@@ -1164,7 +1012,7 @@ void AppUI::DrawResultsList(int yList, int listBottom) {
     if (visible <= 0) return;
 
     if (filter_ == kFilterIdentical) {
-        const Stats& st = results_.stats;
+        const Stats& st = uiResults_.stats;
         const std::string msg =
             "File identici: " + Group(st.identicalFiles) +
             "  (conteggio; le voci identiche non vengono elencate singolarmente)";
@@ -1197,15 +1045,18 @@ void AppUI::DrawResultsList(int yList, int listBottom) {
     SDL_SetRenderClipRect(renderer_, nullptr);
 }
 
-void AppUI::DrawSummary(int summaryY) {
-    const Stats& st = results_.stats;
-    const std::string s =
+void AppUI::DrawSummary(int summaryY, uint64_t hashingErrors) {
+    const Stats& st = uiResults_.stats;
+    std::string s =
         "File: src " + Group(st.sourceFiles) + " / dst " + Group(st.destFiles) +
         "   Identici " + Group(st.identicalFiles) +
         "   Mancanti " + Group(st.missingFiles) +
         "   Extra " + Group(st.extraFiles) +
         "   Dim.diversa " + Group(st.sizeMismatch) +
         "   Errori " + Group(st.readErrors + st.accessDenied + st.changedDuringScan);
+    if (hashingErrors > 0) {
+        s += "   Err.hash " + Group(hashingErrors);
+    }
     DrawText(renderer_, fontBody_, s, kMargin, summaryY, kTextLo);
 }
 

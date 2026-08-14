@@ -336,6 +336,9 @@ bv::ScanController controller(options.caseSensitive);
         std::wcout << L"Cache hash:          " << Group(report.hashCacheHits)
                    << L" file non riletti\n";
     }
+    if (report.hashingErrors > 0) {
+        std::wcout << L"Errori hash (worker):" << Group(report.hashingErrors) << L"\n";
+    }
 
     std::wcout << L"\nTempo totale:            " << FormatTime(report.secondsTotal) << L"\n";
     std::wcout << L"  - enum sorgente:       " << FormatTime(report.secondsEnumerateSource) << L"\n";

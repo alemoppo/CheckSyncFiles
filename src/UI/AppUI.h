@@ -2,26 +2,27 @@
 
 #include <atomic>
 #include <cstdint>
-#include <mutex>
 #include <string>
-#include <thread>
 #include <vector>
 
 #include <SDL3/SDL.h>
 
 #include "Comparison/ComparisonResult.h"
-#include "Comparison/ScanMode.h"
-#include "ScanController.h"
+#include "ScanOrchestrator.h"
 
 struct TTF_Font;
 
 namespace bv::ui {
 
-// SDL3 GUI for BackupVerifier (Phase 2).
+// SDL3 GUI for BackupVerifier (Phase 2). This class is ONLY the view layer: it
+// renders the orchestrator state and forwards input events to it. All scan
+// logic (inputs, worker thread, cancellation, results, export) lives in
+// bv::ScanOrchestrator; nothing here runs a scan or touches business state.
 //
 // Threading model: the UI lives on the main thread (SDL event + render loop);
-// a comparison runs on a separate worker thread. Progress and the final result
-// are copied into UI state under a mutex; the render loop repaints when dirty.
+// the comparison runs on a separate worker thread owned by the orchestrator.
+// The render loop reads a single lock-guarded snapshot per frame and repaints
+// when dirty.
 class AppUI {
 public:
     AppUI() = default;
@@ -43,24 +44,21 @@ private:
     bool init();
     void shutdown();
     void processEvents();
-    void render();
-    void layoutAll();
+    void render(const bv::ScanOrchestrator::UiSnapshot& st);
 
     void OnMouseDown(int mx, int my);
     void OnKeyDown(unsigned int key, bool repeat);
     void OnTextInput(const char* text);
     bool isPointerOverList(float wx, float wy);
-    void startScan();
-    void startSnapshotScan();
-    void stopScan();
-    void onExportCsv();
+    void startScanFromUi();
     void onLoadSnapshot();
-    void workerThread(ScanOptions options);
-    unsigned int threadToCount() const; // threadSel_ -> pool size (0 = auto)
+    // Copies the finished results out of the orchestrator once per run, so the
+    // render loop never re-copies a large problem list on every repaint.
+    void syncResultsCache(const bv::ScanOrchestrator::UiSnapshot& st);
 
     std::vector<const FileResult*> FilteredRows() const;
     void DrawResultsList(int yList, int listBottom);
-    void DrawSummary(int summaryY);
+    void DrawSummary(int summaryY, uint64_t hashingErrors);
 
     // hits ------------------------------------------------------------------
     bool hit(int mx, int my, const SDL_FRect& r) const;
@@ -74,51 +72,19 @@ private:
     int winW_ = 1000;
     int winH_ = 700;
 
-    std::wstring source_;
-    std::wstring dest_;
-    bool sourceFocus_ = false;
-    bool destFocus_ = false;
-
-    ScanMode mode_ = ScanMode::Presence;
-    int threadSel_ = 0; // 0=Auto,1,2,4,8,16
-    bool caseSensitive_ = false; // path matching case policy (default: insensitive)
-    EnumeratorBackend backend_ = EnumeratorBackend::Auto; // enumeration back-end
-
-    // private, locked by mtx_ -----------------------------------------------
-    std::mutex mtx_;
-    bool running_ = false;
-    std::atomic_bool cancel_{false};
-    std::thread worker_;
-    ScanProgress progress_;
-    bool resultsReady_ = false;
-    ResultSet results_;
-    unsigned int threadCountUsed_ = 0; // hash workers actually launched
-    double lastSecondsTotal_ = 0.0;    // duration of the last completed scan
-
-    // Phase 5 ----------------------------------------------------------------
-    bool lastSnapshotWritten_ = false;  // last run saved its source snapshot
-    bool lastDegraded_ = false;         // content degraded to size (no digests)
-    bool lastUsedSnapshot_ = false;     // source side loaded from a snapshot
-    std::wstring lastSnapshotPath_;
-    std::wstring statusNote_;           // transient note (export/snapshot result)
-
-    // Offline comparison: pull the source index from a snapshot instead of
-    // enumerating the source device (which may be unplugged). When set, the
-    // source path field is disabled and the scan uses `compareFrom`.
-    bool useSnapshot_ = false;
-    std::wstring snapshotFile_;
-
-    // render-state ----------------------------------------------------------
-    bool dirty_ = true;
+    // The worker thread sets dirty_ through the orchestrator's progress
+    // callback, so it is atomic (benign by nature, but tidy).
+    std::atomic<bool> dirty_{true};
     bool quit_ = false;
     uint8_t filter_ = kFilterAll;
     int scroll_ = 0;
 
-    // layout (recomputed on resize)
-    int listTop_ = 0;
-    int listBottom_ = 0;
-    int listAreaW_ = 0;
-    int rowH_ = 20;
+    // Cached copy of the last completed results (updated by syncResultsCache).
+    ResultSet uiResults_;
+    bool resultsReadySeen_ = false;
+
+    // All business state lives here; the view reads a per-frame snapshot.
+    bv::ScanOrchestrator orch_;
 };
 
 } // namespace bv::ui

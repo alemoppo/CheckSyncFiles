@@ -211,6 +211,35 @@ file come corrotto); un file troncato a metà voce è rifiutato. Le statistiche 
 sono informative: all'`addEntry` di ogni voce vengono ricalcolate. Il formato è inteso
 stabile, ma la `version` permette evoluzioni future non retrocompatibili.
 
+Layout con offset e dimensioni (tutto little-endian):
+
+| Campo        | Offset          | Byte   | Descrizione                       |
+|--------------|-----------------|--------|-----------------------------------|
+| magic        | 0               | 4      | `0x49535642` ("BVSI")             |
+| version      | 4               | 4      | 1                                 |
+| caseSensitive| 8               | 1      | 0/1                               |
+| sourceRoot   | 9               | 8 + L  | u64 lunghezza + L byte UTF-8      |
+| files        | 17 + L          | 8      | informativo                       |
+| dirs         | 25 + L          | 8      | informativo                       |
+| bytes        | 33 + L          | 8      | informativo                       |
+| count        | 41 + L          | 8      | numero voci (≤ 2^31)              |
+
+Dove `L` = lunghezza di `sourceRoot`. Le voci seguono subito dopo l'header; per ogni
+voce (`len` = lunghezza del path), offset relativi all'inizio della voce:
+
+| Campo         | Offset rel. | Byte             | Descrizione                    |
+|---------------|-------------|------------------|--------------------------------|
+| path          | 0           | 8 + len          | u64 lunghezza + path UTF-8     |
+| size          | 8 + len     | 8                | dimensione file                |
+| lastWriteTime | 16 + len    | 8                | FILETIME ultima modifica       |
+| attributes    | 24 + len    | 4                | `FILE_ATTRIBUTE_*`             |
+| fileId        | 28 + len    | 8                | solo informativo               |
+| isDirectory   | 36 + len    | 1                | 0/1                            |
+| hasHash       | 37 + len    | 1                | 0/1                            |
+| digest        | 38 + len    | 32 (se hasHash)  | SHA-256                        |
+
+Una voce completa occupa quindi `38 + len + (hasHash ? 32 : 0)` byte.
+
 ### Export CSV / JSON
 
 `--export <file>` scrive le voci non identiche dopo la scansione. Formato dedotto

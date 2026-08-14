@@ -1377,6 +1377,56 @@ TEST("cache: corrupt file is rejected cleanly and can be rebuilt", [] {
     CHECK(got[0] == 0xAB);
 });
 
+TEST("cache: concurrent Lookup/Store from many threads stays consistent", [] {
+    // The cache is served by hash worker threads; hammer it from several
+    // threads that Store unique entries and Lookup them back, then verify
+    // every entry is present with the right digest. CHECK/FAIL must not run
+    // from the workers, so the assertions happen on the main thread after the
+    // joins (a race would surface as a crash, a lost entry, or a wrong digest).
+    const std::wstring file = MakeTempDir() + L"\\hash_conc.bin";
+    std::wstring err;
+    hashing::HashCache cache(file, err);
+    CHECK(err.empty());
+
+    const int kThreads = 8;
+    const int kEntriesEach = 250;
+    std::atomic<int> lookupsOk{0};
+    std::vector<std::thread> workers;
+    for (int t = 0; t < kThreads; ++t) {
+        workers.emplace_back([&, t] {
+            for (int i = 0; i < kEntriesEach; ++i) {
+                const std::wstring path = L"C:\\conc\\t" + std::to_wstring(t) +
+                                          L"\\f" + std::to_wstring(i) + L".dat";
+                const uint64_t size = static_cast<uint64_t>(t * 1000 + i);
+                const uint64_t mtime = static_cast<uint64_t>(i * 7 + t);
+                std::array<uint8_t, 32> d{};
+                d[0] = static_cast<uint8_t>(t);
+                d[1] = static_cast<uint8_t>(i & 0xFF);
+                cache.Store(path, size, mtime, d);
+
+                std::array<uint8_t, 32> got{};
+                if (cache.Lookup(path, size, mtime, got) && got == d) {
+                    lookupsOk.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        });
+    }
+    for (auto& w : workers) w.join();
+
+    CHECK_EQ(cache.size(), static_cast<size_t>(kThreads * kEntriesEach));
+    CHECK_MSG(lookupsOk.load() == kThreads * kEntriesEach,
+              "every entry stored by a worker must be immediately lookable");
+
+    // A fresh instance reloads the full, uncorrupted map.
+    std::wstring errSave;
+    CHECK(cache.Save(errSave));
+    CHECK(errSave.empty());
+    std::wstring err2;
+    hashing::HashCache reloaded(file, err2);
+    CHECK(err2.empty());
+    CHECK_EQ(reloaded.size(), static_cast<size_t>(kThreads * kEntriesEach));
+});
+
 TEST("comparator: file changed between enumeration and hash is flagged", [] {
     const auto dir = MakeTempDir();
     const std::wstring src = dir + L"\\src";

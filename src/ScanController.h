@@ -93,6 +93,10 @@ struct ScanReport {
     bool exportWritten = false;             // `exportPath` was produced
     std::wstring exportError;
     size_t hashCacheHits = 0;               // files skipped thanks to the cache
+    // Tasks that threw inside the hash worker pool. Such an exception leaves the
+    // candidate reported as a read error (never a wrong verdict), but the count
+    // is surfaced so the failure is not invisible.
+    uint64_t hashingErrors = 0;
 
     // Human-readable notices to show the user (e.g. back-end fallbacks, or a
     // warning that distinct paths folded to the same case-insensitive key).
