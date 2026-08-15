@@ -93,6 +93,17 @@ public:
     // Cancels and joins the worker thread. Safe to call at any time.
     void shutdown();
 
+    // -- Test seams (null by default; never used by production code) ----------
+    // Invoked by workerThread after the final state update (mtx_ released) and
+    // immediately before notify(); lets a test park the worker inside the window
+    // between "running_ is observable false" and "the thread physically exits".
+    void setBeforeNotifyHook(std::function<void()> hook);
+    // Invoked by startLiveScan()/startSnapshotScan() while mtx_ is held, after
+    // input validation, just before the previous worker is reaped; lets a test
+    // observe that a start acquired the lock. The hook must not acquire mtx_
+    // (it is already held) and must not block indefinitely.
+    void setStartLockedHook(std::function<void()> hook);
+
     // -- Read-only state ------------------------------------------------------
     UiSnapshot snapshot() const;
     // The completed results (moved into the snapshot's caller once, when a run
@@ -137,6 +148,9 @@ private:
     uint64_t hashingErrors_ = 0;
     std::wstring lastSnapshotPath_;
     std::wstring statusNote_;
+
+    std::function<void()> beforeNotifyHook_;
+    std::function<void()> startLockedHook_;
 };
 
 } // namespace bv

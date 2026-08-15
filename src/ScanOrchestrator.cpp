@@ -15,6 +15,16 @@ void ScanOrchestrator::setProgressCallback(std::function<void()> cb) {
     progressCb_ = std::move(cb);
 }
 
+void ScanOrchestrator::setBeforeNotifyHook(std::function<void()> hook) {
+    std::lock_guard<std::mutex> lk(mtx_);
+    beforeNotifyHook_ = std::move(hook);
+}
+
+void ScanOrchestrator::setStartLockedHook(std::function<void()> hook) {
+    std::lock_guard<std::mutex> lk(mtx_);
+    startLockedHook_ = std::move(hook);
+}
+
 void ScanOrchestrator::setSource(std::wstring s) {
     std::lock_guard<std::mutex> lk(mtx_);
     source_ = std::move(s);
@@ -78,19 +88,27 @@ void ScanOrchestrator::clearSnapshot() {
 }
 
 bool ScanOrchestrator::startLiveScan() {
-    std::lock_guard<std::mutex> lk(mtx_);
-    if (running_) return false;
-    if (useSnapshot_) {
-        if (snapshotFile_.empty() || dest_.empty()) return false;
-    } else if (source_.empty() || dest_.empty()) {
-        return false;
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        if (running_) return false;
+        if (useSnapshot_) {
+            if (snapshotFile_.empty() || dest_.empty()) return false;
+        } else if (source_.empty() || dest_.empty()) {
+            return false;
+        }
+        if (startLockedHook_) startLockedHook_();
     }
 
-    // The previous run's worker has finished (running_ == false) but its
-    // std::thread object is still joinable. Joining it reaps the OS thread
-    // before we reuse worker_; assigning over an un-joined thread would call
-    // std::terminate() on the second run.
+    // Never join while holding mtx_, exactly like shutdown(): the worker's
+    // final update sets running_ = false and then notify() re-takes mtx_ to
+    // publish, so joining under the lock would deadlock against that notify().
+    // The start entry points are UI-thread-only (see the class comment), so a
+    // concurrent start cannot slip in and make running_ true while we join; the
+    // running_ re-check below is a defensive net only.
     if (worker_.joinable()) worker_.join();
+
+    std::lock_guard<std::mutex> lk(mtx_);
+    if (running_) return false; // another start won the race (defensive)
 
     cancel_.store(false);
     resetForRunLocked();
@@ -121,13 +139,22 @@ bool ScanOrchestrator::startLiveScan() {
 }
 
 bool ScanOrchestrator::startSnapshotScan(const std::wstring& outFile) {
-    std::lock_guard<std::mutex> lk(mtx_);
-    if (running_) return false;
-    if (source_.empty()) {
-        statusNote_ = L"Specificare la sorgente prima di creare uno snapshot.";
-        return false;
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        if (running_) return false;
+        if (source_.empty()) {
+            statusNote_ = L"Specificare la sorgente prima di creare uno snapshot.";
+            return false;
+        }
+        if (startLockedHook_) startLockedHook_();
     }
+
+    // Join OUTSIDE the lock for the same reason as startLiveScan(): the worker
+    // still needs mtx_ in its final notify() before it can exit.
     if (worker_.joinable()) worker_.join();
+
+    std::lock_guard<std::mutex> lk(mtx_);
+    if (running_) return false; // another start won the race (defensive)
 
     cancel_.store(false);
     resetForRunLocked();
@@ -262,6 +289,12 @@ void ScanOrchestrator::workerThread(ScanOptions options) {
             statusNote_.clear();
         }
     }
+    std::function<void()> hook;
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        hook = beforeNotifyHook_;
+    }
+    if (hook) hook();
     notify(); // wake the UI outside the lock
 }
 
