@@ -79,6 +79,16 @@ private:
     uint8_t filter_ = kFilterAll;
     int scroll_ = 0;
 
+    // Fractional mouse-wheel delta accumulator: high-resolution wheel/trackpads
+    // report deltas smaller than one tick, so the integer scroll steps are only
+    // applied once a whole tick accumulates.
+    float wheelAccum_ = 0.0f;
+
+    // Cursor position (in UTF-16 code units) inside the focused path field.
+    // Lives here because the field text is stored in the orchestrator; this is
+    // the only UI-side bit of the editing state.
+    size_t caret_ = 0;
+
     // Cached copy of the last completed results (updated by syncResultsCache).
     ResultSet uiResults_;
     bool resultsReadySeen_ = false;

@@ -250,15 +250,77 @@ void DrawToggle(SDL_Renderer* ren, TTF_Font* font, const std::string& label,
     DrawTextCenterIn(ren, font, label, x, y, w, h, kTextHi);
 }
 
-void RemoveLastCodepoint(std::wstring& s) {
-    if (s.empty()) return;
-    if (s.size() >= 2 && s.back() >= 0xDC00 && s.back() <= 0xDFFF &&
-        s[s.size() - 2] >= 0xD800 && s[s.size() - 2] <= 0xDBFF) {
-        s.pop_back();
-        s.pop_back();
+// Removes the single UTF-16 codepoint immediately before `caret` (handling
+// surrogate pairs), and moves the caret to just after the removed text.
+void RemoveCodepointBefore(std::wstring& s, size_t& caret) {
+    if (caret == 0) return;
+    const size_t p = caret - 1;
+    if (p > 0 && s[p] >= 0xDC00 && s[p] <= 0xDFFF &&
+        s[p - 1] >= 0xD800 && s[p - 1] <= 0xDBFF) {
+        s.erase(p - 1, 2);
+        caret -= 2;
     } else {
-        s.pop_back();
+        s.erase(p, 1);
+        caret -= 1;
     }
+}
+
+// Removes the single UTF-16 codepoint at `caret` (handling surrogate pairs).
+void RemoveCodepointAt(std::wstring& s, size_t caret) {
+    if (caret >= s.size()) return;
+    if (caret + 1 < s.size() && s[caret] >= 0xD800 && s[caret] <= 0xDBFF &&
+        s[caret + 1] >= 0xDC00 && s[caret + 1] <= 0xDFFF) {
+        s.erase(caret, 2);
+    } else {
+        s.erase(caret, 1);
+    }
+}
+
+// Caret position stepped one codepoint left/right (never lands inside a
+// surrogate pair).
+size_t PrevCodepoint(const std::wstring& s, size_t caret) {
+    if (caret == 0) return 0;
+    const size_t p = caret - 1;
+    if (p > 0 && s[p] >= 0xDC00 && s[p] <= 0xDFFF &&
+        s[p - 1] >= 0xD800 && s[p - 1] <= 0xDBFF) return p - 1;
+    return p;
+}
+
+size_t NextCodepoint(const std::wstring& s, size_t caret) {
+    if (caret >= s.size()) return s.size();
+    if (caret + 1 < s.size() && s[caret] >= 0xD800 && s[caret] <= 0xDBFF &&
+        s[caret + 1] >= 0xDC00 && s[caret + 1] <= 0xDFFF) return caret + 2;
+    return caret + 1;
+}
+
+// Horizontal pixel offset of a caret at `caret` inside `text`, relative to the
+// left edge of the field's text area (textLeft is where the glyphs begin).
+int CaretPixelX(TTF_Font* font, const std::wstring& text, size_t caret,
+                int textLeft) {
+    int w = 0, h = 0;
+    const std::string utf = ToUtf8(text.substr(0, caret));
+    TTF_GetStringSize(font, utf.c_str(), utf.size(), &w, &h);
+    return textLeft + w;
+}
+
+// Inverse of CaretPixelX: turns a mouse x into the nearest caret index (in
+// UTF-16 code units). Positions inside a surrogate pair snap to its start.
+size_t CaretFromPixelX(TTF_Font* font, const std::wstring& text, int x,
+                       int textLeft) {
+    if (x <= textLeft) return 0;
+    size_t best = text.size();
+    for (size_t i = 0; i <= text.size(); ++i) {
+        if (i > 0 && i < text.size() && text[i] >= 0xDC00 && text[i] <= 0xDFFF &&
+            text[i - 1] >= 0xD800 && text[i - 1] <= 0xDBFF) continue; // mid-pair
+        int w = 0, h = 0;
+        const std::string utf = ToUtf8(text.substr(0, i));
+        TTF_GetStringSize(font, utf.c_str(), utf.size(), &w, &h);
+        if (textLeft + w >= x) {
+            best = i;
+            break;
+        }
+    }
+    return best;
 }
 
 std::string Group(std::uint64_t v) {
@@ -515,9 +577,19 @@ void AppUI::processEvents() {
                 }
                 break;
             case SDL_EVENT_MOUSE_WHEEL:
-                if (ev.wheel.y != 0.0f && isPointerOverList(ev.wheel.x, ev.wheel.y)) {
-                    scroll_ -= static_cast<int>(ev.wheel.y);
-                    dirty_ = true;
+                // `mouse_x/mouse_y` are the cursor position; `x/y` are only the
+                // scroll deltas, so the list-hit test must use the cursor.
+                if (ev.wheel.y != 0.0f &&
+                    isPointerOverList(ev.wheel.mouse_x, ev.wheel.mouse_y)) {
+                    float dy = ev.wheel.y;
+                    if (ev.wheel.direction == SDL_MOUSEWHEEL_FLIPPED) dy = -dy;
+                    wheelAccum_ += dy;
+                    const int ticks = static_cast<int>(wheelAccum_);
+                    if (ticks != 0) {
+                        wheelAccum_ -= static_cast<float>(ticks);
+                        scroll_ -= ticks;
+                        dirty_ = true;
+                    }
                 }
                 break;
             case SDL_EVENT_KEY_DOWN:
@@ -545,6 +617,7 @@ void AppUI::OnMouseDown(int mx, int my) {
         if (BrowseFolder(picked)) {
             orch_.setSource(picked);
             orch_.useLiveSource(); // manual source: back to live enumeration
+            if (st.sourceFocus) caret_ = picked.size(); // replacement, not edit
             dirty_.store(true);
         }
         return;
@@ -553,16 +626,19 @@ void AppUI::OnMouseDown(int mx, int my) {
         std::wstring picked;
         if (BrowseFolder(picked)) {
             orch_.setDest(picked);
+            if (st.destFocus) caret_ = picked.size();
             dirty_.store(true);
         }
         return;
     }
 
-    // Path fields: focus.
+    // Path fields: focus (a click also moves the caret to the click position).
     if (hit(mx, my, L.sourceField)) {
         if (offline) return; // source field is disabled while offline
         orch_.setSourceFocus(true);
         orch_.setDestFocus(false);
+        caret_ = CaretFromPixelX(fontBody_, st.source, mx,
+                                 static_cast<int>(L.fieldX) + 6);
         SDL_StartTextInput(window_);
         dirty_.store(true);
         return;
@@ -570,6 +646,8 @@ void AppUI::OnMouseDown(int mx, int my) {
     if (hit(mx, my, L.destField)) {
         orch_.setDestFocus(true);
         orch_.setSourceFocus(false);
+        caret_ = CaretFromPixelX(fontBody_, st.dest, mx,
+                                 static_cast<int>(L.fieldX) + 6);
         SDL_StartTextInput(window_);
         dirty_.store(true);
         return;
@@ -684,37 +762,109 @@ bool AppUI::isPointerOverList(float wx, float wy) {
 
 void AppUI::OnKeyDown(unsigned int key, bool repeat) {
     (void)repeat;
-    if (key == SDLK_BACKSPACE) {
-        bv::ScanOrchestrator::UiSnapshot st = orch_.snapshot();
-        if (st.sourceFocus) {
-            RemoveLastCodepoint(st.source);
-            orch_.setSource(st.source);
-            dirty_.store(true);
-        } else if (st.destFocus) {
-            RemoveLastCodepoint(st.dest);
-            orch_.setDest(st.dest);
-            dirty_.store(true);
-        }
-    } else if (key == SDLK_RETURN) {
+    bv::ScanOrchestrator::UiSnapshot st = orch_.snapshot();
+    const bool inField = st.sourceFocus || st.destFocus;
+
+    if (key == SDLK_RETURN) {
         startScanFromUi();
-    } else if (key == SDLK_ESCAPE) {
-        if (orch_.snapshot().sourceFocus || orch_.snapshot().destFocus) {
+        return;
+    }
+    if (key == SDLK_ESCAPE) {
+        if (inField) {
             orch_.setSourceFocus(false);
             orch_.setDestFocus(false);
             SDL_StopTextInput(window_);
             dirty_.store(true);
         }
+        return;
+    }
+    if (!inField) return;
+
+    const bool ctrl = (SDL_GetModState() & SDL_KMOD_CTRL) != 0;
+    std::wstring buf = st.sourceFocus ? st.source : st.dest;
+    caret_ = std::min(caret_, buf.size());
+
+    // Edits write the whole field back through the orchestrator.
+    const auto commit = [&] {
+        if (st.sourceFocus) orch_.setSource(buf);
+        else orch_.setDest(buf);
+        dirty_.store(true);
+    };
+
+    if (ctrl && key == SDLK_V) { // paste
+        if (SDL_HasClipboardText()) {
+            char* clip = SDL_GetClipboardText();
+            if (clip) {
+                const std::wstring ws = FromUtf8(clip);
+                SDL_free(clip);
+                buf.insert(caret_, ws);
+                caret_ += ws.size();
+                commit();
+            }
+        }
+        return;
+    }
+    if (ctrl && key == SDLK_C) { // copy the whole field
+        if (!buf.empty()) SDL_SetClipboardText(ToUtf8(buf).c_str());
+        return;
+    }
+    if (ctrl && key == SDLK_X) { // cut: copy, then clear
+        if (!buf.empty()) SDL_SetClipboardText(ToUtf8(buf).c_str());
+        buf.clear();
+        caret_ = 0;
+        commit();
+        return;
+    }
+    if (ctrl && key == SDLK_A) return; // no selection model yet: ignore
+
+    switch (key) {
+        case SDLK_BACKSPACE:
+            RemoveCodepointBefore(buf, caret_);
+            commit();
+            break;
+        case SDLK_DELETE:
+            if (caret_ < buf.size()) {
+                RemoveCodepointAt(buf, caret_);
+                commit();
+            }
+            break;
+        case SDLK_LEFT:
+            caret_ = PrevCodepoint(buf, caret_);
+            dirty_.store(true);
+            break;
+        case SDLK_RIGHT:
+            caret_ = NextCodepoint(buf, caret_);
+            dirty_.store(true);
+            break;
+        case SDLK_HOME:
+            caret_ = 0;
+            dirty_.store(true);
+            break;
+        case SDLK_END:
+            caret_ = buf.size();
+            dirty_.store(true);
+            break;
+        default:
+            break;
     }
 }
 
 void AppUI::OnTextInput(const char* text) {
+    // Ctrl+letter combos (e.g. Ctrl+V) can also arrive as TEXT_INPUT; they are
+    // handled in OnKeyDown, so never let them type into the field.
+    if (SDL_GetModState() & SDL_KMOD_CTRL) return;
     bv::ScanOrchestrator::UiSnapshot st = orch_.snapshot();
     if (!st.sourceFocus && !st.destFocus) return;
     const std::wstring ws = FromUtf8(text);
+    if (ws.empty()) return;
+    std::wstring buf = st.sourceFocus ? st.source : st.dest;
+    caret_ = std::min(caret_, buf.size());
+    buf.insert(caret_, ws);
+    caret_ += ws.size();
     if (st.sourceFocus) {
-        orch_.setSource(st.source + ws);
+        orch_.setSource(buf);
     } else {
-        orch_.setDest(st.dest + ws);
+        orch_.setDest(buf);
     }
     dirty_.store(true);
 }
@@ -815,6 +965,12 @@ void AppUI::render(const bv::ScanOrchestrator::UiSnapshot& st) {
     DrawRect(renderer_, L.fieldX, L.y1, L.fieldW, kFieldH,
              st.useSnapshot ? kBorder : (st.sourceFocus ? kAccent : kBorder));
     DrawTextVCenter(renderer_, fontBody_, ToUtf8(srcText), L.fieldX + 6, L.y1, kFieldH, srcCol);
+    if (st.sourceFocus && !st.useSnapshot) {
+        caret_ = std::min(caret_, st.source.size());
+        const int cx = CaretPixelX(fontBody_, st.source, caret_,
+                                   static_cast<int>(L.fieldX) + 6);
+        FillRect(renderer_, cx, L.y1 + 4, 1, kFieldH - 8, kTextHi);
+    }
     float mx = 0, my = 0;
     SDL_GetMouseState(&mx, &my);
     const bool overSrcBrowse = hit(static_cast<int>(mx), static_cast<int>(my), L.sourceBrowse);
@@ -825,6 +981,12 @@ void AppUI::render(const bv::ScanOrchestrator::UiSnapshot& st) {
     FillRect(renderer_, L.fieldX, L.y2, L.fieldW, kFieldH, kField);
     DrawRect(renderer_, L.fieldX, L.y2, L.fieldW, kFieldH, st.destFocus ? kAccent : kBorder);
     DrawTextVCenter(renderer_, fontBody_, ToUtf8(st.dest), L.fieldX + 6, L.y2, kFieldH, kTextHi);
+    if (st.destFocus) {
+        caret_ = std::min(caret_, st.dest.size());
+        const int cx = CaretPixelX(fontBody_, st.dest, caret_,
+                                   static_cast<int>(L.fieldX) + 6);
+        FillRect(renderer_, cx, L.y2 + 4, 1, kFieldH - 8, kTextHi);
+    }
     const bool overDstBrowse = hit(static_cast<int>(mx), static_cast<int>(my), L.destBrowse);
     DrawPickerButton(renderer_, fontBody_, L.destBrowse, overDstBrowse);
 
@@ -1044,7 +1206,12 @@ void AppUI::DrawResultsList(int yList, int listBottom) {
         }
         DrawTextVCenter(renderer_, fontBody_, ToUtf8(StatusName(p.status)),
                         kMargin + 2, y, kRowH, StatusColor(p.status));
-        const std::wstring full = (p.isDirectory ? L"[dir] " : L"") + p.relativePath;
+        std::wstring full = (p.isDirectory ? L"[dir] " : L"") + p.relativePath;
+        if (!p.errorMessage.empty()) {
+            std::wstring msg = p.errorMessage;
+            if (msg.size() > 96) msg = msg.substr(0, 93) + L"...";
+            full += L"  (" + msg + L")";
+        }
         DrawTextVCenter(renderer_, fontBody_, ToUtf8(full), kMargin + 120, y, kRowH, kTextHi);
     }
     SDL_SetRenderClipRect(renderer_, nullptr);
