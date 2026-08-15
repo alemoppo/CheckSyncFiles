@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <map>
 #include <unordered_map>
 #include <vector>
 
@@ -717,6 +718,67 @@ bool ParseAttrListData(const uint8_t* p, size_t n, std::vector<MftAttrListEntry>
     return true;
 }
 
+// Pass A merge for one parsed record. An extension record (base record
+// reference @+32 != 0) carries attributes that belong to the base record;
+// merge its $I30 pieces into the base. The base record always has a lower
+// record number, so it was already parsed when the extension is seen; the
+// sequence check rejects references to a reused record. Shared verbatim
+// between enumerate() (per-record during the raw sweep) and the in-memory
+// test seam, so the seam fails if this merge ever regresses. `recIndex` is the
+// parsed record's number, `rec` its (fixup-applied) bytes; `recs` is the whole
+// per-record table; `diag` counts merged pieces (BV_MFT_DEBUG_FILE).
+void MergePassAFromRecord(std::vector<RecInfo>& recs, uint64_t recIndex,
+                          const uint8_t* rec, size_t& diag) {
+    const FileRef baseRef = SplitRef(*reinterpret_cast<const uint64_t*>(rec + 32));
+    if (baseRef.rec != 0 && baseRef.rec != recIndex && baseRef.rec < recs.size()) {
+        RecInfo& base = recs[baseRef.rec];
+        const RecInfo& r = recs[recIndex];
+        if (base.parsed && base.inUse && base.seq == baseRef.seq) {
+            if (base.idxRoot.empty() && !r.idxRoot.empty()) {
+                base.idxRoot = r.idxRoot;
+                base.idxBlockSize = r.idxBlockSize;
+                ++diag;
+            }
+            for (const auto& h : r.idxAllocHdrs) {
+                if (VcnRangeKnown(base.idxAllocHdrs, h)) continue;
+                base.idxAllocHdrs.push_back(h);
+                ++diag;
+            }
+        }
+    }
+}
+
+// Pass B merge for one record: parse its $ATTRIBUTE_LIST value (`listData`)
+// and merge the $I30 pieces it points to into `r`. Non-$I30 attributes (SI,
+// FN, SD, $DATA, ...) are deliberately ignored. Shared verbatim between
+// enumerate() and the in-memory test seam.
+void MergePassBFromList(std::vector<RecInfo>& recs, uint64_t recIndex, RecInfo& r,
+                        const std::vector<uint8_t>& listData, size_t& diag) {
+    std::vector<MftAttrListEntry> entries;
+    ParseAttrListData(listData.data(), listData.size(), entries);
+    for (const auto& e : entries) {
+        const bool isI30 = e.name.empty() || e.name == L"$I30";
+        if ((e.type == kAttrIndexRoot || e.type == kAttrIndexAlloc) && isI30 &&
+            e.record != recIndex && e.record < recs.size() && recs[e.record].parsed &&
+            recs[e.record].inUse && recs[e.record].seq == e.sequence) {
+            const RecInfo& src = recs[e.record];
+            if (e.type == kAttrIndexRoot) {
+                if (r.idxRoot.empty() && !src.idxRoot.empty()) {
+                    r.idxRoot = src.idxRoot;
+                    r.idxBlockSize = src.idxBlockSize;
+                    ++diag;
+                }
+            } else if (!src.idxAllocHdrs.empty()) {
+                for (const auto& h : src.idxAllocHdrs) {
+                    if (VcnRangeKnown(r.idxAllocHdrs, h)) continue;
+                    r.idxAllocHdrs.push_back(h);
+                    ++diag;
+                }
+            }
+        }
+    }
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -875,25 +937,11 @@ const uint64_t segSize = vd.BytesPerFileRecordSegment;
         if (!ApplyFixup(rec, n)) return;
         ParseRecord(rec, n, r);
         // An extension record (base record reference @+32 != 0) carries
-        // attributes that belong to the base record. Merge its $I30 pieces now:
-        // the base record always has a lower record number, so it was already
-        // parsed, and the sequence check rejects references to a reused record.
-        const FileRef baseRef = SplitRef(*reinterpret_cast<const uint64_t*>(rec + 32));
-        if (baseRef.rec != 0 && baseRef.rec != recIndex && baseRef.rec < nRecords) {
-            RecInfo& base = recs[baseRef.rec];
-            if (base.parsed && base.inUse && base.seq == baseRef.seq) {
-                if (base.idxRoot.empty() && !r.idxRoot.empty()) {
-                    base.idxRoot = r.idxRoot;
-                    base.idxBlockSize = r.idxBlockSize;
-                    ++diagExtI30Merged;
-                }
-                for (const auto& h : r.idxAllocHdrs) {
-                    if (VcnRangeKnown(base.idxAllocHdrs, h)) continue;
-                    base.idxAllocHdrs.push_back(h);
-                    ++diagExtI30Merged;
-                }
-            }
-        }
+        // attributes that belong to the base record. Merge its $I30 pieces now
+        // (shared with the in-memory test seam): the base record always has a
+        // lower record number, so it was already parsed, and the sequence check
+        // rejects references to a reused record.
+        MergePassAFromRecord(recs, recIndex, rec, diagExtI30Merged);
     });
     if (cancelledNow()) {
         CloseHandle(hVol);
@@ -927,29 +975,7 @@ const uint64_t segSize = vd.BytesPerFileRecordSegment;
         } else if (!ReadNonResidentAttr(hVol, cluster, r.attrListHdr, listData)) {
             continue; // cannot follow: the $I30 checks in the walk stay honest
         }
-        std::vector<MftAttrListEntry> entries;
-        ParseAttrListData(listData.data(), listData.size(), entries);
-        for (const auto& e : entries) {
-            const bool isI30 = e.name.empty() || e.name == L"$I30";
-            if ((e.type == kAttrIndexRoot || e.type == kAttrIndexAlloc) && isI30 &&
-                e.record != i && e.record < nRecords && recs[e.record].parsed &&
-                recs[e.record].inUse && recs[e.record].seq == e.sequence) {
-                const RecInfo& src = recs[e.record];
-                if (e.type == kAttrIndexRoot) {
-                    if (r.idxRoot.empty() && !src.idxRoot.empty()) {
-                        r.idxRoot = src.idxRoot;
-                        r.idxBlockSize = src.idxBlockSize;
-                        ++diagExtI30Merged;
-                    }
-                } else if (!src.idxAllocHdrs.empty()) {
-                    for (const auto& h : src.idxAllocHdrs) {
-                        if (VcnRangeKnown(r.idxAllocHdrs, h)) continue;
-                        r.idxAllocHdrs.push_back(h);
-                        ++diagExtI30Merged;
-                    }
-                }
-            }
-        }
+        MergePassBFromList(recs, i, r, listData, diagExtI30Merged);
     }
 
     bool incomplete = false;
@@ -1196,6 +1222,69 @@ bool MftEnumerator::VcnRangeKnownForTest(
         if (low <= r.second && high >= r.first) return true;
     }
     return false;
+}
+
+bool MftEnumerator::ResolveDirectoryForTest(
+    const std::map<uint64_t, std::vector<uint8_t>>& records, uint64_t dirRec,
+    std::vector<std::pair<std::wstring, uint64_t>>& outEntries,
+    bool& outIncomplete) {
+    outEntries.clear();
+    outIncomplete = false;
+    if (records.empty()) return false;
+    const uint64_t nRecords = records.rbegin()->first + 1;
+    std::vector<RecInfo> recs(nRecords);
+    size_t diag = 0; // merge counter (not reported by the seam)
+    for (const auto& [recNo, bytes] : records) {
+        if (recNo >= nRecords) continue;
+        // ApplyFixup mutates its buffer, so parse from a private copy; the
+        // (mutating) sweep in enumerate() recycles a single read buffer.
+        std::vector<uint8_t> work = bytes;
+        if (!ApplyFixup(work.data(), work.size())) continue;
+        ParseRecord(work.data(), work.size(), recs[recNo]);
+        // Pass A inline, as in enumerate(): records are processed in ascending
+        // record number (std::map order), and NTFS guarantees base < extension,
+        // so the base is already parsed when its extension is merged.
+        MergePassAFromRecord(recs, recNo, work.data(), diag);
+    }
+    // Pass B: follow each record's $ATTRIBUTE_LIST. The seam has no volume, so
+    // only resident lists are followed (the non-resident read is generic
+    // infrastructure already covered by the real-volume tests); the MERGE the
+    // seam guards is identical in both cases.
+    for (uint64_t i = 0; i < nRecords; ++i) {
+        RecInfo& r = recs[i];
+        if (!r.parsed || !r.inUse) continue;
+        if (r.attrList.empty()) continue;
+        MergePassBFromList(recs, i, r, r.attrList, diag);
+    }
+
+    // Mirror the walk's $I30 resolution for the target directory (resident
+    // $INDEX_ROOT only: no volume I/O, so no $INDEX_ALLOCATION stream).
+    RecInfo& d = recs[dirRec];
+    if (!d.parsed || !d.inUse) { outIncomplete = true; return false; }
+    if (!d.idxRoot.empty()) ParseIndexRootValue(d.idxRoot, d.children);
+    if (d.children.empty() && d.idxRoot.empty()) {
+        outIncomplete = true; // "directory has no readable $I30 index"
+        return false;
+    }
+    std::vector<std::pair<uint64_t, std::wstring>> kids;
+    for (const auto& c : d.children) {
+        const uint64_t cr = c.ref.rec;
+        if (cr >= nRecords || !recs[cr].parsed || !recs[cr].inUse ||
+            recs[cr].seq != c.ref.seq) {
+            outIncomplete = true; // mirror failIncomplete() for a bad child ref
+            continue;
+        }
+        // Prefer the record's WIN32 name for this parent, as the walk does.
+        const std::wstring recName = ChildNameOf(recs[cr], {dirRec, d.seq});
+        kids.push_back({cr, recName.empty() ? c.name : recName});
+    }
+    std::sort(kids.begin(), kids.end(),
+              [](const std::pair<uint64_t, std::wstring>& a,
+                 const std::pair<uint64_t, std::wstring>& b) {
+                  return a.second < b.second;
+              });
+    for (const auto& k : kids) outEntries.push_back({k.second, k.first});
+    return true;
 }
 
 } // namespace bv

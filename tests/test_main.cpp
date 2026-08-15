@@ -1332,6 +1332,199 @@ TEST("mft: directory index reassembly across growth and shrink (portable)", [] {
 });
 
 // ---------------------------------------------------------------------------
+// The synthetic tests above pin the $ATTRIBUTE_LIST *parser* (the seams
+// ParseAttributeListForTest / VcnRangeKnownForTest decode raw bytes directly),
+// but they do NOT traverse the merge that was actually fixed: Pass A
+// (base-record reference) and Pass B ($ATTRIBUTE_LIST follow) reassemble a
+// directory's $I30 into the base record before the walk resolves it. A
+// regression that silently stops merging -- the audited bug -- would leave
+// those parser tests green (verified by mutation check, before the fixture
+// below existed). The fixture closes that gap: it feeds raw on-disk records of
+// the audited layout through the SAME production merge chain (shared helpers,
+// not a copy), so the suite turns red the moment any merge step regresses,
+// deterministically and without volume access.
+
+namespace {
+
+// ---- NTFS on-disk record builders (test fixture, not production logic). ----
+
+// $FILE_NAME value: 66-byte fixed part + UTF-16 name (namespace `ns`).
+std::vector<uint8_t> BuildFileNameValue(uint64_t parentRec, uint16_t parentSeq,
+                                        const std::wstring& name, uint8_t ns) {
+    std::vector<uint8_t> v(66, 0);
+    *reinterpret_cast<uint64_t*>(v.data()) =
+        parentRec | (static_cast<uint64_t>(parentSeq) << 48);
+    v[64] = static_cast<uint8_t>(name.size());
+    v[65] = ns;
+    const size_t off = v.size();
+    v.resize(off + name.size() * 2);
+    std::memcpy(v.data() + off, name.c_str(), name.size() * 2);
+    return v;
+}
+
+// Append one resident attribute (24-byte header + optional UTF-16 name + value).
+void AppendResidentAttr(std::vector<uint8_t>& rec, uint32_t type,
+                        const std::wstring& name, const std::vector<uint8_t>& value) {
+    const uint32_t nameBytes = static_cast<uint32_t>(name.size() * 2);
+    const uint32_t len = 24 + nameBytes + static_cast<uint32_t>(value.size());
+    const size_t start = rec.size();
+    rec.resize(start + len);
+    *reinterpret_cast<uint32_t*>(rec.data() + start) = type;
+    *reinterpret_cast<uint32_t*>(rec.data() + start + 4) = len;
+    rec[start + 9] = static_cast<uint8_t>(name.size());
+    *reinterpret_cast<uint16_t*>(rec.data() + start + 10) = 24;
+    *reinterpret_cast<uint32_t*>(rec.data() + start + 16) = static_cast<uint32_t>(value.size());
+    *reinterpret_cast<uint16_t*>(rec.data() + start + 20) = 24 + nameBytes;
+    if (nameBytes) std::memcpy(rec.data() + start + 24, name.c_str(), nameBytes);
+    std::memcpy(rec.data() + start + 24 + nameBytes, value.data(), value.size());
+}
+
+// 1024-byte MFT record with a valid USA fixup. The update sequence number is
+// 0xFFFF and no 512-byte sector tail holds that value, so ApplyFixup finds
+// nothing to restore and the record parses exactly as built. Starts as the
+// 56-byte FILE_RECORD_HEADER region; attributes are appended by the caller at
+// offset 56, and FinishRecord pads the record to its final 1024-byte size.
+std::vector<uint8_t> BuildFileRecord(uint64_t recNo, uint16_t seq, uint16_t flags,
+                                     uint64_t baseRef) {
+    std::vector<uint8_t> rec(0x38, 0);
+    std::memcpy(rec.data(), "FILE", 4);
+    *reinterpret_cast<uint16_t*>(rec.data() + 4) = 0x30;  // USA offset
+    *reinterpret_cast<uint16_t*>(rec.data() + 6) = 3;     // USA count (2 sectors + 1)
+    *reinterpret_cast<uint16_t*>(rec.data() + 16) = seq;
+    *reinterpret_cast<uint16_t*>(rec.data() + 20) = 0x38; // first attribute offset
+    *reinterpret_cast<uint16_t*>(rec.data() + 22) = flags;
+    *reinterpret_cast<uint64_t*>(rec.data() + 32) = baseRef;
+    *reinterpret_cast<uint16_t*>(rec.data() + 42) = static_cast<uint16_t>(recNo);
+    *reinterpret_cast<uint16_t*>(rec.data() + 0x30) = 0xFFFF; // USA sequence number
+    return rec;
+}
+
+// Append the end-of-attribute marker, pad the record to 1024 bytes and finalize
+// the size fields (record size at +28 is what ApplyFixup reads as the fixup
+// region span).
+void FinishRecord(std::vector<uint8_t>& rec) {
+    const size_t used = rec.size();
+    const size_t start = rec.size();
+    rec.resize(start + 4, 0);
+    *reinterpret_cast<uint32_t*>(rec.data() + start) = 0xFFFFFFFFu;
+    rec.resize(1024, 0);
+    *reinterpret_cast<uint32_t*>(rec.data() + 24) = static_cast<uint32_t>(used + 4);
+    *reinterpret_cast<uint32_t*>(rec.data() + 28) = 1024; // allocated / record size
+}
+
+// Resident $INDEX_ROOT [$I30] value: 0x10 INDEX_ROOT header + 0x10 INDEX_HEADER
+// + three leaf entries + end-of-node marker.
+std::vector<uint8_t> BuildIndexRootValue() {
+    std::vector<uint8_t> v(0x20, 0);
+    *reinterpret_cast<uint32_t*>(v.data() + 0) = 0x30; // indexed attr type: $FILE_NAME
+    *reinterpret_cast<uint32_t*>(v.data() + 4) = 0x01; // collation rule: FILENAME
+    *reinterpret_cast<uint32_t*>(v.data() + 8) = 4096; // index_block_size
+    *reinterpret_cast<uint32_t*>(v.data() + 12) = 1;   // clusters_per_index_block
+    *reinterpret_cast<uint32_t*>(v.data() + 16) = 16;  // entries offset (rel. INDEX_HEADER)
+    const auto addEntry = [&](uint64_t childRef, const std::wstring& name, uint16_t flags) {
+        std::vector<uint8_t> key(66, 0);
+        key[64] = static_cast<uint8_t>(name.size());
+        key[65] = 1; // WIN32 namespace
+        const size_t keyOff = key.size();
+        key.resize(keyOff + name.size() * 2);
+        std::memcpy(key.data() + keyOff, name.c_str(), name.size() * 2);
+        const uint16_t klen = static_cast<uint16_t>(key.size());
+        const uint16_t elen = static_cast<uint16_t>(16 + klen);
+        const size_t start = v.size();
+        v.resize(start + elen);
+        *reinterpret_cast<uint64_t*>(v.data() + start) = childRef;
+        *reinterpret_cast<uint16_t*>(v.data() + start + 8) = elen;
+        *reinterpret_cast<uint16_t*>(v.data() + start + 10) = klen;
+        *reinterpret_cast<uint16_t*>(v.data() + start + 12) = flags;
+        std::memcpy(v.data() + start + 16, key.data(), klen);
+    };
+    addEntry(4610ull | (1ull << 48), L"file1.txt", 0);
+    addEntry(4611ull | (1ull << 48), L"file2.txt", 0);
+    addEntry(4612ull | (1ull << 48), L"sub", 0);
+    addEntry(0, L"", 0x0002); // end-of-node marker
+    *reinterpret_cast<uint32_t*>(v.data() + 20) =
+        static_cast<uint32_t>(v.size() - 16); // index_length (rel. INDEX_HEADER)
+    return v;
+}
+
+// The audited base record 4609 $ATTRIBUTE_LIST: its $I30 index root lives ONLY
+// in extension record 4613.
+std::vector<uint8_t> BuildAttrList() {
+    std::vector<uint8_t> list;
+    PushAttrListEntry(list, 0x10, L"", 4609, 1, 0);     // $STANDARD_INFORMATION
+    PushAttrListEntry(list, 0x30, L"", 4609, 1, 0);     // $FILE_NAME
+    PushAttrListEntry(list, 0x90, L"$I30", 4613, 1, 0); // $INDEX_ROOT -> extension
+    PushAttrListEntry(list, 0x80, L"", 4609, 1, 0);     // $DATA
+    return list;
+}
+
+// Raw records of the audited layout: base 4609 (dir, seq 1) carries the
+// $ATTRIBUTE_LIST; extension 4613 (base reference 4609) holds the $INDEX_ROOT
+// [$I30]; children 4610/4611/4612 are files. Mirrors the real "APPUNTI 2019"
+// case (E:\nas_4tb_1\...\APPUNTI 2019, records 4609..4613) with the list kept
+// resident so the chain runs without volume access.
+std::map<uint64_t, std::vector<uint8_t>> BuildAuditedFixture() {
+    std::map<uint64_t, std::vector<uint8_t>> records;
+
+    auto base = BuildFileRecord(4609, 1, 0x0003, 0); // in use + directory
+    AppendResidentAttr(base, 0x30, L"", BuildFileNameValue(4608, 1, L"APPUNTI 2019", 1));
+    AppendResidentAttr(base, 0x20, L"", BuildAttrList());
+    FinishRecord(base);
+    records[4609] = std::move(base);
+
+    auto ext = BuildFileRecord(4613, 1, 0x0003, 4609ull | (1ull << 48)); // extension of 4609
+    AppendResidentAttr(ext, 0x90, L"$I30", BuildIndexRootValue());
+    FinishRecord(ext);
+    records[4613] = std::move(ext);
+
+    const auto mkFile = [&](uint64_t recNo, const wchar_t* name) {
+        auto r = BuildFileRecord(recNo, 1, 0x0001, 0);
+        AppendResidentAttr(r, 0x30, L"", BuildFileNameValue(4609, 1, name, 1));
+        FinishRecord(r);
+        records[recNo] = std::move(r);
+    };
+    mkFile(4610, L"file1.txt");
+    mkFile(4611, L"file2.txt");
+    mkFile(4612, L"sub");
+    return records;
+}
+
+} // namespace
+
+TEST("mft: external $I30 via $ATTRIBUTE_LIST resolves children (in-memory fixture)", [] {
+    // Full production chain -- USA fixup, ParseRecord, Pass A base-record
+    // reference merge, Pass B $ATTRIBUTE_LIST merge, $I30 resolution, WIN32
+    // child name resolution -- on the audited layout. A regression in ANY merge
+    // step leaves the parser-only synthetic tests green but makes this fail.
+    auto records = BuildAuditedFixture();
+    std::vector<std::pair<std::wstring, uint64_t>> entries;
+    bool incomplete = false;
+    const bool resolved =
+        MftEnumerator::ResolveDirectoryForTest(records, 4609, entries, incomplete);
+    CHECK(resolved);
+    CHECK(!incomplete);
+    if (!resolved || incomplete) return; // nothing meaningful to assert past here
+    CHECK_EQ(entries.size(), 3u);
+    if (entries.size() != 3) return;
+    CHECK(entries[0].first == L"file1.txt");
+    CHECK_EQ(entries[0].second, 4610u);
+    CHECK(entries[1].first == L"file2.txt");
+    CHECK_EQ(entries[1].second, 4611u);
+    CHECK(entries[2].first == L"sub");
+    CHECK_EQ(entries[2].second, 4612u);
+
+    // Honesty rule: drop the extension record and the directory has no
+    // resolvable $I30 -- the seam must report incompleteness, never silence.
+    auto broken = BuildAuditedFixture();
+    broken.erase(4613);
+    std::vector<std::pair<std::wstring, uint64_t>> empty;
+    bool brokenIncomplete = false;
+    CHECK(!MftEnumerator::ResolveDirectoryForTest(broken, 4609, empty, brokenIncomplete));
+    CHECK(brokenIncomplete);
+    CHECK(empty.empty());
+});
+
+// ---------------------------------------------------------------------------
 // Phase 5: export CSV/JSON, binary snapshot, hash cache, offline compare
 
 TEST("export: csv escaping, BOM and hex digests", [] {
