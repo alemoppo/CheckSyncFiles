@@ -2473,16 +2473,27 @@ TEST("concurrent comparer: cancel mid-content-hash drains submitted jobs, fabric
                            ConcurrentComparer::SourceKind::Live, nullptr, &cancel);
     // The destination emits entries (counting them) and stops as soon as cancel
     // is set. The source emits everything and only then requests cancellation,
-    // gated on the destination having produced enough entries that at least one
-    // 256-candidate hash batch was already submitted: hashing is in flight when
-    // cancellation is signalled.
+    // parked behind a FIFO gate job in the hash pool: with 600 files and at most
+    // 100 directories, the first 400 emitted entries always include >= 256 file
+    // candidates, so one full hash batch is guaranteed to already be enqueued
+    // before the gate is submitted. The pool runs tasks in submission order, so
+    // the gate fires only once every earlier hash job -- the whole first batch --
+    // has completed and committed its verdict: cancellation is never signalled
+    // before at least one batch is classified, and any batch submitted after the
+    // gate observes the flag and takes the early-bailout path.
     auto srcFac = [&] {
         return std::unique_ptr<IFileEnumerator>(new ReplayEnumerator(
             srcEntries, {},
             [&] {
-                while (destEmitted.load(std::memory_order_acquire) < 300)
+                while (destEmitted.load(std::memory_order_acquire) < 400)
                     std::this_thread::yield();
-                cancel.store(true, std::memory_order_release);
+                std::promise<void> gateDone;
+                std::future<void> done = gateDone.get_future();
+                pool.submit([&] {
+                    cancel.store(true, std::memory_order_release);
+                    gateDone.set_value();
+                });
+                done.wait();
             }));
     };
     auto dstFac = [&] {
