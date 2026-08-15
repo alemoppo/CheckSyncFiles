@@ -51,6 +51,19 @@
 //     different directories is a hard link: each (parent,name) pair becomes a
 //     distinct output path (our FileIndex is one-entry-per-path).
 //
+//   * $ATTRIBUTE_LIST (0x20) is followed. When a base record overflows its 1KB
+//     slot, NTFS moves attributes to extension records and records where each
+//     one lives in the base record's $ATTRIBUTE_LIST. A directory's $I30 index
+//     ($INDEX_ROOT / $INDEX_ALLOCATION) can therefore live entirely in an
+//     extension record; ignoring the list would report such a directory as "no
+//     readable $I30 index" on a perfectly valid volume. The list is parsed
+//     (resident or non-resident), and the $I30 pieces it points to are merged
+//     back into the base record; a base-record-reference merge is applied as an
+//     order-independent fallback when the list cannot be read. $INDEX_ALLOCATION
+//     split across several records is reassembled in VCN order. Non-$I30
+//     attributes in the list (SI, FN, SD, $DATA, ...) are ignored: they are
+//     either already parsed inline or irrelevant to tree reconstruction.
+//
 //   * Incompleteness is signalled honestly: if a child listed in a subtree
 //     directory's $I30 index cannot be resolved (record out of range, not in
 //     use, or sequence mismatch), or a directory's $INDEX_ALLOCATION exists but
@@ -66,6 +79,7 @@ namespace bv {
 namespace {
 
 constexpr uint32_t kAttrFileName = 0x30;   // NTFS_ATTR_FILENAME
+constexpr uint32_t kAttrAttrList = 0x20;   // NTFS_ATTR_ATTRIBUTE_LIST
 constexpr uint32_t kAttrData = 0x80;       // NTFS_ATTR_DATA
 constexpr uint32_t kAttrIndexRoot = 0x90;  // NTFS_ATTR_INDEX_ROOT
 constexpr uint32_t kAttrIndexAlloc = 0xA0; // NTFS_ATTR_INDEX_ALLOCATION
@@ -292,9 +306,17 @@ struct RecInfo {
     std::vector<NameInfo> names;      // every $FILE_NAME attribute
     std::vector<IndexChild> children; // $I30 children resolved so far
     std::vector<uint8_t> idxRoot;     // copy of the resident $INDEX_ROOT value
-    std::vector<uint8_t> idxAlloc;    // copy of the $INDEX_ALLOCATION attr header
+    // $INDEX_ALLOCATION ($I30): one non-resident attribute header copy per piece
+    // -- the base record's inline piece plus, after $ATTRIBUTE_LIST following,
+    // any pieces held by extension records. Read in VCN order at resolution time.
+    std::vector<std::vector<uint8_t>> idxAllocHdrs;
     uint32_t idxBlockSize = 0;        // index_block_size from $INDEX_ROOT (value+0x08)
     bool indexResolved = false;       // $I30 fully resolved (root + allocation)
+    // $ATTRIBUTE_LIST (0x20): resident value / non-resident header copy. The
+    // list maps every attribute of a multi-record file to the record that
+    // actually holds it (a directory's $I30 may live in an extension record).
+    std::vector<uint8_t> attrList;
+    std::vector<uint8_t> attrListHdr;
 };
 
 // `$FILE_NAME` namespace:
@@ -336,6 +358,35 @@ std::wstring ChildNameOf(const RecInfo& r, FileRef dirRef) {
     if (!fallback.empty()) return fallback;
     const NameInfo* p = PickWin32Name(r);
     return p ? p->name : std::wstring();
+}
+
+// Attribute name from a raw attribute header (resident or non-resident): the
+// header's NameLength (a+9) counts characters, NameOffset (a+10) is relative to
+// the header start. Returns an empty string for unnamed attributes.
+std::wstring AttrNameOf(const uint8_t* a, uint32_t len) {
+    const uint8_t nl = a[9];
+    const uint16_t no = *reinterpret_cast<const uint16_t*>(a + 10);
+    if (nl == 0) return std::wstring();
+    if ((size_t)no + (size_t)nl * 2u > len) return std::wstring();
+    const wchar_t* p = reinterpret_cast<const wchar_t*>(a + no);
+    return std::wstring(p, p + nl);
+}
+
+// True when any header in `hdrs` already covers the VCN range of `h`: the same
+// $INDEX_ALLOCATION piece must never be merged twice (dedupe for the two merge
+// paths -- Pass A base-record-reference merge and Pass B attribute-list follow).
+bool VcnRangeKnown(const std::vector<std::vector<uint8_t>>& hdrs,
+                   const std::vector<uint8_t>& h) {
+    if (h.size() < 56) return true;
+    const int64_t low = *reinterpret_cast<const int64_t*>(h.data() + 16);
+    const int64_t high = *reinterpret_cast<const int64_t*>(h.data() + 24);
+    for (const auto& e : hdrs) {
+        if (e.size() < 56) continue;
+        const int64_t el = *reinterpret_cast<const int64_t*>(e.data() + 16);
+        const int64_t eh = *reinterpret_cast<const int64_t*>(e.data() + 24);
+        if (low <= eh && high >= el) return true;
+    }
+    return false;
 }
 
 // Parse one record (after fixup) into `out`.
@@ -396,24 +447,42 @@ void ParseRecord(const uint8_t* rec, size_t bufSize, RecInfo& out) {
             if (len >= 56) { // real size lives at +0x30 (8 bytes)
                 out.dataSize = *reinterpret_cast<const uint64_t*>(a + 48);
             }
-        } else if (type == kAttrIndexRoot && !nonResident) {
+        } else if (type == kAttrAttrList && !nonResident) { // resident $ATTRIBUTE_LIST
             const uint16_t valueOff = *reinterpret_cast<const uint16_t*>(a + 20);
             const uint32_t valueLen = *reinterpret_cast<const uint32_t*>(a + 16);
             if (valueOff >= 24 && (size_t)valueOff + valueLen <= len) {
-                out.idxRoot.assign(a + valueOff, a + valueOff + valueLen);
-                if (valueLen >= 16) {
-                    // $INDEX_ROOT header: indexed_attr_type@+0, collation@+4,
-                    // index_block_size@+8, clusters_per_index_block@+12.
-                    out.idxBlockSize =
-                        *reinterpret_cast<const uint32_t*>(a + valueOff + 8);
+                out.attrList.assign(a + valueOff, a + valueOff + valueLen);
+            }
+        } else if (type == kAttrAttrList && nonResident) { // non-resident $ATTRIBUTE_LIST
+            // copy the whole attribute header (incl. the run map) because the
+            // record buffer is recycled between records; the value is read from
+            // the volume later, like $INDEX_ALLOCATION.
+            const size_t copyLen = std::min<size_t>(len, 4096);
+            out.attrListHdr.assign(a, a + copyLen);
+        } else if (type == kAttrIndexRoot && !nonResident) {
+            const std::wstring nm = AttrNameOf(a, len);
+            if (nm.empty() || nm == L"$I30") { // directory $I30 index root
+                const uint16_t valueOff = *reinterpret_cast<const uint16_t*>(a + 20);
+                const uint32_t valueLen = *reinterpret_cast<const uint32_t*>(a + 16);
+                if (valueOff >= 24 && (size_t)valueOff + valueLen <= len) {
+                    out.idxRoot.assign(a + valueOff, a + valueOff + valueLen);
+                    if (valueLen >= 16) {
+                        // $INDEX_ROOT header: indexed_attr_type@+0, collation@+4,
+                        // index_block_size@+8, clusters_per_index_block@+12.
+                        out.idxBlockSize =
+                            *reinterpret_cast<const uint32_t*>(a + valueOff + 8);
+                    }
                 }
             }
         } else if (type == kAttrIndexAlloc) {
-            // copy the whole attribute header (incl. the run map) because the
-            // record buffer is recycled between records. Stray (un-parented)
-            // $INDEX_ALLOCATION attributes on the same record are harmless.
-            const size_t copyLen = std::min<size_t>(len, 4096);
-            out.idxAlloc.assign(a, a + copyLen);
+            const std::wstring nm = AttrNameOf(a, len);
+            if (nm.empty() || nm == L"$I30") { // directory $I30 allocation
+                // copy the whole attribute header (incl. the run map) because the
+                // record buffer is recycled between records. Stray (un-parented)
+                // $INDEX_ALLOCATION attributes on the same record are harmless.
+                const size_t copyLen = std::min<size_t>(len, 4096);
+                out.idxAllocHdrs.push_back(std::vector<uint8_t>(a, a + copyLen));
+            }
         }
         a += len;
     }
@@ -507,21 +576,16 @@ size_t ParseIndexAllocationData(std::vector<uint8_t>& data, size_t blockSize,
     return blocks;
 }
 
-// Read the full data of a non-resident attribute from its stored header copy.
-bool ReadNonResidentAttr(HANDLE hVol, uint64_t cluster, const std::vector<uint8_t>& hdrCopy,
-                         std::vector<uint8_t>& out) {
+// Read the clusters of a non-resident attribute's data runs into `out` starting
+// at byte offset `dstOff`. `out` must already be sized for the whole stream.
+bool ReadNonResidentAttrInto(HANDLE hVol, uint64_t cluster,
+                             const std::vector<uint8_t>& hdrCopy,
+                             std::vector<uint8_t>& out, size_t dstOff) {
     if (hdrCopy.size() < 56) return false;
     const uint16_t mapOff = *reinterpret_cast<const uint16_t*>(hdrCopy.data() + 32);
     const int64_t lowVcn = *reinterpret_cast<const int64_t*>(hdrCopy.data() + 16);
     const int64_t highVcn = *reinterpret_cast<const int64_t*>(hdrCopy.data() + 24);
-    const uint64_t dataSize = *reinterpret_cast<const uint64_t*>(hdrCopy.data() + 48);
-    if (mapOff == 0 || mapOff >= hdrCopy.size() || dataSize == 0 ||
-        dataSize > kMaxAttrData || highVcn < lowVcn) {
-        return false;
-    }
-    const uint64_t totalBytes = (uint64_t)(highVcn - lowVcn + 1) * cluster;
-    if (totalBytes > kMaxAttrData || totalBytes < dataSize) return false;
-    std::vector<uint8_t> tmp((size_t)totalBytes);
+    if (mapOff == 0 || mapOff >= hdrCopy.size() || highVcn < lowVcn) return false;
     const uint8_t* r = hdrCopy.data() + mapOff;
     const uint8_t* const rEnd = hdrCopy.data() + hdrCopy.size();
     int64_t vcn = lowVcn;
@@ -541,17 +605,116 @@ bool ReadNonResidentAttr(HANDLE hVol, uint64_t cluster, const std::vector<uint8_
         r += lenb + offb;
         if (first) { lcn = lcnD; first = false; } else { lcn += lcnD; }
         for (int64_t k = 0; k < len; ++k) {
-            const size_t byteOff = (size_t)vcn * cluster;
-            if (byteOff + cluster <= tmp.size()) {
-                ReadVolAt(hVol, (uint64_t)(lcn + k) * cluster, tmp.data() + byteOff,
+            const size_t byteOff = dstOff + (size_t)(vcn - lowVcn) * cluster;
+            if (byteOff + cluster <= out.size()) {
+                ReadVolAt(hVol, (uint64_t)(lcn + k) * cluster, out.data() + byteOff,
                           (DWORD)cluster);
             }
             ++vcn;
         }
     }
+    return true;
+}
+
+// Read the full data of a single non-resident attribute from its stored header
+// copy (used for $ATTRIBUTE_LIST, which is one whole attribute).
+bool ReadNonResidentAttr(HANDLE hVol, uint64_t cluster, const std::vector<uint8_t>& hdrCopy,
+                         std::vector<uint8_t>& out) {
+    if (hdrCopy.size() < 56) return false;
+    const int64_t lowVcn = *reinterpret_cast<const int64_t*>(hdrCopy.data() + 16);
+    const int64_t highVcn = *reinterpret_cast<const int64_t*>(hdrCopy.data() + 24);
+    const uint64_t dataSize = *reinterpret_cast<const uint64_t*>(hdrCopy.data() + 48);
+    if (dataSize == 0 || dataSize > kMaxAttrData || highVcn < lowVcn) return false;
+    const uint64_t totalBytes = (uint64_t)(highVcn - lowVcn + 1) * cluster;
+    if (totalBytes > kMaxAttrData || totalBytes < dataSize) return false;
+    std::vector<uint8_t> tmp((size_t)totalBytes);
+    if (!ReadNonResidentAttrInto(hVol, cluster, hdrCopy, tmp, 0)) return false;
     if (tmp.size() > dataSize) tmp.resize((size_t)dataSize);
     out.swap(tmp);
     return !out.empty();
+}
+
+// Rebuild the full $INDEX_ALLOCATION ($I30) stream of a directory from one or
+// more non-resident attribute header copies -- the base record's inline piece
+// plus any pieces held by extension records ($ATTRIBUTE_LIST redirection). The
+// pieces are merged by VCN: each header covers [lowVcn..highVcn] and its bytes
+// are written into the shared buffer at that VCN position, so a stream split
+// across records is reassembled exactly in the order NTFS stored it. Returns
+// false when a piece cannot be read (caller marks the scan incomplete).
+bool ReadIndexAllocationStream(HANDLE hVol, uint64_t cluster,
+                               const std::vector<std::vector<uint8_t>>& hdrs,
+                               std::vector<uint8_t>& out) {
+    if (hdrs.empty()) return false;
+    struct Piece {
+        int64_t low;
+        int64_t high;
+        const std::vector<uint8_t>* h;
+    };
+    std::vector<Piece> pieces;
+    pieces.reserve(hdrs.size());
+    for (const auto& h : hdrs) {
+        if (h.size() < 56) return false;
+        const int64_t low = *reinterpret_cast<const int64_t*>(h.data() + 16);
+        const int64_t high = *reinterpret_cast<const int64_t*>(h.data() + 24);
+        if (high < low || low < 0) return false;
+        pieces.push_back({low, high, &h});
+    }
+    std::sort(pieces.begin(), pieces.end(),
+              [](const Piece& x, const Piece& y) { return x.low < y.low; });
+    const int64_t minVcn = pieces.front().low;
+    const int64_t maxVcn = pieces.back().high;
+    const uint64_t spanBytes = (uint64_t)(maxVcn - minVcn + 1) * cluster;
+    if (spanBytes > kMaxAttrData) return false;
+    std::vector<uint8_t> tmp((size_t)spanBytes);
+    for (const auto& pc : pieces) {
+        const size_t dstOff = (size_t)(pc.low - minVcn) * cluster;
+        if (!ReadNonResidentAttrInto(hVol, cluster, *pc.h, tmp, dstOff)) return false;
+    }
+    // The real (valid-data) size is stored in the piece that starts at VCN 0.
+    uint64_t realSize = *reinterpret_cast<const uint64_t*>(pieces.front().h->data() + 48);
+    if (realSize > tmp.size()) realSize = tmp.size();
+    if (realSize < tmp.size()) tmp.resize((size_t)realSize);
+    out.swap(tmp);
+    return true;
+}
+
+// Parse the entries of a raw $ATTRIBUTE_LIST (0x20) value -- the bytes of a
+// resident attribute value or the read data of a non-resident one. Entry layout:
+//
+//   +0x00 4 type (attribute type code; 0 = terminator)
+//   +0x04 2 length of this entry
+//   +0x06 1 attribute-name length, in bytes
+//   +0x07 1 attribute-name offset
+//   +0x08 8 lowest VCN (non-resident attributes)
+//   +0x10 8 file reference (record | sequence<<48) of the owning record
+//   +0x18 2 instance
+//
+// Strictly bounded: an entry whose length is <26 or runs past the end of the
+// buffer stops the walk (the remaining tail is not guessed at), as does the
+// terminator (type==0 / length==0). The scan never reads outside `data`.
+bool ParseAttrListData(const uint8_t* p, size_t n, std::vector<MftAttrListEntry>& out) {
+    const uint8_t* const end = p + n;
+    while (p + 26 <= end) {
+        const uint32_t type = *reinterpret_cast<const uint32_t*>(p);
+        const uint16_t len = *reinterpret_cast<const uint16_t*>(p + 4);
+        if (type == 0 || len == 0) break;
+        if (len < 26 || p + len > end) break; // malformed tail: stop, do not guess
+        MftAttrListEntry e;
+        e.type = type;
+        const uint8_t nameLen = p[6];
+        const uint8_t nameOff = p[7];
+        e.lowestVcn = *reinterpret_cast<const int64_t*>(p + 8);
+        const FileRef where = SplitRef(*reinterpret_cast<const uint64_t*>(p + 16));
+        e.record = where.rec;
+        e.sequence = where.seq;
+        if (nameLen && nameLen % 2 == 0 && (size_t)nameOff + nameLen <= len) {
+            const wchar_t* w = reinterpret_cast<const wchar_t*>(p + nameOff);
+            e.name.assign(w, w + nameLen / 2);
+        }
+        out.push_back(std::move(e));
+        p += len;
+    }
+    return true;
 }
 
 } // namespace
@@ -703,17 +866,90 @@ const uint64_t segSize = vd.BytesPerFileRecordSegment;
 
     // ---- Pass A: parse every record ----------------------------------------
     std::vector<RecInfo> recs(nRecords);
+    // Opt-in ground-truth counter: directories whose $I30 was reassembled from
+    // extension records (via base-record reference or $ATTRIBUTE_LIST). Reported
+    // through BV_MFT_DEBUG_FILE; see the regression test.
+    size_t diagExtI30Merged = 0;
     foreachRecord([&](uint64_t recIndex, uint8_t* rec, size_t n) {
         RecInfo& r = recs[recIndex];
         if (!ApplyFixup(rec, n)) return;
         ParseRecord(rec, n, r);
-        if (r.parsed && r.isDir && !r.idxRoot.empty()) {
-            ParseIndexRootValue(r.idxRoot, r.children); // resolve in a second pass below
+        // An extension record (base record reference @+32 != 0) carries
+        // attributes that belong to the base record. Merge its $I30 pieces now:
+        // the base record always has a lower record number, so it was already
+        // parsed, and the sequence check rejects references to a reused record.
+        const FileRef baseRef = SplitRef(*reinterpret_cast<const uint64_t*>(rec + 32));
+        if (baseRef.rec != 0 && baseRef.rec != recIndex && baseRef.rec < nRecords) {
+            RecInfo& base = recs[baseRef.rec];
+            if (base.parsed && base.inUse && base.seq == baseRef.seq) {
+                if (base.idxRoot.empty() && !r.idxRoot.empty()) {
+                    base.idxRoot = r.idxRoot;
+                    base.idxBlockSize = r.idxBlockSize;
+                    ++diagExtI30Merged;
+                }
+                for (const auto& h : r.idxAllocHdrs) {
+                    if (VcnRangeKnown(base.idxAllocHdrs, h)) continue;
+                    base.idxAllocHdrs.push_back(h);
+                    ++diagExtI30Merged;
+                }
+            }
         }
     });
     if (cancelledNow()) {
         CloseHandle(hVol);
         return true; // aborted during the raw MFT sweep
+    }
+
+    // ---- Pass B: follow $ATTRIBUTE_LIST (0x20) ------------------------------
+    // A record whose attributes overflowed its 1KB slot lists them here, each
+    // entry pointing at the record that actually holds the attribute. NTFS
+    // requires the base record to carry an attribute list once ANY attribute
+    // moved to an extension record. A directory's $INDEX_ROOT /
+    // $INDEX_ALLOCATION ($I30) may live entirely in such an extension record,
+    // which is exactly what makes the parser report "directory has no readable
+    // $I30 index" on a perfectly valid volume. Reassemble the $I30 pieces into
+    // the base record's RecInfo here (the Pass A base-record-reference merge is
+    // the order-independent fallback when the list itself is unreadable).
+    // Non-$I30 attributes (SI, FN, SD, $DATA, ...) are deliberately ignored:
+    // they are either parsed inline already or irrelevant to tree reconstruction.
+    for (uint64_t i = 0; i < nRecords; ++i) {
+        if (cancelledNow()) {
+            CloseHandle(hVol);
+            return true;
+        }
+        RecInfo& r = recs[i];
+        if (!r.parsed || !r.inUse) continue;
+        if (r.attrList.empty() && r.attrListHdr.empty()) continue;
+
+        std::vector<uint8_t> listData;
+        if (!r.attrList.empty()) {
+            listData = r.attrList;
+        } else if (!ReadNonResidentAttr(hVol, cluster, r.attrListHdr, listData)) {
+            continue; // cannot follow: the $I30 checks in the walk stay honest
+        }
+        std::vector<MftAttrListEntry> entries;
+        ParseAttrListData(listData.data(), listData.size(), entries);
+        for (const auto& e : entries) {
+            const bool isI30 = e.name.empty() || e.name == L"$I30";
+            if ((e.type == kAttrIndexRoot || e.type == kAttrIndexAlloc) && isI30 &&
+                e.record != i && e.record < nRecords && recs[e.record].parsed &&
+                recs[e.record].inUse && recs[e.record].seq == e.sequence) {
+                const RecInfo& src = recs[e.record];
+                if (e.type == kAttrIndexRoot) {
+                    if (r.idxRoot.empty() && !src.idxRoot.empty()) {
+                        r.idxRoot = src.idxRoot;
+                        r.idxBlockSize = src.idxBlockSize;
+                        ++diagExtI30Merged;
+                    }
+                } else if (!src.idxAllocHdrs.empty()) {
+                    for (const auto& h : src.idxAllocHdrs) {
+                        if (VcnRangeKnown(r.idxAllocHdrs, h)) continue;
+                        r.idxAllocHdrs.push_back(h);
+                        ++diagExtI30Merged;
+                    }
+                }
+            }
+        }
     }
 
     bool incomplete = false;
@@ -816,12 +1052,18 @@ const uint64_t segSize = vd.BytesPerFileRecordSegment;
 
         RecInfo& d = recs[dirRec];
 
-        // Resolve the directory's full $I30 (inline + allocation leaf blocks).
+        // Resolve the directory's full $I30 (root entries + allocation leaf
+        // blocks). The resident root entries are parsed here (not in Pass A) so
+        // that an $INDEX_ROOT merged back from an extension record via
+        // $ATTRIBUTE_LIST is already present when the node is walked.
         if (!d.indexResolved) {
             d.indexResolved = true;
-            if (!d.idxAlloc.empty()) {
+            if (!d.idxRoot.empty()) {
+                ParseIndexRootValue(d.idxRoot, d.children);
+            }
+            if (!d.idxAllocHdrs.empty()) {
                 std::vector<uint8_t> data;
-                if (!ReadNonResidentAttr(hVol, cluster, d.idxAlloc, data)) {
+                if (!ReadIndexAllocationStream(hVol, cluster, d.idxAllocHdrs, data)) {
                     failIncomplete(dirRel, L"directory $INDEX_ALLOCATION unreadable",
                                    dirRec);
                 } else {
@@ -922,18 +1164,38 @@ const uint64_t segSize = vd.BytesPerFileRecordSegment;
     CloseHandle(hVol);
 
     // Opt-in ground-truth diagnostics (BV_MFT_DEBUG_FILE): report how many
-    // $INDEX_ALLOCATION blocks were parsed and how many children were sourced
-    // from directory indexes (as opposed to the parent-pointer union). Used
-    // by the elevated regression test; silent when the variable is not set.
+    // $INDEX_ALLOCATION blocks were parsed, how many children were sourced from
+    // directory indexes (as opposed to the parent-pointer union), and how many
+    // directories needed their $I30 reassembled from extension records via
+    // $ATTRIBUTE_LIST. Used by the elevated regression tests; silent when the
+    // variable is not set.
     if (const std::wstring diagPath = MftDiagFilePath(); !diagPath.empty()) {
         if (FILE* f = _wfopen(diagPath.c_str(), L"a")) {
-            std::fprintf(f, "indxBlocks=%llu indxChildren=%llu\n",
+            std::fprintf(f, "indxBlocks=%llu indxChildren=%llu extI30=%llu\n",
                          (unsigned long long)diagIndexBlocks,
-                         (unsigned long long)diagIndexChildren);
+                         (unsigned long long)diagIndexChildren,
+                         (unsigned long long)diagExtI30Merged);
             std::fclose(f);
         }
     }
     return !incomplete;
+}
+
+bool MftEnumerator::ParseAttributeListForTest(const std::vector<uint8_t>& data,
+                                              std::vector<MftAttrListEntry>& out) {
+    out.clear();
+    if (data.empty()) return true;
+    return ParseAttrListData(data.data(), data.size(), out);
+}
+
+bool MftEnumerator::VcnRangeKnownForTest(
+    const std::vector<std::pair<int64_t, int64_t>>& knownRanges,
+    int64_t low, int64_t high) {
+    if (low > high) return true; // malformed range is treated as already known
+    for (const auto& r : knownRanges) {
+        if (low <= r.second && high >= r.first) return true;
+    }
+    return false;
 }
 
 } // namespace bv

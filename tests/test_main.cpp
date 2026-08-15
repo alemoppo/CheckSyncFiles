@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -1177,6 +1178,157 @@ TEST("mft: large directory reads $INDEX_ALLOCATION blocks (needs admin)", [] {
         std::fclose(f);
     }
     CHECK_MSG(indxBlocks > 0, "$INDEX_ALLOCATION leaf blocks were not exercised");
+});
+
+// ---------------------------------------------------------------------------
+// Audit regression (portable, no volume dependencies): the audited bug was a
+// directory whose $I30 index lives only in an EXTENSION record, referenced
+// from the base record via $ATTRIBUTE_LIST (the real-world "APPUNTI 2019" case:
+// base record 4609 -> extension record 4613). Before the fix the parser
+// reported "directory has no readable $I30 index" and silently dropped the
+// directory's files.
+//
+// That exact layout is produced by ntfs-3g (the Linux packer used by NAS
+// devices) and cannot be created from userland on modern Windows NTFS -- which
+// keeps $INDEX_ROOT resident and splits into leaf blocks instead of
+// externalising it (verified empirically with wide names, near-full records,
+// growth/shrink and large-ACL patterns). The regression is therefore pinned to
+// the parser logic itself, deterministically, on synthetic $ATTRIBUTE_LIST
+// bytes (the two test-only seams below). A second portable test recreates the
+// closest structure Windows CAN produce -- a directory whose index outgrew the
+// resident $INDEX_ROOT and was later shrunk -- asserting MFT == Win32 whenever
+// the volume is raw-readable (otherwise skipped, as every MFT test here).
+
+namespace {
+
+// Push one NTFS $ATTRIBUTE_LIST entry (26-byte header + UTF-16 name) into `buf`.
+void PushAttrListEntry(std::vector<uint8_t>& buf, uint32_t type,
+                       const std::wstring& name, uint64_t record, uint16_t seq,
+                       int64_t lowestVcn) {
+    const size_t start = buf.size();
+    const uint8_t nameBytes = static_cast<uint8_t>(name.size() * 2);
+    const uint16_t len = static_cast<uint16_t>(26 + nameBytes);
+    buf.resize(start + 26 + nameBytes);
+    *reinterpret_cast<uint32_t*>(buf.data() + start) = type;
+    *reinterpret_cast<uint16_t*>(buf.data() + start + 4) = len;
+    buf[start + 6] = nameBytes;
+    buf[start + 7] = 26;
+    *reinterpret_cast<int64_t*>(buf.data() + start + 8) = lowestVcn;
+    *reinterpret_cast<uint64_t*>(buf.data() + start + 16) =
+        record | (static_cast<uint64_t>(seq) << 48);
+    if (nameBytes) std::memcpy(buf.data() + start + 26, name.c_str(), nameBytes);
+}
+
+} // namespace
+
+TEST("mft: $ATTRIBUTE_LIST parser follows an external $I30 (synthetic)", [] {
+    // Recreate the audited attribute list: SI/FN/$DATA stay in the base record
+    // (4609), $INDEX_ROOT [$I30] and $INDEX_ALLOCATION [$I30] moved to the
+    // extension record 4613 (lowestVcn 0 and 4 respectively).
+    std::vector<uint8_t> list;
+    PushAttrListEntry(list, 0x10, L"", 4609, 1, 0);                  // $STANDARD_INFORMATION
+    PushAttrListEntry(list, 0x30, L"", 4609, 1, 0);                  // $FILE_NAME
+    PushAttrListEntry(list, 0x90, L"$I30", 4613, 1, 0);              // $INDEX_ROOT  -> ext
+    PushAttrListEntry(list, 0xA0, L"$I30", 4613, 1, 4);              // $INDEX_ALLOCATION -> ext
+    PushAttrListEntry(list, 0x80, L"", 4609, 1, 0);                  // $DATA
+    list.push_back(0);                                               // terminator
+
+    std::vector<MftAttrListEntry> entries;
+    CHECK(MftEnumerator::ParseAttributeListForTest(list, entries));
+    CHECK_EQ(entries.size(), 5u);
+    CHECK_EQ(entries[0].type, 0x10u);
+    CHECK(entries[0].name.empty());
+    CHECK_EQ(entries[0].record, 4609u);
+    CHECK_EQ(entries[0].sequence, 1u);
+    CHECK_EQ(entries[1].type, 0x30u);
+    CHECK_EQ(entries[2].type, 0x90u);
+    CHECK(entries[2].name == L"$I30");
+    CHECK_EQ(entries[2].record, 4613u);
+    CHECK_EQ(entries[2].sequence, 1u);
+    CHECK_EQ(entries[2].lowestVcn, 0);
+    CHECK_EQ(entries[3].type, 0xA0u);
+    CHECK(entries[3].name == L"$I30");
+    CHECK_EQ(entries[3].record, 4613u);
+    CHECK_EQ(entries[3].lowestVcn, 4);
+    CHECK_EQ(entries[4].type, 0x80u);
+});
+
+TEST("mft: $ATTRIBUTE_LIST parser is bounded on malformed data (synthetic)", [] {
+    // A valid entry followed by a tail that claims more bytes than exist must
+    // stop cleanly (entries so far returned, no overread, no crash).
+    std::vector<uint8_t> list;
+    PushAttrListEntry(list, 0x90, L"$I30", 4613, 1, 0);
+    PushAttrListEntry(list, 0x30, L"", 4609, 1, 0);
+    list.push_back(0x00); // truncated second entry: type present, length missing
+
+    std::vector<MftAttrListEntry> entries;
+    CHECK(MftEnumerator::ParseAttributeListForTest(list, entries));
+    CHECK_EQ(entries.size(), 2u);
+    CHECK_EQ(entries[0].record, 4613u);
+    CHECK_EQ(entries[1].type, 0x30u);
+
+    // Empty list -> no entries, no failure.
+    std::vector<MftAttrListEntry> empty;
+    CHECK(MftEnumerator::ParseAttributeListForTest({}, empty));
+    CHECK(empty.empty());
+
+    // Terminator as first entry -> nothing parsed.
+    std::vector<uint8_t> term(2, 0);
+    std::vector<MftAttrListEntry> t;
+    CHECK(MftEnumerator::ParseAttributeListForTest(term, t));
+    CHECK(t.empty());
+});
+
+TEST("mft: $INDEX_ALLOCATION piece dedupe by VCN range (synthetic)", [] {
+    using Range = std::pair<int64_t, int64_t>;
+    // Adjacent pieces (no overlap) must not be deduped; overlapping ones must.
+    const std::vector<Range> known{{0, 3}, {8, 11}};
+    CHECK(!MftEnumerator::VcnRangeKnownForTest(known, 4, 7));  // gap: new piece
+    CHECK(MftEnumerator::VcnRangeKnownForTest(known, 2, 5));   // overlaps [0,3]
+    CHECK(MftEnumerator::VcnRangeKnownForTest(known, 9, 9));   // inside [8,11]
+    CHECK(MftEnumerator::VcnRangeKnownForTest(known, 11, 14)); // touches [8,11]
+    CHECK(!MftEnumerator::VcnRangeKnownForTest(known, 12, 14));
+    // A malformed range (low > high) is treated as already known (never merged).
+    CHECK(MftEnumerator::VcnRangeKnownForTest(known, 6, 1));
+});
+
+TEST("mft: directory index reassembly across growth and shrink (portable)", [] {
+    // Reproduce the closest structure Windows can create: a directory whose
+    // index outgrew the resident $INDEX_ROOT (leaf blocks) and was later
+    // shrunk -- the same history as the audited APPUNTI 2019 directory, minus
+    // the ntfs-3g externalised-root layout. Exercises the $INDEX_ALLOCATION
+    // stream reassembly the fix rewrote. Skipped when the volume is not raw
+    // readable (the standing convention for every MFT test).
+    const auto dir = MakeTempDir();
+    const std::wstring big = dir + L"\\bigdir";
+    fs::create_directories(big);
+    std::wstring suffix(90, L'z');
+    for (int i = 0; i < 1200; ++i) {
+        wchar_t buf[24];
+        wsprintfW(buf, L"f%04u", static_cast<unsigned>(i));
+        std::ofstream(fs::path(big) / (std::wstring(buf) + suffix + L".txt")).put('x');
+    }
+    // Shrink to a handful of entries (delete all but 8).
+    size_t remaining = 0;
+    for (auto it = fs::directory_iterator(big); it != fs::directory_iterator(); ++it) {
+        if (remaining >= 8) {
+            std::error_code ec;
+            fs::remove(it->path(), ec);
+        } else {
+            ++remaining;
+        }
+    }
+
+    RefSet win;
+    CHECK(EnumerateSet(dir, false, win));
+    RefSet mft;
+    const bool mftOk = EnumerateSet(dir, true, mft);
+    if (!mftOk) {
+        std::wcout << L"  mft non disponibile (processo non elevato), test saltato\n";
+        return;
+    }
+    const size_t diffs = CompareMftVsWin(L"growth-shrink", win, mft);
+    CHECK_MSG(diffs == 0, "mft vs win32 differ on growth/shrink directory");
 });
 
 // ---------------------------------------------------------------------------

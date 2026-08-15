@@ -6,6 +6,19 @@
 
 namespace bv {
 
+// NTFS $ATTRIBUTE_LIST (0x20) entry, as parsed by MftEnumerator. NTFS builds
+// this list on a base record once ANY of its attributes overflow the 1 KB slot
+// (e.g. a directory whose $INDEX_ROOT [$I30] lives in an extension record); each
+// entry names one attribute and the record that actually holds it. Parsed with
+// a strictly bounded scan -- a malformed tail stops the walk, never overreads.
+struct MftAttrListEntry {
+    uint32_t type;        // NTFS attribute type code (e.g. 0x90 $INDEX_ROOT)
+    std::wstring name;    // attribute name ("" for unnamed attributes)
+    uint64_t record;      // referenced MFT record number
+    uint16_t sequence;    // referenced record sequence number
+    int64_t lowestVcn;    // first VCN of a non-resident attribute
+};
+
 // NTFS Master File Table scan (Phase 4).
 //
 // Reads the volume's raw $MFT once and reconstructs the subtree rooted at
@@ -33,6 +46,16 @@ public:
                    const ErrorCallback& onError,
                    const ProgressCallback& onProgress = {},
                    const std::atomic_bool* cancel = nullptr) override;
+
+    // Test-only seams for the $ATTRIBUTE_LIST parser (the logic that resolves a
+    // directory whose $I30 lives in an extension record). They operate on raw
+    // bytes so the parser can be unit-tested deterministically without a live
+    // volume; normal callers should not need them.
+    static bool ParseAttributeListForTest(const std::vector<uint8_t>& data,
+                                          std::vector<MftAttrListEntry>& out);
+    static bool VcnRangeKnownForTest(
+        const std::vector<std::pair<int64_t, int64_t>>& knownRanges,
+        int64_t low, int64_t high);
 };
 
 } // namespace bv
