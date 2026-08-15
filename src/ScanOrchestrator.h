@@ -6,6 +6,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "Comparison/ComparisonResult.h"
 #include "Comparison/ScanMode.h"
@@ -40,6 +41,14 @@ public:
         bool running = false;
         bool resultsReady = false;
         bool cancelled = false; // last run was interrupted by the user
+        // Last run outcome: whether each side was enumerated cleanly (mirrors
+        // ScanReport::sourceOk / destinationOk). False when the side failed or
+        // was cancelled; the UI must then never present the run as completed.
+        bool sourceOk = true;
+        bool destinationOk = true;
+        // User-facing notes from the last run (e.g. back-end fallbacks, or an
+        // incomplete scan explanation). Empty when there is nothing to say.
+        std::vector<std::wstring> notes;
         ScanProgress progress;
         unsigned int threadCountUsed = 0; // hash workers actually launched
         double lastSecondsTotal = 0.0;    // duration of the last completed scan
@@ -145,6 +154,9 @@ private:
     bool lastSnapshotWritten_ = false;
     bool lastUsedSnapshot_ = false;
     bool lastDegraded_ = false;
+    bool sourceOk_ = true;
+    bool destinationOk_ = true;
+    std::vector<std::wstring> notes_;
     uint64_t hashingErrors_ = 0;
     std::wstring lastSnapshotPath_;
     std::wstring statusNote_;

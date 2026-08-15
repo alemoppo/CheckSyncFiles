@@ -224,6 +224,9 @@ ScanOrchestrator::UiSnapshot ScanOrchestrator::snapshot() const {
     s.running = running_;
     s.resultsReady = resultsReady_;
     s.cancelled = cancel_.load();
+    s.sourceOk = sourceOk_;
+    s.destinationOk = destinationOk_;
+    s.notes = notes_;
     s.progress = progress_;
     s.threadCountUsed = threadCountUsed_;
     s.lastSecondsTotal = lastSecondsTotal_;
@@ -255,6 +258,9 @@ void ScanOrchestrator::resetForRunLocked() {
     lastSnapshotWritten_ = false;
     lastUsedSnapshot_ = false;
     lastDegraded_ = false;
+    sourceOk_ = true;
+    destinationOk_ = true;
+    notes_.clear();
     hashingErrors_ = 0;
     statusNote_.clear();
     lastSnapshotPath_.clear();
@@ -278,6 +284,9 @@ void ScanOrchestrator::workerThread(ScanOptions options) {
         lastSnapshotWritten_ = report.snapshotWritten;
         lastUsedSnapshot_ = report.usedSnapshot;
         lastDegraded_ = report.contentDegradedToSize;
+        sourceOk_ = report.sourceOk;
+        destinationOk_ = report.destinationOk;
+        notes_ = report.notes;
         if (lastSnapshotWritten_ && !lastSnapshotPath_.empty()) {
             statusNote_ = L"Snapshot salvato: " + lastSnapshotPath_;
         } else if (lastDegraded_) {
@@ -285,6 +294,18 @@ void ScanOrchestrator::workerThread(ScanOptions options) {
         } else if (lastUsedSnapshot_) {
             statusNote_ = L"Sorgente caricata da snapshot (" +
                           std::to_wstring(results_.stats.sourceFiles) + L" voci).";
+        } else if (!cancel_.load() && (!report.sourceOk || !report.destinationOk)) {
+            // A side could not be scanned completely: surface the reason (the
+            // comparer's notes, e.g. "albero incompleto") instead of an empty
+            // status, so the user is never left believing the run completed.
+            std::wstring reason;
+            for (const std::wstring& n : notes_) {
+                if (!reason.empty()) reason += L"  ";
+                reason += n;
+            }
+            statusNote_ = reason.empty()
+                              ? L"Una o entrambe le radici non sono state scandite completamente."
+                              : reason;
         } else {
             statusNote_.clear();
         }

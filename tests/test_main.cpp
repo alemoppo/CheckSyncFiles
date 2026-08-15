@@ -2968,6 +2968,116 @@ TEST("orchestrator: start, finish, then start again reaps the previous worker (n
     // called std::terminate() during one of the starts above.
 });
 
+TEST("orchestrator: successful live scan exposes both sides as ok", [] {
+    const std::wstring src = MakeTempDir();
+    const std::wstring dst = MakeTempDir();
+    CHECK(WriteFileBytes(src + L"\\a.txt", "aaa", 3));
+    CHECK(WriteFileBytes(dst + L"\\b.txt", "bbb", 3));
+
+    bv::ScanOrchestrator orch;
+    orch.setSource(src);
+    orch.setDest(dst);
+    CHECK(orch.startLiveScan());
+    CHECK_MSG(WaitForRunDone(orch, 5000), "live scan did not finish");
+
+    const auto st = orch.snapshot();
+    CHECK(st.resultsReady);
+    CHECK(!st.cancelled);
+    CHECK(st.sourceOk);
+    CHECK(st.destinationOk);
+});
+
+TEST("orchestrator: failed source is exposed as incomplete, not successful", [] {
+    const std::wstring dir = MakeTempDir();
+    const std::wstring dst = MakeTempDir();
+    CHECK(WriteFileBytes(dst + L"\\b.txt", "bbb", 3));
+    const std::wstring missing = dir + L"\\does_not_exist_source";
+
+    bv::ScanOrchestrator orch;
+    orch.setSource(missing);
+    orch.setDest(dst);
+    CHECK(orch.startLiveScan());
+    CHECK_MSG(WaitForRunDone(orch, 5000), "failed-source scan did not finish");
+
+    const auto st = orch.snapshot();
+    CHECK(st.resultsReady);
+    CHECK(!st.cancelled);
+    CHECK(!st.sourceOk);
+    CHECK(st.destinationOk);
+});
+
+TEST("orchestrator: failed destination is exposed as incomplete, not successful", [] {
+    const std::wstring dir = MakeTempDir();
+    const std::wstring src = MakeTempDir();
+    CHECK(WriteFileBytes(src + L"\\a.txt", "aaa", 3));
+    const std::wstring missing = dir + L"\\does_not_exist_dest";
+
+    bv::ScanOrchestrator orch;
+    orch.setSource(src);
+    orch.setDest(missing);
+    CHECK(orch.startLiveScan());
+    CHECK_MSG(WaitForRunDone(orch, 5000), "failed-destination scan did not finish");
+
+    const auto st = orch.snapshot();
+    CHECK(st.resultsReady);
+    CHECK(!st.cancelled);
+    CHECK(st.sourceOk);
+    CHECK(!st.destinationOk);
+});
+
+TEST("orchestrator: both sides failed is exposed as incomplete, not successful", [] {
+    const std::wstring dir = MakeTempDir();
+    const std::wstring missingA = dir + L"\\does_not_exist_src";
+    const std::wstring missingB = dir + L"\\does_not_exist_dst";
+
+    bv::ScanOrchestrator orch;
+    orch.setSource(missingA);
+    orch.setDest(missingB);
+    CHECK(orch.startLiveScan());
+    CHECK_MSG(WaitForRunDone(orch, 5000), "both-failed scan did not finish");
+
+    const auto st = orch.snapshot();
+    CHECK(st.resultsReady);
+    CHECK(!st.cancelled);
+    CHECK(!st.sourceOk);
+    CHECK(!st.destinationOk);
+});
+
+TEST("orchestrator: cancelled scan stays distinct from failure", [] {
+    const std::wstring src = MakeTempDir();
+    const std::wstring dst = MakeTempDir();
+    CHECK(WriteFileBytes(src + L"\\a.txt", "aaa", 3));
+    CHECK(WriteFileBytes(dst + L"\\b.txt", "bbb", 3));
+
+    bv::ScanOrchestrator orch;
+    orch.setSource(src);
+    orch.setDest(dst);
+
+    // Park the worker in the existing test seam (between its final state update
+    // and notify()), then cancel. The snapshot must then report cancelled
+    // (checked by the UI before the failure/success branches) regardless of the
+    // per-side ok flags. Cancellation itself is exercised deterministically;
+    // the comparer-level cancelled/partial-result behaviour is covered by the
+    // comparer tests (e.g. "cancel mid-content-hash...").
+    std::atomic<bool> workerParked{false};
+    std::promise<void> releaseWorker;
+    std::future<void> releaseFut = releaseWorker.get_future();
+    orch.setBeforeNotifyHook([&] {
+        workerParked.store(true, std::memory_order_release);
+        releaseFut.wait();
+    });
+
+    CHECK(orch.startLiveScan());
+    while (!workerParked.load(std::memory_order_acquire)) std::this_thread::yield();
+    orch.stop();
+    releaseWorker.set_value();
+    CHECK_MSG(WaitForRunDone(orch, 5000), "cancelled scan did not finish");
+
+    const auto st = orch.snapshot();
+    CHECK(st.resultsReady);
+    CHECK_MSG(st.cancelled, "a run stopped by the user must be reported as cancelled");
+});
+
 // ---------------------------------------------------------------------------
 
 int main() {

@@ -964,6 +964,11 @@ void AppUI::render(const bv::ScanOrchestrator::UiSnapshot& st) {
         }
     } else if (st.resultsReady && st.cancelled) {
         status = L"Scansione interrotta dall'utente.";
+    } else if (st.resultsReady && (!st.sourceOk || !st.destinationOk)) {
+        // A side failed or was only partially scanned: the run is NOT complete,
+        // so it must never be presented as a successful comparison.
+        status = L"Scansione incompleta: una o entrambe le radici non sono state "
+                 L"scandite completamente.";
     } else if (st.resultsReady) {
         status = L"Scansione completata.  Velocita: " +
                  FormatRateW(uiResults_.stats.bytesSource, st.lastSecondsTotal);
