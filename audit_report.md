@@ -108,3 +108,80 @@ dopo ogni commit: `cmake --build build` + `ctest --test-dir build --output-on-fa
 
 - Script elevati e probe temporanei fuori repo (`%TEMP%\opencode`).
 - Nessuna modifica ad API pubbliche né ridisegno dell'architettura MFT v2.
+
+---
+
+# Test regressivo portabile `$ATTRIBUTE_LIST → $INDEX_ALLOCATION [$I30]` (dev_parallel_1, non committato)
+
+Regression test **sempre eseguito** (nessun admin/volume) dell'intera catena
+`$ATTRIBUTE_LIST → record di estensione → $INDEX_ALLOCATION non-residente [$I30]
+→ blocchi INDX → children`. Tutti i dati in memoria; il seam
+`ResolveDirectoryForTest` (parametri predefiniti opzionali: `clusters`,
+`clusterSize`, `bytesPerSector`, `outPiecesMerged`) guida **le stesse** funzioni
+di produzione (`MergePassAFromRecord`, `MergePassBFromList`,
+`ReadNonResidentAttr`, `ReadIndexAllocationStream`, `ParseIndexAllocationData`).
+
+## A. Esito
+
+- **PASS** — suite 100/100 (`bin/bv_tests.exe`, eseguita 2 volte di fila) e
+  `ctest --test-dir build --output-on-failure` 1/1 (~20 s). Albero pulito,
+  nessuna mutazione committata.
+
+## B. Percorso di produzione esercitato
+
+Base 4613 (dir, seq 1) con solo `$ATTRIBUTE_LIST` (nessun `$I30` inline).
+Estensione 4609 (base-ref 4613): `$INDEX_ROOT [$I30]` vuoto + `$INDEX_ALLOCATION`
+non-residente VCN 0..0 (blocco leaf con file1/file2). Estensione 4614 (base-ref
+4613): `$INDEX_ALLOCATION` VCN 1..1 (file3/file4). I blocchi INDX vivono in
+`clusters` a LCN 100 (VCN 0) e LCN 60 (VCN 1); la lista menziona VCN 0 due volte.
+`enumerate()` vera e propria: passata solo come riferimento — la catena dati è
+identica, ma non si toccano volumi reali.
+
+## C. Perché Pass A non può falsificare il test
+
+Geometria asimmetrica deliberata: **4609 è sotto la base** (4609 < 4613), quindi
+il merge Pass A (che richiede base già parsata quando si vede l'estensione, ordine
+ascendente per numero record) **non può raggiungerlo** → VCN 0 arriva **solo** via
+Pass B (la lista). **4614 è sopra la base e non è elencato** → VCN 1 arriva **solo**
+via Pass A (base-ref). I due passi sono disgiunti e ciascuno indispensabile.
+
+## D. Record di estensione / VCN coinvolti
+
+| Record | Base-ref | Contenuto | VCN | Solo via |
+|---|---|---|---|---|
+| 4609 | 4613 | `$INDEX_ROOT [$I30]` + `$INDEX_ALLOCATION` VCN 0 (LCN 100) | 0 | Pass B (lista) |
+| 4614 | 4613 | `$INDEX_ALLOCATION` VCN 1 (LCN 60) | 1 | Pass A (base-ref) |
+| 4620–4623 | — | children `file1..file4` (parent 4613) | — | — |
+
+Messa in sequenza: la lista duplica l'entry VCN 0; il reordering a `lowestVcn` di
+`ReadIndexAllocationStream` ricostruisce VCN 0 poi VCN 1.
+
+## E. Mutazioni diagnostiche (ciascuna: fail → restore → suite verde)
+
+| Mut | Modifica | Esito |
+|---|---|---|
+| A | Pass B IA merge disabilitato (`MergePassBFromList`) | **FAIL**: solo VCN 1 (2/4 entries) |
+| B | Pass A IA merge disabilitato (`MergePassAFromRecord`) | **FAIL**: solo VCN 0 (2/4 entries) |
+| A+B | entrambi disabilitati | **FAIL** duro: 0 pieces, 0 entries |
+| C | `ReadIndexAllocationStream` legge solo il primo piece | **FAIL**: mancano C/D (2/4) |
+| D | dedupe disabilitato (`VcnRangeKnown` → false) | **FAIL**: `pieces==3` (duplicato VCN 0) |
+
+## F. Casi non coperti dal nuovo test
+
+- Indice non-residente su **più di 2 pezzi** o con VCN non contigui.
+- `$ATTRIBUTE_LIST` non-residente attraversato via `clusters` (il seam lo
+  supporta: ramo `attrListHdr` non vuoto; non coperto da fixture nuova).
+- Ordini di lista non canonici (VCN alto prima del basso, pezzi sparsi).
+- Indice leaf con più di un blocco per VCN.
+
+## G. Nessun volume reale
+
+Solo memoria: `ResolveDirectoryForTest` con store in-memory; nessun
+`\\.\C:` / E: / D:, nessun path reale, nessun admin richiesto. I test admin
+preesistenti restano skip su processo non elevato.
+
+## H. Albero pulito
+
+`git status --short`: solo `src/Filesystem/MftEnumerator.{cpp,h}` e
+`tests/test_main.cpp` modificati (nessuna mutazione residua, `grep MUTATION`
+vuoto). Build senza nuovi warning.

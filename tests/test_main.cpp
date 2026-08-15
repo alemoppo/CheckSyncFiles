@@ -1489,6 +1489,187 @@ std::map<uint64_t, std::vector<uint8_t>> BuildAuditedFixture() {
     return records;
 }
 
+// ---- $ATTRIBUTE_LIST -> external NON-RESIDENT $INDEX_ALLOCATION fixture ----
+
+// Append one NON-RESIDENT attribute (0x40 header + optional UTF-16 name + a
+// single-run mapping-pairs list) to `rec`. `lcn` is the piece's absolute first
+// LCN (fits one signed byte; run length 1 cluster); lowVcn..highVcn is the
+// piece's VCN range; `dataSize` is the attribute's logical data length -- the
+// VCN-0 extent carries the WHOLE stream's size, as NTFS does for a split
+// attribute (ReadIndexAllocationStream reads the real size from the VCN-0
+// piece's header).
+void AppendNonResidentAttr(std::vector<uint8_t>& rec, uint32_t type,
+                           const std::wstring& name, int64_t lowVcn, int64_t highVcn,
+                           uint32_t lcn, uint64_t dataSize) {
+    const uint32_t nameBytes = static_cast<uint32_t>(name.size() * 2);
+    const uint32_t mapOff = 0x40 + nameBytes;
+    const uint32_t len = mapOff + 4; // header + name + 1-run list + terminator
+    const size_t start = rec.size();
+    rec.resize(start + len, 0);
+    *reinterpret_cast<uint32_t*>(rec.data() + start) = type;
+    *reinterpret_cast<uint32_t*>(rec.data() + start + 4) = len;
+    rec[start + 8] = 0x40; // non-resident form code
+    rec[start + 9] = static_cast<uint8_t>(name.size());
+    *reinterpret_cast<uint16_t*>(rec.data() + start + 10) = 0x40; // name offset
+    *reinterpret_cast<int64_t*>(rec.data() + start + 0x10) = lowVcn;
+    *reinterpret_cast<int64_t*>(rec.data() + start + 0x18) = highVcn;
+    *reinterpret_cast<uint16_t*>(rec.data() + start + 0x20) = static_cast<uint16_t>(mapOff);
+    *reinterpret_cast<uint64_t*>(rec.data() + start + 0x28) =
+        static_cast<uint64_t>(highVcn - lowVcn + 1) * 4096; // allocated size
+    *reinterpret_cast<uint64_t*>(rec.data() + start + 0x30) = dataSize; // real size
+    *reinterpret_cast<uint64_t*>(rec.data() + start + 0x38) = dataSize; // valid data
+    if (nameBytes) std::memcpy(rec.data() + start + 0x40, name.c_str(), nameBytes);
+    uint8_t* mp = rec.data() + start + mapOff;
+    mp[0] = 0x11;                    // lenb=1, offb=1
+    mp[1] = 1;                       // run length: 1 cluster
+    mp[2] = static_cast<uint8_t>(lcn);
+    mp[3] = 0x00;                    // end of mapping pairs
+}
+
+// Resident $INDEX_ROOT [$I30] value with an EMPTY root node: every child lives
+// in the $INDEX_ALLOCATION leaves. Carries the directory's index_block_size.
+std::vector<uint8_t> BuildEmptyIndexRootValue() {
+    std::vector<uint8_t> v(0x30, 0);
+    *reinterpret_cast<uint32_t*>(v.data() + 0) = 0x30; // indexed attr: $FILE_NAME
+    *reinterpret_cast<uint32_t*>(v.data() + 4) = 0x01; // collation: FILENAME
+    *reinterpret_cast<uint32_t*>(v.data() + 8) = 4096; // index_block_size
+    *reinterpret_cast<uint32_t*>(v.data() + 12) = 1;   // clusters_per_index_block
+    *reinterpret_cast<uint32_t*>(v.data() + 16) = 16;  // entries offset (rel. INDEX_HEADER)
+    *reinterpret_cast<uint32_t*>(v.data() + 20) = 16;  // index_length: just the marker
+    *reinterpret_cast<uint16_t*>(v.data() + 0x28) = 16;     // marker elen
+    *reinterpret_cast<uint16_t*>(v.data() + 0x2A) = 0;      // marker klen
+    *reinterpret_cast<uint16_t*>(v.data() + 0x2C) = 0x0002; // marker flags: last entry
+    return v;
+}
+
+// A 4096-byte $INDEX_ALLOCATION INDX leaf block holding `entries`. The block
+// carries a valid USA fixup: every 512-byte sector tail holds the USN (0xFFFF)
+// and the true bytes live in the update-sequence array at 0x28, so
+// UndoFixupIndexBlock accepts it and restores the tails. The INDEX_HEADER sits
+// at block+0x18 as the production parser expects.
+std::vector<uint8_t> BuildIndxBlock(
+    uint64_t vcn, const std::vector<std::pair<uint64_t, std::wstring>>& entries) {
+    std::vector<uint8_t> b(4096, 0);
+    std::memcpy(b.data(), "INDX", 4);
+    *reinterpret_cast<uint16_t*>(b.data() + 4) = 0x28; // usa_ofs
+    *reinterpret_cast<uint16_t*>(b.data() + 6) = 9;    // usa_count (USN + 8 sectors)
+    *reinterpret_cast<uint64_t*>(b.data() + 0x10) = vcn; // index block VCN
+    *reinterpret_cast<uint16_t*>(b.data() + 0x28) = 0xFFFF; // USN
+    for (uint32_t i = 1; i <= 8; ++i) {
+        *reinterpret_cast<uint16_t*>(b.data() + i * 512 - 2) = 0xFFFF;
+    }
+    *reinterpret_cast<uint32_t*>(b.data() + 0x18) = 0x28; // entries offset (rel. node)
+    size_t nodeLen = 0x28;
+    size_t pos = 0x40;
+    const auto addEntry = [&](uint64_t childRef, const std::wstring& name, uint16_t flags) {
+        std::vector<uint8_t> key(66, 0);
+        key[64] = static_cast<uint8_t>(name.size());
+        key[65] = 1; // WIN32 namespace
+        const size_t keyOff = key.size();
+        key.resize(keyOff + name.size() * 2);
+        std::memcpy(key.data() + keyOff, name.c_str(), name.size() * 2);
+        const uint16_t klen = static_cast<uint16_t>(key.size());
+        const uint16_t elen = static_cast<uint16_t>(16 + klen);
+        *reinterpret_cast<uint64_t*>(b.data() + pos) = childRef;
+        *reinterpret_cast<uint16_t*>(b.data() + pos + 8) = elen;
+        *reinterpret_cast<uint16_t*>(b.data() + pos + 10) = klen;
+        *reinterpret_cast<uint16_t*>(b.data() + pos + 12) = flags;
+        std::memcpy(b.data() + pos + 16, key.data(), klen);
+        pos += elen;
+        nodeLen += elen;
+    };
+    for (const auto& e : entries) addEntry(e.first, e.second, 0);
+    addEntry(0, L"", 0x0002); // end-of-node marker
+    *reinterpret_cast<uint32_t*>(b.data() + 0x1C) = static_cast<uint32_t>(nodeLen);
+    *reinterpret_cast<uint32_t*>(b.data() + 0x20) = static_cast<uint32_t>(nodeLen);
+    return b;
+}
+
+// Base record 4613's $ATTRIBUTE_LIST for the external-$INDEX_ALLOCATION layout:
+// the $I30 index root lives in extension 4609, the VCN-0 $INDEX_ALLOCATION piece
+// lives in extension 4609 too (BELOW the base, so Pass A's ascending merge
+// cannot reach it -- VCN 0 is reachable ONLY through this list, i.e. Pass B).
+// The VCN-0 piece is listed TWICE so the test can prove VcnRangeKnown dedupes
+// real duplicates instead of merging a second copy. VCN 1 (extension 4614, ABOVE
+// the base) is NOT listed: it is reachable ONLY via Pass A's base-record-ref
+// merge. The two merge passes are therefore each indispensable and disjoint --
+// disabling either one leaves exactly half the tree.
+std::vector<uint8_t> BuildExternalIaList() {
+    std::vector<uint8_t> list;
+    PushAttrListEntry(list, 0x10, L"", 4613, 1, 0);     // $STANDARD_INFORMATION
+    PushAttrListEntry(list, 0x30, L"", 4613, 1, 0);     // $FILE_NAME
+    PushAttrListEntry(list, 0x90, L"$I30", 4609, 1, 0); // $INDEX_ROOT -> extension 4609
+    PushAttrListEntry(list, 0xA0, L"$I30", 4609, 1, 0); // $INDEX_ALLOCATION VCN 0
+    PushAttrListEntry(list, 0xA0, L"$I30", 4609, 1, 0); // duplicate VCN 0 entry
+    PushAttrListEntry(list, 0x80, L"", 4613, 1, 0);     // $DATA
+    list.push_back(0); // terminator
+    return list;
+}
+
+struct ExternalIaFixture {
+    std::map<uint64_t, std::vector<uint8_t>> records;
+    std::vector<uint8_t> clusters; // in-memory "volume": INDX blocks by LCN
+};
+
+// Records + INDX data of the external NON-RESIDENT $INDEX_ALLOCATION layout.
+//
+//   base 4613 (dir, seq 1): $ATTRIBUTE_LIST only, NO inline $I30
+//      |-- ext 4609 (base-ref 4613, seq 1): $INDEX_ROOT [$I30] (empty root)
+//      |     + $INDEX_ALLOCATION [$I30] VCN 0..0 (leaf block: file1/file2)
+//      `-- ext 4614 (base-ref 4613, seq 1): $INDEX_ALLOCATION [$I30] VCN 1..1
+//            (leaf block: file3/file4)
+//
+// Deliberate, documented asymmetry: ext 4609 sits BELOW the base, so Pass A's
+// ascending-order merge (the base must already be parsed when its extension is
+// seen) cannot reach it -- VCN 0 is reachable ONLY through the $ATTRIBUTE_LIST
+// (Pass B). ext 4614 sits ABOVE the base and is NOT listed, so VCN 1 is
+// reachable ONLY through Pass A's base-record-reference merge. The two passes
+// are disjoint and each indispensable: disabling either one leaves exactly half
+// the tree (the fixture cannot be "saved" by the other pass). Children are
+// plain files 4620..4623; the leaf blocks live in `clusters` at LCN 100 (VCN 0)
+// and LCN 60 (VCN 1).
+ExternalIaFixture BuildExternalIaFixture() {
+    ExternalIaFixture fx;
+
+    auto base = BuildFileRecord(4613, 1, 0x0003, 0); // in use + directory
+    AppendResidentAttr(base, 0x30, L"", BuildFileNameValue(4600, 1, L"EXT_IA_DIR", 1));
+    AppendResidentAttr(base, 0x20, L"", BuildExternalIaList());
+    FinishRecord(base);
+    fx.records[4613] = std::move(base);
+
+    auto extLow = BuildFileRecord(4609, 1, 0x0003, 4613ull | (1ull << 48));
+    AppendResidentAttr(extLow, 0x90, L"$I30", BuildEmptyIndexRootValue());
+    AppendNonResidentAttr(extLow, 0xA0, L"$I30", 0, 0, 100, 8192);
+    FinishRecord(extLow);
+    fx.records[4609] = std::move(extLow);
+
+    auto extHigh = BuildFileRecord(4614, 1, 0x0003, 4613ull | (1ull << 48));
+    AppendNonResidentAttr(extHigh, 0xA0, L"$I30", 1, 1, 60, 8192);
+    FinishRecord(extHigh);
+    fx.records[4614] = std::move(extHigh);
+
+    const auto mkFile = [&](uint64_t recNo, const wchar_t* name) {
+        auto r = BuildFileRecord(recNo, 1, 0x0001, 0);
+        AppendResidentAttr(r, 0x30, L"", BuildFileNameValue(4613, 1, name, 1));
+        FinishRecord(r);
+        fx.records[recNo] = std::move(r);
+    };
+    mkFile(4620, L"file1.txt");
+    mkFile(4621, L"file2.txt");
+    mkFile(4622, L"file3.txt");
+    mkFile(4623, L"file4.txt");
+
+    const uint32_t kCluster = 4096;
+    fx.clusters.assign(512 * kCluster, 0);
+    auto blk0 = BuildIndxBlock(0, {{4620ull | (1ull << 48), L"file1.txt"},
+                                   {4621ull | (1ull << 48), L"file2.txt"}});
+    std::memcpy(fx.clusters.data() + 100 * kCluster, blk0.data(), blk0.size());
+    auto blk1 = BuildIndxBlock(1, {{4622ull | (1ull << 48), L"file3.txt"},
+                                   {4623ull | (1ull << 48), L"file4.txt"}});
+    std::memcpy(fx.clusters.data() + 60 * kCluster, blk1.data(), blk1.size());
+    return fx;
+}
+
 } // namespace
 
 TEST("mft: external $I30 via $ATTRIBUTE_LIST resolves children (in-memory fixture)", [] {
@@ -1522,6 +1703,95 @@ TEST("mft: external $I30 via $ATTRIBUTE_LIST resolves children (in-memory fixtur
     CHECK(!MftEnumerator::ResolveDirectoryForTest(broken, 4609, empty, brokenIncomplete));
     CHECK(brokenIncomplete);
     CHECK(empty.empty());
+});
+
+TEST("mft: $ATTRIBUTE_LIST external $INDEX_ALLOCATION [$I30] is merged", [] {
+    // The full $ATTRIBUTE_LIST -> external NON-RESIDENT $INDEX_ALLOCATION chain:
+    // base 4613 carries only the list; extension 4609 holds the (empty) root
+    // and the VCN-0 leaf, extension 4614 the VCN-1 leaf. The seam drives the
+    // SAME production merge (MergePassAFromRecord / MergePassBFromList) and the
+    // real index reconstruction (ReadIndexAllocationStream +
+    // ParseIndexAllocationData); all data is in memory, no volume access.
+    auto fx = BuildExternalIaFixture();
+    std::vector<std::pair<std::wstring, uint64_t>> entries;
+    bool incomplete = false;
+    size_t pieces = 999;
+    const bool resolved = MftEnumerator::ResolveDirectoryForTest(
+        fx.records, 4613, entries, incomplete, &fx.clusters, 4096, 512, &pieces);
+    CHECK(resolved);
+    CHECK(!incomplete);
+    if (!resolved || incomplete) return;
+    // Dedupe observable: VCN 0 is referenced TWICE in the list (and VCN 1 once
+    // by Pass A) -- yet only ONE piece per VCN range reaches the stream, so
+    // exactly two distinct pieces are merged.
+    CHECK_EQ(pieces, 2u);
+    // Every child from both leaf blocks is present exactly once: VCN 0
+    // contributed file1/file2, VCN 1 file3/file4. The merged pieces arrive in
+    // NON-VCN order (Pass A runs before Pass B, so VCN 1 is pushed first), so
+    // the reassembly is only complete if the stream is rebuilt by lowestVcn --
+    // never by record/list order and never just the first piece.
+    CHECK_EQ(entries.size(), 4u);
+    if (entries.size() != 4) return;
+    CHECK(entries[0].first == L"file1.txt");
+    CHECK_EQ(entries[0].second, 4620u);
+    CHECK(entries[1].first == L"file2.txt");
+    CHECK_EQ(entries[1].second, 4621u);
+    CHECK(entries[2].first == L"file3.txt");
+    CHECK_EQ(entries[2].second, 4622u);
+    CHECK(entries[3].first == L"file4.txt");
+    CHECK_EQ(entries[3].second, 4623u);
+    // No child is emitted twice (a duplicated piece must not duplicate a child).
+    for (size_t i = 0; i < entries.size(); ++i) {
+        for (size_t j = i + 1; j < entries.size(); ++j) {
+            CHECK(entries[i].second != entries[j].second);
+        }
+    }
+});
+
+TEST("mft: $ATTRIBUTE_LIST referencing a bad extension is not silently complete", [] {
+    // A malformed follow must never yield a directory that LOOKS complete: the
+    // seam must report incompleteness. Two corruptions: a wrong sequence number
+    // and a reference to a nonexistent record. In both, the only $I30 source is
+    // extension 4609 BELOW the base (Pass A's ascending-order merge cannot reach
+    // it), so a rejected list entry leaves the directory with no readable $I30.
+    const auto baseWithList = [&](std::vector<uint8_t> list) {
+        std::map<uint64_t, std::vector<uint8_t>> records;
+        auto base = BuildFileRecord(4613, 1, 0x0003, 0);
+        AppendResidentAttr(base, 0x30, L"", BuildFileNameValue(4600, 1, L"EXT_IA_DIR", 1));
+        list.push_back(0);
+        AppendResidentAttr(base, 0x20, L"", list);
+        FinishRecord(base);
+        records[4613] = std::move(base);
+        auto ext = BuildFileRecord(4609, 1, 0x0003, 4613ull | (1ull << 48));
+        AppendResidentAttr(ext, 0x90, L"$I30", BuildEmptyIndexRootValue());
+        AppendNonResidentAttr(ext, 0xA0, L"$I30", 0, 0, 100, 4096);
+        FinishRecord(ext);
+        records[4609] = std::move(ext);
+        return records;
+    };
+
+    // Wrong sequence number on every $I30 entry: the follow rejects the piece
+    // (the live record's sequence 1 != the listed 2).
+    std::vector<uint8_t> wrongSeq;
+    PushAttrListEntry(wrongSeq, 0x90, L"$I30", 4609, 2, 0);
+    PushAttrListEntry(wrongSeq, 0xA0, L"$I30", 4609, 2, 0);
+    auto r1 = baseWithList(wrongSeq);
+    std::vector<std::pair<std::wstring, uint64_t>> e1;
+    bool inc1 = false;
+    CHECK(!MftEnumerator::ResolveDirectoryForTest(r1, 4613, e1, inc1));
+    CHECK(inc1);
+    CHECK(e1.empty());
+
+    // Nonexistent record: the follow must not guess at the missing piece.
+    std::vector<uint8_t> missing;
+    PushAttrListEntry(missing, 0x90, L"$I30", 4700, 1, 0);
+    PushAttrListEntry(missing, 0xA0, L"$I30", 4700, 1, 0);
+    auto r2 = baseWithList(missing);
+    std::vector<std::pair<std::wstring, uint64_t>> e2;
+    bool inc2 = false;
+    CHECK(!MftEnumerator::ResolveDirectoryForTest(r2, 4613, e2, inc2));
+    CHECK(inc2);
+    CHECK(e2.empty());
 });
 
 // ---------------------------------------------------------------------------

@@ -73,13 +73,26 @@ public:
     // protected, as read from the volume). `dirRec` is the base record number of
     // the directory. Out: emitted (relativePath, recordNumber) pairs for the
     // directory's children, and `outIncomplete` mirroring enumerate()'s honesty
-    // rule (true when a $I30 child could not be resolved). No volume I/O is
-    // performed, so fixture records must keep the directory's $I30 resident
-    // ($INDEX_ROOT only, no $INDEX_ALLOCATION leaf data).
+    // rule (true when a $I30 child could not be resolved).
+    //
+    // Non-resident $I30 payloads are read from `clusters`, an in-memory stand-in
+    // for the volume: INDX leaf blocks are placed at absolute byte offsets
+    // LCN * clusterSize, and the SAME ReadIndexAllocationStream /
+    // ReadNonResidentAttr code a real scan drives through the volume HANDLE
+    // fetches them. Pass clusterSize/bytesPerSector matching the fixture
+    // geometry (defaults 4096/512). When `clusters` is null the seam only
+    // resolves resident $INDEX_ROOT data (its original behaviour).
+    //
+    // `outPiecesMerged` (optional) receives the number of distinct
+    // $INDEX_ALLOCATION pieces merged into the directory -- the same dedupe
+    // observable the production merge counts -- so a test can assert a
+    // duplicate reference (Pass A base-ref plus Pass B list follow) added no
+    // extra copy.
     static bool ResolveDirectoryForTest(
         const std::map<uint64_t, std::vector<uint8_t>>& records, uint64_t dirRec,
-        std::vector<std::pair<std::wstring, uint64_t>>& outEntries,
-        bool& outIncomplete);
+        std::vector<std::pair<std::wstring, uint64_t>>& outEntries, bool& outIncomplete,
+        const std::vector<uint8_t>* clusters = nullptr, uint32_t clusterSize = 4096,
+        uint32_t bytesPerSector = 512, size_t* outPiecesMerged = nullptr);
 };
 
 } // namespace bv

@@ -579,7 +579,11 @@ size_t ParseIndexAllocationData(std::vector<uint8_t>& data, size_t blockSize,
 
 // Read the clusters of a non-resident attribute's data runs into `out` starting
 // at byte offset `dstOff`. `out` must already be sized for the whole stream.
-bool ReadNonResidentAttrInto(HANDLE hVol, uint64_t cluster,
+// Bytes are fetched through `read(absByteOffset, dst, len)` so the SAME
+// runlist decode serves the volume path (enumerate()) and the in-memory test
+// seam: the seam feeds raw fixture bytes, the scan feeds a volume HANDLE.
+template <typename RawReader>
+bool ReadNonResidentAttrInto(const RawReader& read, uint64_t cluster,
                              const std::vector<uint8_t>& hdrCopy,
                              std::vector<uint8_t>& out, size_t dstOff) {
     if (hdrCopy.size() < 56) return false;
@@ -608,8 +612,7 @@ bool ReadNonResidentAttrInto(HANDLE hVol, uint64_t cluster,
         for (int64_t k = 0; k < len; ++k) {
             const size_t byteOff = dstOff + (size_t)(vcn - lowVcn) * cluster;
             if (byteOff + cluster <= out.size()) {
-                ReadVolAt(hVol, (uint64_t)(lcn + k) * cluster, out.data() + byteOff,
-                          (DWORD)cluster);
+                read((uint64_t)(lcn + k) * cluster, out.data() + byteOff, (size_t)cluster);
             }
             ++vcn;
         }
@@ -619,8 +622,9 @@ bool ReadNonResidentAttrInto(HANDLE hVol, uint64_t cluster,
 
 // Read the full data of a single non-resident attribute from its stored header
 // copy (used for $ATTRIBUTE_LIST, which is one whole attribute).
-bool ReadNonResidentAttr(HANDLE hVol, uint64_t cluster, const std::vector<uint8_t>& hdrCopy,
-                         std::vector<uint8_t>& out) {
+template <typename RawReader>
+bool ReadNonResidentAttr(const RawReader& read, uint64_t cluster,
+                         const std::vector<uint8_t>& hdrCopy, std::vector<uint8_t>& out) {
     if (hdrCopy.size() < 56) return false;
     const int64_t lowVcn = *reinterpret_cast<const int64_t*>(hdrCopy.data() + 16);
     const int64_t highVcn = *reinterpret_cast<const int64_t*>(hdrCopy.data() + 24);
@@ -629,7 +633,7 @@ bool ReadNonResidentAttr(HANDLE hVol, uint64_t cluster, const std::vector<uint8_
     const uint64_t totalBytes = (uint64_t)(highVcn - lowVcn + 1) * cluster;
     if (totalBytes > kMaxAttrData || totalBytes < dataSize) return false;
     std::vector<uint8_t> tmp((size_t)totalBytes);
-    if (!ReadNonResidentAttrInto(hVol, cluster, hdrCopy, tmp, 0)) return false;
+    if (!ReadNonResidentAttrInto(read, cluster, hdrCopy, tmp, 0)) return false;
     if (tmp.size() > dataSize) tmp.resize((size_t)dataSize);
     out.swap(tmp);
     return !out.empty();
@@ -642,7 +646,8 @@ bool ReadNonResidentAttr(HANDLE hVol, uint64_t cluster, const std::vector<uint8_
 // are written into the shared buffer at that VCN position, so a stream split
 // across records is reassembled exactly in the order NTFS stored it. Returns
 // false when a piece cannot be read (caller marks the scan incomplete).
-bool ReadIndexAllocationStream(HANDLE hVol, uint64_t cluster,
+template <typename RawReader>
+bool ReadIndexAllocationStream(const RawReader& read, uint64_t cluster,
                                const std::vector<std::vector<uint8_t>>& hdrs,
                                std::vector<uint8_t>& out) {
     if (hdrs.empty()) return false;
@@ -669,7 +674,7 @@ bool ReadIndexAllocationStream(HANDLE hVol, uint64_t cluster,
     std::vector<uint8_t> tmp((size_t)spanBytes);
     for (const auto& pc : pieces) {
         const size_t dstOff = (size_t)(pc.low - minVcn) * cluster;
-        if (!ReadNonResidentAttrInto(hVol, cluster, *pc.h, tmp, dstOff)) return false;
+        if (!ReadNonResidentAttrInto(read, cluster, *pc.h, tmp, dstOff)) return false;
     }
     // The real (valid-data) size is stored in the piece that starts at VCN 0.
     uint64_t realSize = *reinterpret_cast<const uint64_t*>(pieces.front().h->data() + 48);
@@ -861,6 +866,14 @@ const uint64_t segSize = vd.BytesPerFileRecordSegment;
     FlushFileBuffers(hVol);
     const uint64_t nRecords = mftBytes / segSize;
 
+    // Raw reader for attribute payloads: the $ATTRIBUTE_LIST and $INDEX_ALLOCATION
+    // read path (ReadNonResidentAttr / ReadIndexAllocationStream) fetches bytes
+    // through this so the in-memory test seam can drive the SAME code with
+    // fixture bytes instead of a volume HANDLE.
+    const auto rawReader = [&](uint64_t off, uint8_t* dst, size_t len) {
+        return ReadVolAt(hVol, off, dst, (DWORD)len);
+    };
+
     // ---- $MFT data-run map from record 0 (fragmentation-aware) -------------
     std::vector<uint8_t> rec0((size_t)segSize);
     if (!ReadVolAt(hVol, mftStartBytes, rec0.data(), (DWORD)segSize) ||
@@ -972,7 +985,7 @@ const uint64_t segSize = vd.BytesPerFileRecordSegment;
         std::vector<uint8_t> listData;
         if (!r.attrList.empty()) {
             listData = r.attrList;
-        } else if (!ReadNonResidentAttr(hVol, cluster, r.attrListHdr, listData)) {
+        } else if (!ReadNonResidentAttr(rawReader, cluster, r.attrListHdr, listData)) {
             continue; // cannot follow: the $I30 checks in the walk stay honest
         }
         MergePassBFromList(recs, i, r, listData, diagExtI30Merged);
@@ -1089,7 +1102,7 @@ const uint64_t segSize = vd.BytesPerFileRecordSegment;
             }
             if (!d.idxAllocHdrs.empty()) {
                 std::vector<uint8_t> data;
-                if (!ReadIndexAllocationStream(hVol, cluster, d.idxAllocHdrs, data)) {
+                if (!ReadIndexAllocationStream(rawReader, cluster, d.idxAllocHdrs, data)) {
                     failIncomplete(dirRel, L"directory $INDEX_ALLOCATION unreadable",
                                    dirRec);
                 } else {
@@ -1226,14 +1239,31 @@ bool MftEnumerator::VcnRangeKnownForTest(
 
 bool MftEnumerator::ResolveDirectoryForTest(
     const std::map<uint64_t, std::vector<uint8_t>>& records, uint64_t dirRec,
-    std::vector<std::pair<std::wstring, uint64_t>>& outEntries,
-    bool& outIncomplete) {
+    std::vector<std::pair<std::wstring, uint64_t>>& outEntries, bool& outIncomplete,
+    const std::vector<uint8_t>* clusters, uint32_t clusterSize, uint32_t bytesPerSector,
+    size_t* outPiecesMerged) {
     outEntries.clear();
     outIncomplete = false;
     if (records.empty()) return false;
     const uint64_t nRecords = records.rbegin()->first + 1;
     std::vector<RecInfo> recs(nRecords);
     size_t diag = 0; // merge counter (not reported by the seam)
+
+    // In-memory stand-in for the raw volume reads: the fixture's non-resident
+    // payloads (INDX blocks, a non-resident $ATTRIBUTE_LIST) are placed at
+    // absolute byte offsets (LCN * clusterSize) in `clusters` and fetched by
+    // the SAME runlist-decode / stream-reassembly code a real scan drives
+    // through ReadVolAt. When `clusters` is null the seam behaves as before
+    // (resident $INDEX_ROOT only, no non-resident payload reads).
+    const auto memReader = [&](uint64_t off, uint8_t* dst, size_t len) -> bool {
+        if (clusters == nullptr || off > clusters->size() || len > clusters->size() - off) {
+            if (len) std::memset(dst, 0, len);
+            return false;
+        }
+        std::memcpy(dst, clusters->data() + off, len);
+        return true;
+    };
+
     for (const auto& [recNo, bytes] : records) {
         if (recNo >= nRecords) continue;
         // ApplyFixup mutates its buffer, so parse from a private copy; the
@@ -1246,22 +1276,59 @@ bool MftEnumerator::ResolveDirectoryForTest(
         // so the base is already parsed when its extension is merged.
         MergePassAFromRecord(recs, recNo, work.data(), diag);
     }
-    // Pass B: follow each record's $ATTRIBUTE_LIST. The seam has no volume, so
-    // only resident lists are followed (the non-resident read is generic
-    // infrastructure already covered by the real-volume tests); the MERGE the
-    // seam guards is identical in both cases.
+    // Pass B: follow each record's $ATTRIBUTE_LIST -- resident, or non-resident
+    // through the in-memory store (the same ReadNonResidentAttr the scan uses).
     for (uint64_t i = 0; i < nRecords; ++i) {
         RecInfo& r = recs[i];
         if (!r.parsed || !r.inUse) continue;
-        if (r.attrList.empty()) continue;
-        MergePassBFromList(recs, i, r, r.attrList, diag);
+        if (r.attrList.empty() && r.attrListHdr.empty()) continue;
+        std::vector<uint8_t> listData;
+        if (!r.attrList.empty()) {
+            listData = r.attrList;
+        } else if (clusters == nullptr ||
+                   !ReadNonResidentAttr(memReader, clusterSize, r.attrListHdr, listData)) {
+            continue; // cannot follow: the $I30 checks in the walk stay honest
+        }
+        MergePassBFromList(recs, i, r, listData, diag);
     }
 
-    // Mirror the walk's $I30 resolution for the target directory (resident
-    // $INDEX_ROOT only: no volume I/O, so no $INDEX_ALLOCATION stream).
+    // The number of distinct $INDEX_ALLOCATION pieces merged into the target
+    // directory (same dedupe observable production tracks). A duplicate
+    // reference -- Pass A base-ref merge plus Pass B attribute-list follow, or
+    // a duplicated list entry -- must add NO new piece, so the test can assert
+    // the dedupe really happened instead of only eyeballing the children.
+    if (outPiecesMerged) {
+        *outPiecesMerged = (dirRec < nRecords) ? recs[dirRec].idxAllocHdrs.size() : 0u;
+    }
+
+    // Mirror the walk's $I30 resolution: resident root entries, then the
+    // $INDEX_ALLOCATION leaf stream reassembled across extension records.
     RecInfo& d = recs[dirRec];
     if (!d.parsed || !d.inUse) { outIncomplete = true; return false; }
     if (!d.idxRoot.empty()) ParseIndexRootValue(d.idxRoot, d.children);
+    if (!d.idxAllocHdrs.empty()) {
+        if (clusters == nullptr) {
+            // No in-memory store: an external $INDEX_ALLOCATION cannot be read,
+            // so the directory is reported incomplete, exactly as enumerate()
+            // would on an unreadable $I30. Never a silent partial tree.
+            outIncomplete = true;
+            return false;
+        }
+        std::vector<uint8_t> data;
+        if (!ReadIndexAllocationStream(memReader, clusterSize, d.idxAllocHdrs, data)) {
+            outIncomplete = true; // mirror "$INDEX_ALLOCATION unreadable"
+            return false;
+        }
+        const size_t blk = (d.idxBlockSize >= kMinIndexBlockSize &&
+                            d.idxBlockSize <= kMaxIndexBlockSize)
+                               ? d.idxBlockSize
+                               : kIndexBlockSizeDefault;
+        const size_t parsed = ParseIndexAllocationData(data, blk, bytesPerSector, d.children);
+        if (parsed == SIZE_MAX) {
+            outIncomplete = true; // mirror "$INDEX_ALLOCATION block corrupt"
+            return false;
+        }
+    }
     if (d.children.empty() && d.idxRoot.empty()) {
         outIncomplete = true; // "directory has no readable $I30 index"
         return false;
