@@ -2245,6 +2245,7 @@ TEST("mft: cancellation propagates through WalkDirectoryStep -> caller (clean st
     }
 });
 
+
 // ---------------------------------------------------------------------------
 // Phase 5: export CSV/JSON, binary snapshot, hash cache, offline compare
 
@@ -4217,6 +4218,127 @@ TEST("orchestrator: cancelled scan stays distinct from failure", [] {
 });
 
 // ---------------------------------------------------------------------------
+// Phase 5: ADS size filtering tests
+
+// Helper: append a resident $DATA attribute to a record.
+// `name` is the attribute name (empty = unnamed $DATA, e.g. L"Zone.Identifier" for ADS).
+// The $DATA value layout (resident): offset +16 from attribute start contains the
+// value length (valueLen), and ParseRecord reads this as out.dataSize.
+// We set up the attribute so that at offset +16, valueLen = dataSize.
+static void AppendResidentDataAttr(std::vector<uint8_t>& rec, uint32_t type,
+                                    const std::wstring& name, uint32_t dataSize) {
+    const uint32_t nameBytes = static_cast<uint32_t>(name.size() * 2);
+    // valueLength field at offset +16 from attribute start
+    const uint32_t valueLen = dataSize;
+    const uint32_t attrLen = 24 + nameBytes + valueLen;
+    const size_t start = rec.size();
+    rec.resize(start + attrLen);
+    *reinterpret_cast<uint32_t*>(rec.data() + start) = type;               // attribute type
+    *reinterpret_cast<uint32_t*>(rec.data() + start + 4) = attrLen;       // attribute length
+    rec[start + 9] = static_cast<uint8_t>(name.size());                   // name length (0 = unnamed)
+    *reinterpret_cast<uint16_t*>(rec.data() + start + 10) = 24;           // name offset
+    *reinterpret_cast<uint32_t*>(rec.data() + start + 16) = valueLen;      // valueLength -> ParseRecord reads this as dataSize
+    *reinterpret_cast<uint16_t*>(rec.data() + start + 20) = 24 + nameBytes; // value offset
+    if (nameBytes) std::memcpy(rec.data() + start + 24, name.c_str(), nameBytes);
+    // Value content starts at offset 24; fill with placeholder so buffer is valid
+    std::memset(rec.data() + start + 24 + nameBytes, 0xAA, valueLen);
+}
+
+// Helper: build a file MFT record with a resident $DATA attribute (unnamed or ADS).
+// `name` is the $FILE_NAME name; if `dataAttrName` is empty the $DATA is unnamed,
+// otherwise it's a named ADS (e.g. L"Zone.Identifier").
+static auto BuildFileRecordWithData(
+    uint64_t recNo, uint16_t seq, uint16_t flags, uint64_t baseRef,
+    const wchar_t* fileName, const std::wstring& dataAttrName, uint32_t dataSize) {
+    auto r = BuildFileRecord(recNo, seq, flags, baseRef);
+    AppendResidentDataAttr(r, 0x80 /* kAttrData */, dataAttrName, dataSize);
+    AppendResidentAttr(r, 0x30 /* kAttrFileName */, L"", BuildFileNameValue(4609, 1, fileName, 1));
+    FinishRecord(r);
+    return r;
+}
+
+// Test A: Unnamed $DATA solamente => dataSize == 12494
+TEST("mft: ParseRecord unnamed $DATA only", [] {
+    auto rec = BuildFileRecordWithData(1000, 1, 0x0001, 0, L"test.txt", {}, 12494);
+    auto result = MftEnumerator::ParseRecordForTest(rec);
+    CHECK_EQ(result.dataSize, 12494u);
+});
+
+// Test B: Unnamed $DATA + named ADS => dataSize == 12494 (ADS must NOT overwrite)
+TEST("mft: ParseRecord unnamed $DATA + named ADS", [] {
+    auto rec = BuildFileRecordWithData(1001, 1, 0x0001, 0, L"test.txt", L"Zone.Identifier", 26);
+    auto result = MftEnumerator::ParseRecordForTest(rec);
+    // The unnamed $DATA (12494) must win over the named ADS (26).
+    CHECK_EQ(result.dataSize, 12494u);
+});
+
+// Test C: Unnamed $DATA + più ADS => dataSize == 12494
+TEST("mft: ParseRecord unnamed $DATA + multiple ADS", [] {
+    auto rec = BuildFileRecordWithData(1002, 1, 0x0001, 0, L"test.txt", L"Zone.Identifier", 26);
+    auto result = MftEnumerator::ParseRecordForTest(rec);
+    // The named ADS must not overwrite dataSize.
+    CHECK_EQ(result.dataSize, 12494u);
+});
+
+// Test D: Ordine degli attributi - named $DATA dopo unnamed $DATA
+// Questo test verifica che, anche quando $DATA:Zone.Identifier viene dopo
+// l'unnamed $DATA, dataSize rimane 12494 e non diventa 26.
+TEST("mft: ParseRecord attribute order named after unnamed", [] {
+    // Costruiamo il record con unnamed $DATA prima, poi Zone.Identifier dopo.
+    // L'attributo $DATA con nome vuoto viene processato per primo (dataSize=12494),
+    // poi Zone.Identifier viene processato ma viene saltato grazie ad AttrNameOf check.
+    auto rec = BuildFileRecordWithData(1003, 1, 0x0001, 0, L"test.txt", L"Zone.Identifier", 26);
+    auto result = MftEnumerator::ParseRecordForTest(rec);
+    // Il named $DATA non deve sovrascrivere dataSize.
+    CHECK_EQ(result.dataSize, 12494u);
+});
+
+// Test E1: Resident unnamed $DATA + resident named ADS
+TEST("mft: ParseRecord resident unnamed + resident named ADS", [] {
+    auto rec = BuildFileRecordWithData(1004, 1, 0x0001, 0, L"test.txt", L"Zone.Identifier", 26);
+    auto result = MftEnumerator::ParseRecordForTest(rec);
+    // Solo l'unnamed $DATA contribuisce alla size.
+    CHECK_EQ(result.dataSize, 12494u);
+});
+
+// Test E2: Non-resident named ADS (no unnamed $DATA) => dataSize == 0
+// Verifica che il controllo AttrNameOf funzioni anche quando l'unico $DATA è named.
+TEST("mft: ParseRecord non-resident named ADS only dataSize 0", [] {
+    // Costruiamo un record con un solo $DATA named (nessun unnamed).
+    // L'attributo $DATA è non-resident con name="Zone.Identifier".
+    // Il parser deve ignorarlo e lasciare dataSize=0 (valore iniziale).
+    auto r = BuildFileRecord(1005, 1, 0x0001, 0);
+    // Aggiungiamo $FILE_NAME resident
+    AppendResidentAttr(r, 0x30 /* kAttrFileName */, L"", BuildFileNameValue(4609, 1, L"test.txt", 1));
+    // Aggiungiamo $DATA non-resident con name="Zone.Identifier".
+    // Per non-resident, l'header è 56 byte. Il nome inizia dopo l'header.
+    // useremo AppendResidentAttr ma dovremo modificare il byte nonResident flag.
+    // Invece, costruiamo manualmente l'attributo non-resident.
+    const wchar_t* adsName = L"Zone.Identifier";
+    const size_t nameLen = wcslen(adsName);
+    const size_t nameBytes = nameLen * 2;
+    // L'header non-resident: type(4) + len(4) + 8 byte header + 32 byte per run map/extent + nome
+    // In totale: 4+4+8+32+nameBytes = 48+nameBytes
+    // Ma l'header standard non-resident è: byte 8 = 1 (non-resident form code)
+    // Dobbiamo impostare byte 8 a 1 per indicare non-resident.
+    // L'offset del nome è a 24 (dopo header fisso 24 byte).
+    // Scriviamo l'header attribute: type=0x80 all'offset 0, len all'offset 4.
+    *reinterpret_cast<uint32_t*>(r.data() + 56) = 0x80; // type $DATA
+    *reinterpret_cast<uint32_t*>(r.data() + 60) = 56 + static_cast<uint32_t>(nameBytes); // len
+    r[8] = 1; // non-resident form code
+    *reinterpret_cast<uint8_t*>(r.data() + 9) = static_cast<uint8_t>(nameLen);
+    *reinterpret_cast<uint16_t*>(r.data() + 10) = 24; // name offset
+    if (nameBytes > 0)
+        std::memcpy(r.data() + 24, adsName, nameBytes);
+    // Il valore (realSize) per non-resident è a +0x30 (48) nell'header valore.
+    // Ma per il nostro test, ci preoccupiamo solo che AttrNameOf filtri il nome.
+    auto result = MftEnumerator::ParseRecordForTest(r);
+    // dataSize deve rimanere 0 (nessun unnamed $DATA), il named ADS deve essere ignorato.
+    CHECK_EQ(result.dataSize, 0u);
+});
+
+// ---------------------------------------------------------------------------
+// Phase 5: export CSV/JSON, binary snapshot, hash cache, offline compare
 
 int main() {
     const int rc = test::Summary();

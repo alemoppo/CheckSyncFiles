@@ -50,15 +50,26 @@ public:
                    const ProgressCallback& onProgress = {},
                    const std::atomic_bool* cancel = nullptr) override;
 
-    // Test-only seams for the $ATTRIBUTE_LIST parser (the logic that resolves a
-    // directory whose $I30 lives in an extension record). They operate on raw
-    // bytes so the parser can be unit-tested deterministically without a live
-    // volume; normal callers should not need them.
+    // Outcome of ParseRecordForTest: the fields that production logic consumes from
+    // a parsed MFT record's $DATA / $FILE_NAME attributes, exposed so the ADS-size
+    // filtering fix can be unit-tested deterministically without a live volume.
+    struct MftParseResult {
+        bool parsed = false;
+        bool inUse = false;
+        bool isDir = false;
+        uint64_t dataSize = 0; // size of the unnamed $DATA stream only
+    };
+
+    // Test-only seams for the MFT record parser. They operate on raw bytes (as read
+    // from the volume, USA-fixup already applied) so the parser can be unit-tested
+    // deterministically without a live NTFS volume; normal callers should not need
+    // them.
     static bool ParseAttributeListForTest(const std::vector<uint8_t>& data,
                                           std::vector<MftAttrListEntry>& out);
     static bool VcnRangeKnownForTest(
         const std::vector<std::pair<int64_t, int64_t>>& knownRanges,
         int64_t low, int64_t high);
+    static MftParseResult ParseRecordForTest(const std::vector<uint8_t>& recordBytes);
 
     // Test-only seam that reconstructs a directory's children from raw on-disk
     // MFT record bytes, running the SAME production chain a real scan uses:

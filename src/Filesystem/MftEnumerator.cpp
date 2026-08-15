@@ -446,10 +446,13 @@ void ParseRecord(const uint8_t* rec, size_t bufSize, RecInfo& out) {
                 }
             }
         } else if (type == kAttrData && !nonResident) { // resident $DATA
-            const uint32_t valueLen = *reinterpret_cast<const uint32_t*>(a + 16);
-            out.dataSize = valueLen; // content length
+            if (AttrNameOf(a, len).empty()) { // unnamed $DATA only (skip ADS)
+                const uint32_t valueLen = *reinterpret_cast<const uint32_t*>(a + 16);
+                out.dataSize = valueLen; // content length
+            }
         } else if (type == kAttrData && nonResident) { // non-resident $DATA
-            if (len >= 56) { // real size lives at +0x30 (8 bytes)
+            if (len >= 56 && AttrNameOf(a, len).empty()) { // unnamed $DATA only (skip ADS)
+                // real size lives at +0x30 (8 bytes)
                 out.dataSize = *reinterpret_cast<const uint64_t*>(a + 48);
             }
         } else if (type == kAttrAttrList && !nonResident) { // resident $ATTRIBUTE_LIST
@@ -1403,6 +1406,18 @@ bool MftEnumerator::VcnRangeKnownForTest(
         if (low <= r.second && high >= r.first) return true;
     }
     return false;
+}
+
+MftEnumerator::MftParseResult MftEnumerator::ParseRecordForTest(
+    const std::vector<uint8_t>& recordBytes) {
+    RecInfo info;
+    ParseRecord(recordBytes.data(), recordBytes.size(), info);
+    MftParseResult r;
+    r.parsed = info.parsed;
+    r.inUse = info.inUse;
+    r.isDir = info.isDir;
+    r.dataSize = info.dataSize;
+    return r;
 }
 
 bool MftEnumerator::ResolveDirectoryForTest(
