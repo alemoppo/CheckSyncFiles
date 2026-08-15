@@ -1415,12 +1415,17 @@ TEST("snapshot: cancelled source hashing stores no all-zero digest", [] {
         }
     }
 
-    // Cancelled mid-batch: the onBatchSubmitted seam fires right after the jobs
-    // are submitted and before they are drained. With a single-thread pool the
-    // jobs run one at a time, so the last-submitted jobs can never run before
-    // the flag is set: the skipped-mid-batch path is exercised, and whichever
-    // jobs DID run produced real digests. No all-zero digest may exist, and at
-    // least one file must have been skipped.
+    // Cancelled mid-batch, deterministically. A "gate" job is submitted to the
+    // pool before the batch and parks the single worker (the pool queue is FIFO,
+    // so the gate is run before any hash job and blocks there). The
+    // onBatchSubmitted seam fires only AFTER every hash job of the batch is
+    // enqueued but BEFORE they are drained, so at that moment all 64 jobs are
+    // submitted and none can have started. The seam then (1) sets the cancel
+    // flag and (2) opens the gate. Every queued job that subsequently executes
+    // therefore OBSERVES cancellation before it begins hashing and takes the
+    // early-bailout path: no sleeps, no reliance on the worker being slower
+    // than the submitting thread. The skipped-mid-batch path is exercised for
+    // every file, so the index must hold no digest at all.
     FileIndex interrupted(false);
     {
         Win32Enumerator en;
@@ -1431,9 +1436,36 @@ TEST("snapshot: cancelled source hashing stores no all-zero digest", [] {
         std::atomic_bool cancel{false};
         std::atomic<size_t> hits{0};
         ThreadPool pool(1);
-        std::function<void()> afterSubmit = [&] { cancel.store(true); };
+
+        // The gate blocks the single worker until the seam opens it. `opened`
+        // makes set_value idempotent: the seam opens the gate on the happy path,
+        // and the RAII guard opens it on unwind (if the seam never ran, e.g. a
+        // submission failure), so the worker -- and the pool destructor that
+        // joins it -- can never hang.
+        std::promise<void> gate;
+        std::shared_future<void> gateOpens = gate.get_future();
+        bool gateOpened = false;
+        auto openGate = [&] {
+            if (gateOpened) return;
+            gateOpened = true;
+            gate.set_value();
+        };
+        pool.submit([gateOpens] { gateOpens.wait(); });
+        struct GateGuard {
+            std::function<void()> open;
+            ~GateGuard() { open(); }
+        } gateGuard{openGate};
+
+        std::function<void()> afterSubmit = [&] {
+            cancel.store(true); // 1) cancellation first...
+            openGate();         // 2) ...then let the queued jobs run: all bail
+        };
         HashSourceIndex(interrupted, src, pool, &cancel, nullptr, hits, nullptr, afterSubmit);
 
+        // Because no job can have started before the flag was set, every job was
+        // skipped: the index must contain no digest entry at all.
+        CHECK_MSG(interrupted.hashCount() == 0,
+                  "a cancelled batch must skip every queued job, deterministically");
         std::array<uint8_t, 32> zero{};
         for (const auto& kv : interrupted.entries()) {
             if (kv.second.isDirectory) continue;
@@ -1442,8 +1474,6 @@ TEST("snapshot: cancelled source hashing stores no all-zero digest", [] {
                 CHECK_MSG(d != zero, "an all-zero digest must never be stored");
             }
         }
-        CHECK_MSG(interrupted.hashCount() < size_t{kFiles},
-                  "mid-batch cancellation must skip at least one file");
     }
 });
 
