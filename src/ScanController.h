@@ -13,6 +13,24 @@
 
 namespace bv {
 
+namespace hashing {
+class HashCache;
+}
+
+class FileIndex;
+class ThreadPool;
+
+// Hashes every file of `index` (all under `root`) into the index, in bounded
+// batches over `pool`. A slot whose job did not produce a digest (cancellation
+// landed mid-batch, or the file could not be hashed) is left WITHOUT an entry,
+// never with an all-zero digest. Declared here (it is an internal helper) so
+// the snapshot-capture cancellation behaviour can be tested directly.
+void HashSourceIndex(FileIndex& index, const std::wstring& root, ThreadPool& pool,
+                     const std::atomic_bool* cancel, hashing::HashCache* cache,
+                     std::atomic<size_t>& cacheHits,
+                     const std::function<void(uint64_t done, uint64_t total)>& onProgress,
+                     std::function<void()> onBatchSubmitted = {});
+
 // High level phases of a run, reported through ScanProgress.
 enum class ScanPhase : uint8_t {
     EnumerateSource,     // building the source index

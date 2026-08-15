@@ -26,14 +26,39 @@ double NowSeconds() {
     return duration<double>(steady_clock::now().time_since_epoch()).count();
 }
 
+// One digest slot of a hash batch. `skipped` records that no digest was produced
+// for this slot (the job bailed on cancellation, or the file could not be read
+// or hashed): the slot must then NOT be written into the index. Writing the
+// default all-zero digest would be persisted to the snapshot and later misread
+// as a content mismatch, so a missing digest is represented by "no hash entry"
+// instead of a bogus digest.
+struct HashSlot {
+    std::array<uint8_t, 32> digest{};
+    bool skipped = false;
+};
+
+} // namespace
+
 // Computes the digest of every file in `index` (all under `root`), storing them
 // back in the index. Used by the snapshot-capture path in Content mode so the
 // snapshot embeds source digests and the offline comparison can reuse them (the
 // source is then never read twice). Optionally feeds/reads the hash cache.
+//
+// A slot whose job never produced a digest (cancellation landed while the batch
+// was in flight, or the file could not be hashed) is marked `skipped` and is
+// left WITHOUT an entry in the index: it is simply as if that file was never
+// hashed this run. The caller decides whether an interrupted capture is still
+// written as a snapshot.
+//
+// `onBatchSubmitted` is a test seam: it fires right after a batch's jobs are
+// submitted and before they are drained, so a test can flip the cancel flag at
+// a well-defined point and deterministically exercise the mid-batch bailout.
+// Production callers leave it empty.
 void HashSourceIndex(FileIndex& index, const std::wstring& root, ThreadPool& pool,
                      const std::atomic_bool* cancel, hashing::HashCache* cache,
                      std::atomic<size_t>& cacheHits,
-                     const std::function<void(uint64_t done, uint64_t total)>& onProgress) {
+                     const std::function<void(uint64_t done, uint64_t total)>& onProgress,
+                     std::function<void()> onBatchSubmitted) {
     std::vector<std::wstring> files;
     for (const auto& kv : index.entries()) {
         if (!kv.second.isDirectory) files.push_back(kv.second.relativePath);
@@ -43,41 +68,48 @@ void HashSourceIndex(FileIndex& index, const std::wstring& root, ThreadPool& poo
     size_t done = 0;
     while (done < total && !(cancel && cancel->load(std::memory_order_relaxed))) {
         const size_t n = std::min<size_t>(256, total - done);
-        std::vector<std::array<uint8_t, 32>> digests(n);
+        std::vector<HashSlot> slots(n);
         for (size_t i = 0; i < n; ++i) {
             // Capture the stable vector index, not a reference to the element:
             // `files` is fully built before the loop and never modified, and the
-            // batch-local `digests` below is drained by pool.waitAll() before the
+            // batch-local `slots` below is drained by pool.waitAll() before the
             // batch scope ends, so both stay valid for the whole task lifetime.
             // `root` is a const reference parameter alive through this call.
             const size_t relIndex = done + i;
-            pool.submit([&files, &digests, relIndex, i, &root, cache, &cacheHits, cancel] {
-                if (cancel && cancel->load(std::memory_order_relaxed)) return;
+            pool.submit([&files, &slots, relIndex, i, &root, cache, &cacheHits, cancel] {
+                HashSlot& slot = slots[i];
+                if (cancel && cancel->load(std::memory_order_relaxed)) {
+                    slot.skipped = true;
+                    return;
+                }
                 const std::wstring& rel = files[relIndex];
-                std::array<uint8_t, 32>& d = digests[i];
                 const std::wstring abs = pathutil::MakeAbsolute(root, rel);
                 uint64_t sz = 0;
                 uint64_t mt = 0;
-                if (!hashing::StatFile(abs, sz, mt)) return;
-                if (cache && cache->Lookup(abs, sz, mt, d)) {
+                if (!hashing::StatFile(abs, sz, mt)) {
+                    slot.skipped = true;
+                    return;
+                }
+                if (cache && cache->Lookup(abs, sz, mt, slot.digest)) {
                     cacheHits.fetch_add(1, std::memory_order_relaxed);
                     return;
                 }
-                if (hashing::Sha256File(abs, d) == hashing::HashStatus::Ok) {
-                    if (cache) cache->Store(abs, sz, mt, d);
+                if (hashing::Sha256File(abs, slot.digest) == hashing::HashStatus::Ok) {
+                    if (cache) cache->Store(abs, sz, mt, slot.digest);
+                } else {
+                    slot.skipped = true;
                 }
             });
         }
+        if (onBatchSubmitted) onBatchSubmitted();
         pool.waitAll();
         for (size_t i = 0; i < n; ++i) {
-            index.setHash(files[done + i], digests[i]);
+            if (!slots[i].skipped) index.setHash(files[done + i], slots[i].digest);
         }
         done += n;
         if (onProgress) onProgress(done, total);
     }
 }
-
-} // namespace
 
 ScanReport ScanController::run(const ScanOptions& options) {
     ScanReport report;
@@ -279,16 +311,29 @@ ScanReport ScanController::run(const ScanOptions& options) {
                 report.hashThreadsUsed = srcThreads;
                 report.hashingErrors += sourcePool.taskErrors();
             }
+
+            // If hashing was interrupted (cancellation landed while a batch was
+            // in flight), some digests were never computed. An incomplete capture
+            // must never be presented as a complete snapshot, so the source side
+            // is marked not-ok and the write below (and the destination pass, both
+            // guarded on report.sourceOk) are skipped -- mirroring the
+            // enumeration-cancellation check above.
+            if (options.cancel && options.cancel->load()) {
+                report.sourceOk = false;
+            }
+
             std::wstring werr;
-            report.snapshotWritten =
-                indexio::WriteSnapshot(options.snapshotOut, sourceIndex, options.source, werr);
-            if (!report.snapshotWritten) {
-                FileResult r;
-                r.status = Status::ReadError;
-                r.isDirectory = true;
-                r.errorMessage = std::move(werr);
-                report.results.problems.push_back(std::move(r));
-                ++report.results.stats.readErrors;
+            if (report.sourceOk) {
+                report.snapshotWritten =
+                    indexio::WriteSnapshot(options.snapshotOut, sourceIndex, options.source, werr);
+                if (!report.snapshotWritten) {
+                    FileResult r;
+                    r.status = Status::ReadError;
+                    r.isDirectory = true;
+                    r.errorMessage = std::move(werr);
+                    report.results.problems.push_back(std::move(r));
+                    ++report.results.stats.readErrors;
+                }
             }
         }
     }

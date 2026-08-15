@@ -33,9 +33,11 @@ void AddStats(Stats& target, const Stats& add) {
 
 // Hashes both sides of one candidate and folds the outcome into the thread-safe
 // `sink`. Safe to call concurrently from any number of pool workers (stats are
-// atomics, problems go through the sink mutex). The historical behaviour is
-// preserved exactly: a task that bails on cancellation still reports its
-// candidate as a read error (never missing/extra).
+// atomics, problems go through the sink mutex). A task that bails because
+// cancellation was requested produces NO outcome for its candidate: it is as if
+// that pair was never processed this run (no stats bucket, no FileResult), so a
+// cancelled batch can never fabricate read errors or mismatches for files that
+// were never actually hashed.
 void HashOneCandidateInto(const ContentCandidate& c, bool offlineSource, FileIndex* index,
                           const std::wstring& sourceRoot, const std::wstring& destRoot,
                           ConcurrentSink& sink, const std::atomic_bool* cancel,
@@ -67,7 +69,9 @@ void HashOneCandidateInto(const ContentCandidate& c, bool offlineSource, FileInd
     };
 
     if (cancel && cancel->load(std::memory_order_relaxed)) {
-        reportReadError(false, false, false, Digest{}, Digest{});
+        // Cancelled before any work: drop the candidate silently. Reporting a
+        // read error here would fabricate a verdict for a file that was never
+        // opened.
         return;
     }
 

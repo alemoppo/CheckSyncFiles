@@ -30,6 +30,7 @@
 #include "Comparison/ScanMode.h"
 #include "Comparison/ConcurrentComparer.h"
 #include "Comparison/FileComparator.h"
+#include "Comparison/HashPhase.h"
 #include "Comparison/MatchTable.h"
 #include "Errors.h"
 #include "Export/CsvExporter.h"
@@ -1376,6 +1377,105 @@ TEST("offline: snapshot without hashes degrades content to size", [] {
     CHECK_EQ(r.results.stats.identicalFiles, 1ull); // same size counts as identical
 });
 
+TEST("snapshot: cancelled source hashing stores no all-zero digest", [] {
+    // Bug regression: a hash job that bails on cancellation used to leave its
+    // slot at the default all-zero digest, which was then written into the index
+    // (and later persisted to the snapshot, misread as a content mismatch). A
+    // skipped job must leave NO entry instead.
+    const auto dir = MakeTempDir();
+    const std::wstring src = dir + L"\\src";
+    fs::create_directories(src);
+    const int kFiles = 64;
+    for (int i = 0; i < kFiles; ++i) {
+        CHECK(WriteFileBytes(src + L"\\f" + std::to_wstring(i) + L".dat", "data", 4));
+    }
+
+    FileIndex index(false);
+    {
+        Win32Enumerator en;
+        const auto br = index.build(src, en);
+        CHECK(br.ok);
+    }
+    CHECK_EQ(index.size(), size_t{kFiles});
+
+    // Positive control: with no cancellation every file is hashed with a real,
+    // non-zero digest.
+    {
+        std::atomic_bool noCancel{false};
+        std::atomic<size_t> hits{0};
+        ThreadPool pool(1);
+        HashSourceIndex(index, src, pool, &noCancel, nullptr, hits, nullptr);
+        CHECK_EQ(index.hashCount(), size_t{kFiles});
+        std::array<uint8_t, 32> zero{};
+        for (const auto& kv : index.entries()) {
+            if (kv.second.isDirectory) continue;
+            std::array<uint8_t, 32> d{};
+            CHECK(index.getHash(kv.second.relativePath, d));
+            CHECK_MSG(d != zero, "a real hash must never be all-zero");
+        }
+    }
+
+    // Cancelled mid-batch: the onBatchSubmitted seam fires right after the jobs
+    // are submitted and before they are drained. With a single-thread pool the
+    // jobs run one at a time, so the last-submitted jobs can never run before
+    // the flag is set: the skipped-mid-batch path is exercised, and whichever
+    // jobs DID run produced real digests. No all-zero digest may exist, and at
+    // least one file must have been skipped.
+    FileIndex interrupted(false);
+    {
+        Win32Enumerator en;
+        const auto br = interrupted.build(src, en);
+        CHECK(br.ok);
+    }
+    {
+        std::atomic_bool cancel{false};
+        std::atomic<size_t> hits{0};
+        ThreadPool pool(1);
+        std::function<void()> afterSubmit = [&] { cancel.store(true); };
+        HashSourceIndex(interrupted, src, pool, &cancel, nullptr, hits, nullptr, afterSubmit);
+
+        std::array<uint8_t, 32> zero{};
+        for (const auto& kv : interrupted.entries()) {
+            if (kv.second.isDirectory) continue;
+            std::array<uint8_t, 32> d{};
+            if (interrupted.getHash(kv.second.relativePath, d)) {
+                CHECK_MSG(d != zero, "an all-zero digest must never be stored");
+            }
+        }
+        CHECK_MSG(interrupted.hashCount() < size_t{kFiles},
+                  "mid-batch cancellation must skip at least one file");
+    }
+});
+
+TEST("snapshot: cancelled capture is never written as a complete snapshot", [] {
+    // Cancelling mid-capture (after the first hash batch) must not produce a
+    // snapshot at all: an incomplete capture cannot be presented as a complete
+    // one. Trace: HashSourceIndex -> report.sourceOk -> WriteSnapshot. The
+    // destination pass is skipped too (guarded on report.sourceOk).
+    const auto dir = MakeTempDir();
+    const std::wstring src = dir + L"\\src";
+    fs::create_directories(src);
+    testgen::CreateStressTree(src, 300); // > one 256-file hash batch
+
+    std::atomic_bool cancel{false};
+    const std::wstring snap = dir + L"\\src.bin";
+    ScanOptions opts;
+    opts.source = src;
+    opts.destination = src;
+    opts.mode = ScanMode::Content;
+    opts.hashThreads = 1;
+    opts.snapshotOut = snap;
+    opts.cancel = &cancel;
+    opts.onProgress = [&](const ScanProgress& p) {
+        if (p.phase == ScanPhase::Hashing) cancel.store(true);
+    };
+
+    const ScanReport r = ScanController(false).run(opts);
+    CHECK(!r.snapshotWritten);
+    CHECK(!r.sourceOk);
+    CHECK_MSG(!fs::exists(snap), "an interrupted capture must not leave a snapshot on disk");
+});
+
 TEST("cache: second run reuses stored hashes without re-reading", [] {
     const auto tree = MakeTempDir();
     testgen::CreateStressTree(tree, 200); // 3 dirs x 100 files? -> 200 files total
@@ -1550,6 +1650,75 @@ TEST("comparator: file changed between enumeration and hash is flagged", [] {
     if (out.problems.size() == 1) {
         CHECK(out.problems[0].status == Status::ChangedDuringScan);
         CHECK(out.problems[0].relativePath == L"a.txt");
+    }
+});
+
+TEST("hash phase: cancelled hash jobs fabricate no read errors", [] {
+    // Bug regression: a hash task that bails on cancellation must not report its
+    // candidate as a read error (the file was never opened). Here the cancel
+    // flag is ALREADY set, so every submitted job takes the early-bailout path:
+    // the sink must stay completely untouched (no stats, no FileResult).
+    const auto dir = MakeTempDir();
+    const std::wstring src = dir + L"\\src";
+    const std::wstring dst = dir + L"\\dst";
+    fs::create_directories(src);
+    fs::create_directories(dst);
+    CHECK(WriteFileBytes(src + L"\\same.txt", "hello world", 11));
+    CHECK(WriteFileBytes(src + L"\\diff.txt", "aaaaaa", 6));
+    fs::copy(src, dst, fs::copy_options::recursive);
+    CHECK(WriteFileBytes(dst + L"\\diff.txt", "bbbbbb", 6)); // same size, different bytes
+
+    // Build the same candidates the comparer would collect (same path + size),
+    // using each side's real stat so change-detection stays quiet.
+    std::vector<ContentCandidate> candidates;
+    for (const auto& rel : {L"same.txt", L"diff.txt"}) {
+        uint64_t sz = 0, mt = 0;
+        CHECK(hashing::StatFile(src + L"\\" + rel, sz, mt));
+        ContentCandidate c;
+        c.relativePath = rel;
+        c.sizeSource = sz;
+        uint64_t dsz = 0, dmt = 0;
+        CHECK(hashing::StatFile(dst + L"\\" + rel, dsz, dmt));
+        c.sizeDest = dsz;
+        c.srcMtime = mt;
+        c.dstMtime = dmt;
+        candidates.push_back(std::move(c));
+    }
+
+    std::atomic<size_t> hits{0};
+
+    // Positive control: without cancellation the jobs classify normally.
+    {
+        std::atomic_bool noCancel{false};
+        ConcurrentSink sink;
+        ThreadPool pool(2);
+        SubmitHashCandidates(candidates, pool, /*offline=*/false, nullptr, src, dst, sink,
+                             &noCancel, nullptr, hits);
+        pool.waitAll();
+        const ResultSet ok = sink.take();
+        CHECK_EQ(ok.stats.identicalFiles, 1ull);   // same.txt
+        CHECK_EQ(ok.stats.contentMismatch, 1ull);  // diff.txt
+        CHECK_EQ(ok.stats.readErrors, 0ull);
+        CHECK_EQ(ok.stats.accessDenied, 0ull);
+        CHECK_EQ(ok.problems.size(), 1ull);
+    }
+
+    // Cancelled: every job bails before touching the sink. Before the fix each
+    // bailed job produced a fabricated ReadError ("errore di lettura durante il
+    // calcolo dell'impronta") -- that must never happen for a never-opened file.
+    {
+        std::atomic_bool cancelled{true};
+        ConcurrentSink sink;
+        ThreadPool pool(2);
+        SubmitHashCandidates(candidates, pool, /*offline=*/false, nullptr, src, dst, sink,
+                             &cancelled, nullptr, hits);
+        pool.waitAll();
+        const ResultSet r = sink.take();
+        CHECK_EQ(r.stats.identicalFiles, 0ull);
+        CHECK_EQ(r.stats.contentMismatch, 0ull);
+        CHECK_EQ(r.stats.readErrors, 0ull);
+        CHECK_EQ(r.stats.accessDenied, 0ull);
+        CHECK_EQ(r.problems.size(), 0ull);
     }
 });
 
