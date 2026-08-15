@@ -10,9 +10,16 @@ namespace bv {
 // Behaviour:
 //   - long paths are supported via the "\\?\" prefix (UNC aware)
 //   - hidden and system files are included
-//   - directory reparse points (junctions / directory symlinks) are recorded
-//     as directory entries but NOT followed, which guarantees there are no
-//     cycles (a symlink loop can never be entered)
+//   - reparse points (symlinks, junctions, mount points) are recorded as plain
+//     entries but are NEVER traversed, regardless of what they point to:
+//       * a directory reparse point is listed as a directory entry
+//         (isDirectory == true, attributes contain FILE_ATTRIBUTE_REPARSE_POINT)
+//         and is not descended into
+//       * a file reparse point is listed as a file entry
+//     This is an intentional policy: a reparse point may point at any path,
+//     including one of its own ancestors (a cycle). Following it would make the
+//     scan loop forever. Treating every reparse point as a leaf guarantees
+//     termination on any tree, adversarial or not.
 //   - per-directory failures are reported through the error callback and do
 //     not stop the scan
 class Win32Enumerator : public IFileEnumerator {

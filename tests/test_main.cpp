@@ -83,7 +83,14 @@ bool RemoveAllWin(const std::wstring& path) {
         }
         const std::wstring child = path + L"\\" + fd.cFileName;
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-            RemoveAllWin(child);
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) {
+                // Junctions / directory symlinks must NOT be traversed here:
+                // a link can point back into the tree being cleaned (a cycle).
+                // Removing the link itself (not its target) avoids that loop.
+                RemoveDirectoryW(pathutil::AddLongPathPrefix(child).c_str());
+            } else {
+                RemoveAllWin(child);
+            }
         } else {
             DeleteFileW(pathutil::AddLongPathPrefix(child).c_str());
         }
@@ -173,6 +180,18 @@ void BumpMtimeMinutes(const std::wstring& path, int minutes) {
     ft.dwHighDateTime = ui.HighPart;
     SetFileTime(h, nullptr, nullptr, &ft);
     CloseHandle(h);
+}
+
+// Creates a directory junction `link` pointing at `target` via the shell's
+// `mklink /J` (a cmd built-in). The link directory must NOT already exist.
+// Junctions need no administrator rights (unlike symlinks), so this is
+// exercisable on an ordinary temp directory. Building the junction reparse
+// buffer by hand (FSCTL_SET_REPARSE_POINT) is fragile and version-dependent,
+// so we reuse the OS tool instead -- the same approach as the icacls helpers
+// above. Returns false when junction creation is not supported.
+bool CreateJunction(const std::wstring& link, const std::wstring& target) {
+    std::wstring cmd = L"cmd /c mklink /J \"" + link + L"\" \"" + target + L"\" >nul 2>nul";
+    return _wsystem(cmd.c_str()) == 0;
 }
 
 } // namespace
@@ -446,6 +465,59 @@ TEST("content mode: auto thread count resolves from the IO class", [] {
     const auto r = RunScan(dir + L"\\src", dir + L"\\dst", ScanMode::Content,
                            false, 0); // auto
     CHECK(r.hashThreadsUsed >= 1u);
+});
+
+TEST("junction: listed as an entry but never descended into (no loops)", [] {
+    // A directory junction pointing back at its own root is the canonical
+    // cycle: following it would re-enumerate the whole tree forever. The
+    // enumerator must record it as a single directory entry and treat it as a
+    // leaf. Junctions require no administrator rights, so this runs on a plain
+    // temp directory (NTFS).
+    const auto dir = MakeTempDir();
+    const std::wstring src = dir + L"\\src";
+    const std::wstring dst = dir + L"\\dst";
+
+    // src\sub\loop -> src (a loop back to the root of the scan)
+    fs::create_directories(src);
+    fs::create_directories(dst);
+    fs::create_directories(src + L"\\sub");
+    fs::create_directories(dst + L"\\sub");
+    WriteFileBytes(src + L"\\a.txt", "same", 4);
+    WriteFileBytes(dst + L"\\a.txt", "same", 4);
+    WriteFileBytes(src + L"\\sub\\f.txt", "f", 1);
+    WriteFileBytes(dst + L"\\sub\\f.txt", "f", 1);
+    CHECK_MSG(CreateJunction(src + L"\\sub\\loop", src), "junction creation failed");
+
+    // Direct enumeration: the junction is a directory entry ...
+    {
+        FileIndex idx(false);
+        Win32Enumerator en;
+        const auto br = idx.build(src, en);
+        CHECK(br.ok);
+        FileEntry e;
+        CHECK(idx.find(L"sub\\loop", e));
+        CHECK(e.isDirectory);
+        CHECK((e.attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0);
+        // ... but it is never descended into: nothing exists below it, and the
+        // entry set is exactly the tree's own files/dirs (a followed cycle
+        // would add "sub\loop\a.txt", "sub\loop\sub", ... indefinitely).
+        CHECK(!idx.find(L"sub\\loop\\a.txt", e));
+        CHECK(!idx.find(L"sub\\loop\\sub", e));
+        CHECK_EQ(br.stats.files, 2ull); // a.txt, sub\f.txt
+        CHECK_EQ(br.stats.dirs, 2ull);  // sub, sub\loop
+    }
+
+    // End-to-end: a presence scan against a tree without the junction
+    // terminates (no infinite loop) and reports exactly the junction as a
+    // missing directory, with no missing files leaked from its contents.
+    const auto r = RunScan(src, dst, ScanMode::Presence);
+    const auto& s = r.results.stats;
+    CHECK_EQ(s.identicalFiles, 2ull); // a.txt, sub\f.txt
+    CHECK_EQ(s.identicalDirs, 1ull);  // sub
+    CHECK_EQ(s.missingDirs, 1ull);    // sub\loop
+    CHECK_EQ(s.missingFiles, 0ull);   // the junction's contents were never read
+    CHECK_EQ(s.extraFiles, 0ull);
+    CHECK_EQ(s.extraDirs, 0ull);
 });
 
 TEST("sha256: known vector for 'abc'", [] {
