@@ -717,11 +717,15 @@ const uint64_t segSize = vd.BytesPerFileRecordSegment;
     }
 
     bool incomplete = false;
-    auto failIncomplete = [&](const wchar_t* why, uint64_t rec) {
+    // Reports an unreadable directory; `dirPath` is the path (relative to the
+    // scan root) of the directory whose $I30 index or child could not be
+    // resolved, so the caller can show which subtree the scan missed.
+    auto failIncomplete = [&](const std::wstring& dirPath, const wchar_t* why,
+                              uint64_t rec) {
         incomplete = true;
         if (onError) {
             ScanError e;
-            e.path = L"";
+            e.path = dirPath;
             e.message = std::wstring(L"MFT scan incomplete: ") + why + L" (record " +
                         std::to_wstring(rec) + L")";
             e.winError = ERROR_INVALID_DATA;
@@ -818,7 +822,8 @@ const uint64_t segSize = vd.BytesPerFileRecordSegment;
             if (!d.idxAlloc.empty()) {
                 std::vector<uint8_t> data;
                 if (!ReadNonResidentAttr(hVol, cluster, d.idxAlloc, data)) {
-                    failIncomplete(L"directory $INDEX_ALLOCATION unreadable", dirRec);
+                    failIncomplete(dirRel, L"directory $INDEX_ALLOCATION unreadable",
+                                   dirRec);
                 } else {
                     const size_t blk = (d.idxBlockSize >= kMinIndexBlockSize &&
                                         d.idxBlockSize <= kMaxIndexBlockSize)
@@ -827,14 +832,15 @@ const uint64_t segSize = vd.BytesPerFileRecordSegment;
                     const size_t parsed =
                         ParseIndexAllocationData(data, blk, bytesPerSector, d.children);
                     if (parsed == SIZE_MAX) {
-                        failIncomplete(L"directory $INDEX_ALLOCATION block corrupt", dirRec);
+                        failIncomplete(dirRel, L"directory $INDEX_ALLOCATION block corrupt",
+                                       dirRec);
                     } else {
                         diagIndexBlocks += parsed;
                     }
                 }
             }
             if (d.children.empty() && d.idxRoot.empty()) {
-                failIncomplete(L"directory has no readable $I30 index", dirRec);
+                failIncomplete(dirRel, L"directory has no readable $I30 index", dirRec);
             }
         }
 
@@ -845,7 +851,8 @@ const uint64_t segSize = vd.BytesPerFileRecordSegment;
             const uint64_t cr = c.ref.rec;
             if (cr >= nRecords || !recs[cr].parsed || !recs[cr].inUse ||
                 recs[cr].seq != c.ref.seq) {
-                failIncomplete(L"index child record missing or sequence mismatch", cr);
+                failIncomplete(dirRel, L"index child record missing or sequence mismatch",
+                               cr);
                 continue;
             }
             // Prefer the record's WIN32 name for this parent (the index key can
