@@ -118,11 +118,16 @@ ctest --test-dir build_gui --output-on-failure
     puntato) prima del parse dei data-run.
 14. **Metafile non utente**: la banda record ≤ 23 ($MFT, $LogFile, ...) è esclusa; i
     record non "in use" restano i soli eliminati (v. §2 punto 6).
-15. **`enumerate()` ritorna `false` se incompleta** (ma la ricostruzione resta utile
-    anche su scansioni parziali). `ScanController` già gestisce il `false` con
-    `runWithFallback`: il FileIndex parziale viene scartato e ricostruito da zero col
-    fallback Win32 — il messaggio di incomplete finisce negli errori. **Nessuna scansione
-    parziale silenziosa**; il backend MFT non deve mai sembrare valida quando non lo è.
+15. **Per-directory Win32 fallback (NON ripetere)**: quando il parser non riesce a
+    ricostruire il `$I30` di UNA sola directory (estensione irraggiungibile, blocco
+    INDX corrotto, nessun indice, reference figlio non risolvibile), `enumerate()`
+    chiama `EnumerateWin32Subtree` (FindFirstFileW/FindNextFileW su quella sola
+    directory, path relativi prefixati con `dirRel`) e continua: la scansione resta
+    MFT-backed e non segna incomplete. `enumerate()` ritorna `false` solo se la
+    directory è illeggibile con ENTRAMBI i backend → fallback Win32 completo in
+    `ScanController`. **Nessuna scansione parziale silenziosa**; il backend MFT non
+    deve mai sembrare valida quando non lo è. Contatore diagnostico `fbDirs=` in
+    `BV_MFT_DEBUG_FILE`.
 16. **Debug**: `BV_MFT_DEBUG=1` in ambiente fa stampare (stderr) il motivo di ogni
     bail-out (`mft[1..10]`); disattivata di default, è una modalità diagnostica
     permanente e non produce rumore.

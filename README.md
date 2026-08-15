@@ -62,10 +62,16 @@ Approccio usato:
 - i record non più **"in use"** (flag header bit 0x0001 non impostato) vengono ignorati
   per escludere record stantii (deleted); la banda dei metafile di sistema (record ≤ 23:
   `$MFT`, `$LogFile`, ...) non è mai esposta come voce utente.
-- un `enumerate()` **incompleto** ritorna `false`: il `FileIndex` parziale viene
-  scartato e ricostruito da zero dal fallback Win32 (mai una scansione parziale che
-  sembri valida). `BV_MFT_DEBUG=1` in ambiente abilita una traccia diagnostica del motivo
-  di ogni bail-out (default off).
+- quando il parser **non riesce a ricostruire il `$I30` di una singola directory**
+  (estensione irraggiungibile, blocco INDX corrotto, nessun indice, o una reference
+  figlio non risolvibile), la **sola sottostruttura di quella directory** viene
+  enumerata con `FindFirstFileW`/`FindNextFileW` (`EnumerateWin32Subtree`) e immessa
+  nello stesso albero/flusso: la scansione resta MFT-backed ovunque altro e quella
+  directory non è segnata incomplete. Un `enumerate()` ritorna `false` solo se una
+  directory è illeggibile **con entrambi** i backend: allora il `FileIndex` parziale
+  viene scartato e ricostruito da zero dal fallback Win32 (mai una scansione parziale
+  che sembri valida). `BV_MFT_DEBUG=1` in ambiente abilita una traccia diagnostica del
+  motivo di ogni bail-out (default off).
 
 La MFT è **un'ottimizzazione, non una dipendenza**: il programma continua a funzionare
 se il volume non è NTFS, se l'accesso alla MFT non è disponibile, se mancano i privilegi,

@@ -93,6 +93,31 @@ public:
         std::vector<std::pair<std::wstring, uint64_t>>& outEntries, bool& outIncomplete,
         const std::vector<uint8_t>* clusters = nullptr, uint32_t clusterSize = 4096,
         uint32_t bytesPerSector = 512, size_t* outPiecesMerged = nullptr);
+
+    // Outcome of a per-directory Win32 fallback (see EnumerateWin32Subtree).
+    enum class SubtreeStatus {
+        Ok,        // the whole subtree was emitted through onEntry/onProgress
+        Aborted,   // the consumer stopped it by returning false from onEntry
+        DeviceLost,// storage disconnected during the walk (a lostDevice error
+                   //   was already reported through onError): abort the scan
+        Unreadable // the root cannot be enumerated via Win32 either (reported
+                   //   through onError): the scan stays incomplete/honest
+    };
+
+    // Per-directory Win32 fallback used by enumerate(): when the raw MFT parser
+    // cannot reconstruct ONE directory's $I30, only that directory's subtree is
+    // enumerated with FindFirstFileW/FindNextFileW (via Win32Enumerator) instead
+    // of failing the whole enumeration. Every entry's relative path is prefixed
+    // with `relPrefix` (the directory's path relative to the scan root), so the
+    // entries feed into the same tree/flow as the MFT walk; subdirectories are
+    // NOT descended again by the caller. `outFiles`/`outDirs` receive the
+    // subtree's file/directory counts. Also exposed for tests (a real temp tree,
+    // no volume/admin needed).
+    static SubtreeStatus EnumerateWin32Subtree(
+        const std::wstring& absDir, const std::wstring& relPrefix,
+        uint64_t& outFiles, uint64_t& outDirs, const EntryCallback& onEntry,
+        const ErrorCallback& onError, const ProgressCallback& onProgress,
+        const std::atomic_bool* cancel);
 };
 
 } // namespace bv

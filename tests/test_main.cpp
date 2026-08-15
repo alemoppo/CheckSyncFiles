@@ -1794,6 +1794,83 @@ TEST("mft: $ATTRIBUTE_LIST referencing a bad extension is not silently complete"
     CHECK(e2.empty());
 });
 
+TEST("mft: per-directory Win32 fallback enumerates a subtree with prefixed paths", [] {
+    // The per-directory Win32 fallback seam drives Win32Enumerator on ONE
+    // directory and joins every emitted relative path with the directory's
+    // scan-root-relative prefix, so the subtree plugs into the same tree/flow
+    // the MFT walk builds. Real temp tree: no volume, no elevation required.
+    const std::wstring dir = MakeTempDir();
+    const std::wstring sub = dir + L"\\sub";
+    fs::create_directories(sub + L"\\deep");
+    CHECK(WriteFileBytes(dir + L"\\a.txt", "a", 1));
+    CHECK(WriteFileBytes(dir + L"\\b.bin", "bb", 2));
+    CHECK(WriteFileBytes(sub + L"\\c.txt", "ccc", 3));
+    CHECK(WriteFileBytes(sub + L"\\deep\\d.txt", "dddd", 4));
+
+    std::vector<std::wstring> rels;
+    std::vector<std::wstring> progPaths;
+    uint64_t fbFiles = 0;
+    uint64_t fbDirs = 0;
+    const auto st = MftEnumerator::EnumerateWin32Subtree(
+        dir, L"fb", fbFiles, fbDirs,
+        [&](FileEntry&& e) {
+            rels.push_back(e.relativePath);
+            return true;
+        },
+        [](const ScanError&) {},
+        [&](uint64_t, uint64_t, const std::wstring& p) { progPaths.push_back(p); }, nullptr);
+    CHECK(st == MftEnumerator::SubtreeStatus::Ok);
+    CHECK_EQ(rels.size(), 6u);
+    if (rels.size() != 6) return;
+    CHECK_EQ(fbFiles, 4u);
+    CHECK_EQ(fbDirs, 2u);
+    CHECK(std::find(rels.begin(), rels.end(), L"fb\\a.txt") != rels.end());
+    CHECK(std::find(rels.begin(), rels.end(), L"fb\\b.bin") != rels.end());
+    CHECK(std::find(rels.begin(), rels.end(), L"fb\\sub") != rels.end());
+    CHECK(std::find(rels.begin(), rels.end(), L"fb\\sub\\c.txt") != rels.end());
+    CHECK(std::find(rels.begin(), rels.end(), L"fb\\sub\\deep") != rels.end());
+    // Subdirectories are fully enumerated in the one call, so the MFT caller
+    // must NOT descend again (a second descent would duplicate entries).
+    CHECK(std::find(rels.begin(), rels.end(), L"fb\\sub\\deep\\d.txt") != rels.end());
+    // Progress reports the prefixed, scan-root-relative directory paths.
+    CHECK(std::find(progPaths.begin(), progPaths.end(), L"fb\\sub\\deep") != progPaths.end());
+
+    // Empty prefix == the scan root itself: paths stay relative to the root.
+    std::vector<std::wstring> rootRels;
+    uint64_t rf = 0;
+    uint64_t rd = 0;
+    const auto st2 = MftEnumerator::EnumerateWin32Subtree(
+        dir, L"", rf, rd,
+        [&](FileEntry&& e) {
+            rootRels.push_back(e.relativePath);
+            return true;
+        },
+        [](const ScanError&) {}, {}, nullptr);
+    CHECK(st2 == MftEnumerator::SubtreeStatus::Ok);
+    CHECK_EQ(rootRels.size(), 6u);
+    CHECK_EQ(rf, 4u);
+    CHECK_EQ(rd, 2u);
+    CHECK(std::find(rootRels.begin(), rootRels.end(), L"a.txt") != rootRels.end());
+    CHECK(std::find(rootRels.begin(), rootRels.end(), L"sub\\deep\\d.txt") != rootRels.end());
+
+    // Consumer abort: onEntry returns false -> Aborted, never Ok.
+    uint64_t af = 0;
+    uint64_t ad = 0;
+    int seen = 0;
+    const auto st3 = MftEnumerator::EnumerateWin32Subtree(
+        dir, L"", af, ad, [&](FileEntry&&) { return ++seen < 3; },
+        [](const ScanError&) {}, {}, nullptr);
+    CHECK(st3 == MftEnumerator::SubtreeStatus::Aborted);
+
+    // Unreadable root (does not exist): Unreadable, not DeviceLost.
+    uint64_t uf = 0;
+    uint64_t ud = 0;
+    const auto st4 = MftEnumerator::EnumerateWin32Subtree(
+        dir + L"\\no_such_dir", L"", uf, ud, [](FileEntry&&) { return true; },
+        [](const ScanError&) {}, {}, nullptr);
+    CHECK(st4 == MftEnumerator::SubtreeStatus::Unreadable);
+});
+
 // ---------------------------------------------------------------------------
 // Phase 5: export CSV/JSON, binary snapshot, hash cache, offline compare
 
