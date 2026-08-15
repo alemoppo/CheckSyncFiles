@@ -832,9 +832,19 @@ MftEnumerator::SubtreeStatus MftEnumerator::EnumerateWin32Subtree(
         }
         return true;
     };
+    // Prefix error paths with the fallback directory's scan-root-relative
+    // prefix, exactly as the entry callback does, so errors report against the
+    // scan root (not the subtree root the Win32Enumerator was driven from).
+    // An empty error path (e.g. the fallback directory itself being unreadable)
+    // refers to the directory as a whole, so it is reported as `relPrefix`.
     const ErrorCallback subError = [&](const ScanError& e) {
         if (e.lostDevice) lostDevice = true;
-        if (onError) onError(e);
+        if (onError) {
+            ScanError prefixed = e;
+            prefixed.path = pathutil::JoinRel(relPrefix, e.path);
+            if (prefixed.path.empty()) prefixed.path = relPrefix;
+            onError(prefixed);
+        }
     };
     const ProgressCallback subProgress = [&](uint64_t files, uint64_t dirs,
                                              const std::wstring& path) {
@@ -849,6 +859,177 @@ MftEnumerator::SubtreeStatus MftEnumerator::EnumerateWin32Subtree(
     if (consumerAbort) return SubtreeStatus::Aborted;
     if (!ok) return lostDevice ? SubtreeStatus::DeviceLost : SubtreeStatus::Unreadable;
     return SubtreeStatus::Ok;
+}
+
+// Outcome of the shared per-directory walk step (WalkDirectoryStep).
+enum class DirStepOutcome {
+    EmitMft,            // MFT resolved the directory: children in `kids`
+    FallbackOk,         // Win32 fallback emitted the directory's subtree
+    FallbackAborted,    // consumer stopped the fallback subtree walk
+    FallbackDeviceLost, // storage disappeared during the fallback
+    FallbackUnreadable  // unreadable through both backends: scan stays incomplete
+};
+
+// A directory's child while the walk builds it (shared by the walk and the
+// test seam that drives the same per-directory step).
+struct ChildEntry {
+    std::wstring name;
+    bool viaIndex;
+};
+
+// Reports an unreadable directory; `dirPath` is the path (relative to the scan
+// root) of the directory whose $I30 index or child could not be resolved, so
+// the caller can show which subtree the scan missed.
+void ReportIncomplete(const IFileEnumerator::ErrorCallback& onError, bool& incomplete,
+                      const std::wstring& dirPath, const wchar_t* why, uint64_t rec) {
+    incomplete = true;
+    if (onError) {
+        ScanError e;
+        e.path = dirPath;
+        e.message = std::wstring(L"MFT scan incomplete: ") + why + L" (record " +
+                    std::to_wstring(rec) + L")";
+        e.winError = ERROR_INVALID_DATA;
+        onError(e);
+    }
+}
+
+// The per-directory step of the top-down walk, shared verbatim between
+// enumerate() and WalkDirectoryStepForTest: resolves the directory's full $I30
+// from the parsed records, collects its children, and -- when the MFT cannot
+// reconstruct the directory -- runs the per-directory Win32 fallback on the
+// real subtree at `normRoot` + `dirRel`. `read` fetches raw bytes (a volume
+// HANDLE in enumerate(), an in-memory store in the test seam). Returns the
+// outcome; `kids` is filled only for EmitMft (the caller emits the children).
+template <typename RawReader>
+DirStepOutcome WalkDirectoryStep(
+    std::vector<RecInfo>& recs, uint64_t nRecords,
+    const std::unordered_map<uint64_t, std::vector<uint32_t>>& revChildren,
+    const RawReader& read, uint64_t cluster, uint32_t bytesPerSector,
+    const std::wstring& normRoot, uint64_t dirRec, const std::wstring& dirRel,
+    const IFileEnumerator::EntryCallback& onEntry,
+    const IFileEnumerator::ErrorCallback& onError,
+    const IFileEnumerator::ProgressCallback& onProgress,
+    const std::atomic_bool* cancel, uint64_t& files, uint64_t& dirs,
+    size_t& diagIndexBlocks, size_t& diagIndexChildren, size_t& diagWin32FallbackDirs,
+    std::vector<std::pair<uint64_t, ChildEntry>>& kids, bool& incomplete) {
+    RecInfo& d = recs[dirRec];
+
+    // Resolve the directory's full $I30 (root entries + allocation leaf
+    // blocks). The resident root entries are parsed here (not in Pass A) so
+    // that an $INDEX_ROOT merged back from an extension record via
+    // $ATTRIBUTE_LIST is already present when the node is walked. A
+    // directory the parser cannot reconstruct is NOT reported incomplete:
+    // its subtree falls back to a per-directory Win32 enumeration below.
+    bool needWin32Fallback = false;
+    if (!d.indexResolved) {
+        d.indexResolved = true;
+        if (!d.idxRoot.empty()) {
+            ParseIndexRootValue(d.idxRoot, d.children);
+        }
+        if (!d.idxAllocHdrs.empty()) {
+            std::vector<uint8_t> data;
+            if (!ReadIndexAllocationStream(read, cluster, d.idxAllocHdrs, data)) {
+                needWin32Fallback = true;
+            } else {
+                const size_t blk = (d.idxBlockSize >= kMinIndexBlockSize &&
+                                    d.idxBlockSize <= kMaxIndexBlockSize)
+                                       ? d.idxBlockSize
+                                       : kIndexBlockSizeDefault;
+                const size_t parsed =
+                    ParseIndexAllocationData(data, blk, bytesPerSector, d.children);
+                if (parsed == SIZE_MAX) {
+                    needWin32Fallback = true;
+                } else {
+                    diagIndexBlocks += parsed;
+                }
+            }
+        }
+        if (!needWin32Fallback && d.children.empty() && d.idxRoot.empty()) {
+            needWin32Fallback = true;
+        }
+    }
+
+    // Collect this directory's children: index entries first (authoritative),
+    // then parent-pointer union (redundant source). An unresolvable child
+    // reference also triggers the per-directory fallback: a directory is
+    // either fully reconstructed from the MFT or fully Win32-enumerated,
+    // never partially.
+    std::unordered_map<uint64_t, ChildEntry> kidMap;
+    if (!needWin32Fallback) {
+        for (const auto& c : d.children) {
+            const uint64_t cr = c.ref.rec;
+            if (cr >= nRecords || !recs[cr].parsed || !recs[cr].inUse ||
+                recs[cr].seq != c.ref.seq) {
+                needWin32Fallback = true;
+                break;
+            }
+            // Prefer the record's WIN32 name for this parent (the index key can
+            // be the DOS 8.3 short name and is not a reliable display name).
+            const std::wstring recName = ChildNameOf(recs[cr], {dirRec, d.seq});
+            kidMap.emplace(cr, ChildEntry{recName.empty() ? c.name : recName, true});
+            ++diagIndexChildren;
+        }
+        if (!needWin32Fallback) {
+            if (auto it = revChildren.find(dirRec); it != revChildren.end()) {
+                for (uint32_t cr : it->second) {
+                    RecInfo& cRec = recs[cr];
+                    if (!cRec.parsed || !cRec.inUse) continue;
+                    // stale parent references (reused directory record) are caught
+                    // by the sequence check: only links carrying this directory's
+                    // live sequence are trusted.
+                    bool linkOk = false;
+                    for (const auto& nm : cRec.names) {
+                        if (nm.parent.rec == dirRec && nm.parent.seq == d.seq) linkOk = true;
+                    }
+                    if (!linkOk) continue;
+                    if (kidMap.count(cr)) continue;
+                    kidMap.emplace(cr, ChildEntry{ChildNameOf(cRec, {dirRec, d.seq}), false});
+                }
+            }
+        }
+    }
+
+    if (needWin32Fallback) {
+        // Per-directory Win32 fallback: enumerate ONLY this directory's
+        // subtree via FindFirstFileW and feed it into the same tree/flow the
+        // MFT walk uses. The rest of the scan stays MFT-backed, and this
+        // directory is not reported incomplete. `absDir` is resolved from the
+        // (already normalized) scan root; Win32Enumerator handles long paths
+        // and skips reparse points exactly like the MFT walk does.
+        ++diagWin32FallbackDirs;
+        const std::wstring absDir =
+            dirRel.empty() ? normRoot : pathutil::MakeAbsolute(normRoot, dirRel);
+        const uint64_t baseFiles = files;
+        const uint64_t baseDirs = dirs;
+        uint64_t fbFiles = 0;
+        uint64_t fbDirs = 0;
+        const IFileEnumerator::ProgressCallback fbProgress = [&](uint64_t f, uint64_t d,
+                                                                 const std::wstring& p) {
+            if (onProgress) onProgress(baseFiles + f, baseDirs + d, p);
+        };
+        const MftEnumerator::SubtreeStatus st = MftEnumerator::EnumerateWin32Subtree(
+            absDir, dirRel, fbFiles, fbDirs, onEntry, onError, fbProgress, cancel);
+        files += fbFiles;
+        dirs += fbDirs;
+        if (st == MftEnumerator::SubtreeStatus::Aborted) {
+            return DirStepOutcome::FallbackAborted;
+        }
+        if (st == MftEnumerator::SubtreeStatus::DeviceLost) {
+            return DirStepOutcome::FallbackDeviceLost;
+        }
+        if (st == MftEnumerator::SubtreeStatus::Unreadable) {
+            // Genuinely unreadable through BOTH backends (e.g. an ACL denies
+            // traversal): report it and mark the scan incomplete. The caller
+            // must NOT treat this as a successful/subtree fallback -- the
+            // directory's children are missing, so the scan is incomplete.
+            ReportIncomplete(onError, incomplete, dirRel,
+                             L"directory $I30 unreadable (MFT and Win32 fallback)", dirRec);
+            return DirStepOutcome::FallbackUnreadable;
+        }
+        return DirStepOutcome::FallbackOk;
+    }
+    kids.assign(kidMap.begin(), kidMap.end());
+    return DirStepOutcome::EmitMft;
 }
 
 bool MftEnumerator::enumerate(const std::wstring& root,
@@ -1041,23 +1222,8 @@ const uint64_t segSize = vd.BytesPerFileRecordSegment;
     }
 
     bool incomplete = false;
-    // Reports an unreadable directory; `dirPath` is the path (relative to the
-    // scan root) of the directory whose $I30 index or child could not be
-    // resolved, so the caller can show which subtree the scan missed.
-    auto failIncomplete = [&](const std::wstring& dirPath, const wchar_t* why,
-                              uint64_t rec) {
-        incomplete = true;
-        if (onError) {
-            ScanError e;
-            e.path = dirPath;
-            e.message = std::wstring(L"MFT scan incomplete: ") + why + L" (record " +
-                        std::to_wstring(rec) + L")";
-            e.winError = ERROR_INVALID_DATA;
-            onError(e);
-        }
-    };
 
-    // ---- Root structural validation ----------------------------------------
+    // ---- Root structural validation ---------------------------------------
     if (rootRef.rec >= nRecords || !recs[rootRef.rec].inUse ||
         recs[rootRef.rec].seq != rootRef.seq) {
         BVDBG("mft[9] root invalid rec=%llu n=%llu inUse=%d seq=%u liveSeq=%u\\n",
@@ -1110,10 +1276,6 @@ const uint64_t segSize = vd.BytesPerFileRecordSegment;
     }
 
     // ---- Top-down walk from the root ---------------------------------------
-    struct ChildEntry {
-        std::wstring name;
-        bool viaIndex;
-    };
 
     std::vector<std::pair<uint64_t, std::wstring>> work;
     work.push_back({rootRef.rec, L""});
@@ -1142,135 +1304,37 @@ const uint64_t segSize = vd.BytesPerFileRecordSegment;
         const uint64_t dirRec = top.first;
         const std::wstring dirRel = top.second;
 
-        RecInfo& d = recs[dirRec];
-
-        // Resolve the directory's full $I30 (root entries + allocation leaf
-        // blocks). The resident root entries are parsed here (not in Pass A) so
-        // that an $INDEX_ROOT merged back from an extension record via
-        // $ATTRIBUTE_LIST is already present when the node is walked. A
-        // directory the parser cannot reconstruct is NOT reported incomplete:
-        // its subtree falls back to a per-directory Win32 enumeration below.
-        bool needWin32Fallback = false;
-        if (!d.indexResolved) {
-            d.indexResolved = true;
-            if (!d.idxRoot.empty()) {
-                ParseIndexRootValue(d.idxRoot, d.children);
-            }
-            if (!d.idxAllocHdrs.empty()) {
-                std::vector<uint8_t> data;
-                if (!ReadIndexAllocationStream(rawReader, cluster, d.idxAllocHdrs, data)) {
-                    needWin32Fallback = true;
-                } else {
-                    const size_t blk = (d.idxBlockSize >= kMinIndexBlockSize &&
-                                        d.idxBlockSize <= kMaxIndexBlockSize)
-                                           ? d.idxBlockSize
-                                           : kIndexBlockSizeDefault;
-                    const size_t parsed =
-                        ParseIndexAllocationData(data, blk, bytesPerSector, d.children);
-                    if (parsed == SIZE_MAX) {
-                        needWin32Fallback = true;
-                    } else {
-                        diagIndexBlocks += parsed;
-                    }
-                }
-            }
-            if (!needWin32Fallback && d.children.empty() && d.idxRoot.empty()) {
-                needWin32Fallback = true;
-            }
+        std::vector<std::pair<uint64_t, ChildEntry>> kids;
+        const DirStepOutcome step = WalkDirectoryStep(
+            recs, nRecords, revChildren, rawReader, cluster, bytesPerSector, normRoot,
+            dirRec, dirRel, onEntry, onError, onProgress, cancel, files, dirs,
+            diagIndexBlocks, diagIndexChildren, diagWin32FallbackDirs, kids, incomplete);
+        if (step == DirStepOutcome::FallbackAborted) {
+            CloseHandle(hVol);
+            return true; // consumer asked to stop
         }
-
-        // Collect this directory's children: index entries first (authoritative),
-        // then parent-pointer union (redundant source). An unresolvable child
-        // reference also triggers the per-directory fallback: a directory is
-        // either fully reconstructed from the MFT or fully Win32-enumerated,
-        // never partially.
-        std::unordered_map<uint64_t, ChildEntry> kids;
-        if (!needWin32Fallback) {
-            for (const auto& c : d.children) {
-                const uint64_t cr = c.ref.rec;
-                if (cr >= nRecords || !recs[cr].parsed || !recs[cr].inUse ||
-                    recs[cr].seq != c.ref.seq) {
-                    needWin32Fallback = true;
-                    break;
-                }
-                // Prefer the record's WIN32 name for this parent (the index key can
-                // be the DOS 8.3 short name and is not a reliable display name).
-                const std::wstring recName = ChildNameOf(recs[cr], {dirRec, d.seq});
-                kids.emplace(cr, ChildEntry{recName.empty() ? c.name : recName, true});
-                ++diagIndexChildren;
-            }
-            if (!needWin32Fallback) {
-                if (auto it = revChildren.find(dirRec); it != revChildren.end()) {
-                    for (uint32_t cr : it->second) {
-                        RecInfo& cRec = recs[cr];
-                        if (!cRec.parsed || !cRec.inUse) continue;
-                        // stale parent references (reused directory record) are caught
-                        // by the sequence check: only links carrying this directory's
-                        // live sequence are trusted.
-                        bool linkOk = false;
-                        for (const auto& nm : cRec.names) {
-                            if (nm.parent.rec == dirRec && nm.parent.seq == d.seq) linkOk = true;
-                        }
-                        if (!linkOk) continue;
-                        if (kids.count(cr)) continue;
-                        kids.emplace(cr, ChildEntry{ChildNameOf(cRec, {dirRec, d.seq}), false});
-                    }
-                }
-            }
+        if (step == DirStepOutcome::FallbackDeviceLost) {
+            CloseHandle(hVol);
+            return false; // storage gone: abort the whole scan
         }
-
-        if (needWin32Fallback) {
-            // Per-directory Win32 fallback: enumerate ONLY this directory's
-            // subtree via FindFirstFileW and feed it into the same tree/flow the
-            // MFT walk uses. The rest of the scan stays MFT-backed, and this
-            // directory is not reported incomplete. `absDir` is resolved from the
-            // (already normalized) scan root; Win32Enumerator handles long paths
-            // and skips reparse points exactly like the MFT walk does.
-            ++diagWin32FallbackDirs;
-            const std::wstring absDir =
-                dirRel.empty() ? normRoot : pathutil::MakeAbsolute(normRoot, dirRel);
-            const uint64_t baseFiles = files;
-            const uint64_t baseDirs = dirs;
-            uint64_t fbFiles = 0;
-            uint64_t fbDirs = 0;
-            const ProgressCallback fbProgress = [&](uint64_t f, uint64_t d,
-                                                    const std::wstring& p) {
-                if (onProgress) onProgress(baseFiles + f, baseDirs + d, p);
-            };
-            const SubtreeStatus st = EnumerateWin32Subtree(
-                absDir, dirRel, fbFiles, fbDirs, onEntry, onError, fbProgress, cancel);
-            files += fbFiles;
-            dirs += fbDirs;
-            if (st == SubtreeStatus::Aborted) {
-                CloseHandle(hVol);
-                return true; // consumer asked to stop
-            }
-            if (st == SubtreeStatus::DeviceLost) {
-                CloseHandle(hVol);
-                return false; // storage gone: abort the whole scan
-            }
-            if (st == SubtreeStatus::Unreadable) {
-                // Genuinely unreadable through BOTH backends (e.g. an ACL denies
-                // traversal): report it and keep the scan honest -- enumerate()
-                // returns false, so the caller falls back to a full Win32 rebuild,
-                // exactly as if the MFT had failed on this directory.
-                failIncomplete(dirRel,
-                               L"directory $I30 unreadable (MFT and Win32 fallback)",
-                               dirRec);
-            }
+        if (step == DirStepOutcome::FallbackUnreadable) {
+            // Directory unreadable through both backends: reported incomplete
+            // (ReportIncomplete set `incomplete` inside WalkDirectoryStep, which
+            // makes enumerate() return false). Skip its children and keep
+            // walking siblings: this is not a whole-scan abort.
             continue;
         }
+        if (step == DirStepOutcome::FallbackOk) continue;
 
         // Emit children in alphabetical order (depth-first), skipping the
         // volume metafile band ($MFT, $Boot, ...).
-        std::vector<std::pair<uint64_t, ChildEntry>> ordered(kids.begin(), kids.end());
-        std::sort(ordered.begin(), ordered.end(),
+        std::sort(kids.begin(), kids.end(),
                   [](const std::pair<uint64_t, ChildEntry>& a,
                      const std::pair<uint64_t, ChildEntry>& b) { return a.second.name < b.second.name; });
 
-        for (size_t k = ordered.size(); k-- > 0;) {
-            const uint64_t cr = ordered[k].first;
-            const std::wstring& cname = ordered[k].second.name;
+        for (size_t k = kids.size(); k-- > 0;) {
+            const uint64_t cr = kids[k].first;
+            const std::wstring& cname = kids[k].second.name;
             if (isMetafile(cr, cname)) continue;
             const RecInfo& cRec = recs[cr];
 
@@ -1456,6 +1520,86 @@ bool MftEnumerator::ResolveDirectoryForTest(
               });
     for (const auto& k : kids) outEntries.push_back({k.second, k.first});
     return true;
+}
+
+MftEnumerator::DirWalkOutcome MftEnumerator::WalkDirectoryStepForTest(
+    const std::map<uint64_t, std::vector<uint8_t>>& records, uint64_t dirRec,
+    const std::wstring& dirRel, const std::wstring& normRoot,
+    std::vector<std::pair<std::wstring, uint64_t>>& outEntries,
+    const EntryCallback& onEntry, const ErrorCallback& onError,
+    const ProgressCallback& onProgress, const std::atomic_bool* cancel,
+    size_t* outDiagFallbackDirs, uint32_t clusterSize, uint32_t bytesPerSector,
+    bool* outDiagIncomplete) {
+    outEntries.clear();
+    if (outDiagFallbackDirs) *outDiagFallbackDirs = 0;
+    if (outDiagIncomplete) *outDiagIncomplete = false;
+
+    // Same Pass A/B reconstruction enumerate() performs on the raw MFT, driven
+    // from fixture bytes instead of a volume HANDLE: this is the identical
+    // RecInfo population the real walk consumes, so WalkDirectoryStep below is
+    // the *same* function a production scan calls.
+    const uint64_t nRecords =
+        records.empty() ? uint64_t{0} : (records.rbegin()->first + 1);
+    std::vector<RecInfo> recs((size_t)nRecords);
+    // No in-memory cluster store in this seam: non-resident $I30 payloads are
+    // unreadable, which is exactly one of the trigger cases the walk falls back
+    // from (mirrors resolve-without-clusters in ResolveDirectoryForTest).
+    const auto memReader = [](uint64_t, uint8_t*, size_t) -> bool { return false; };
+
+    for (const auto& [recNo, bytes] : records) {
+        if (recNo >= nRecords) continue;
+        std::vector<uint8_t> work = bytes;
+        if (!ApplyFixup(work.data(), work.size())) continue;
+        ParseRecord(work.data(), work.size(), recs[recNo]);
+        size_t diag = 0;
+        MergePassAFromRecord(recs, recNo, work.data(), diag);
+    }
+    for (uint64_t i = 0; i < nRecords; ++i) {
+        RecInfo& r = recs[i];
+        if (!r.parsed || !r.inUse) continue;
+        if (r.attrList.empty() && r.attrListHdr.empty()) continue;
+        std::vector<uint8_t> listData;
+        if (!r.attrList.empty()) {
+            listData = r.attrList;
+        } else {
+            continue; // non-resident $ATTRIBUTE_LIST: no cluster store in this seam
+        }
+        size_t diag = 0;
+        MergePassBFromList(recs, i, r, listData, diag);
+    }
+
+    // Reverse index (parent pointer union), same shape as enumerate().
+    std::unordered_map<uint64_t, std::vector<uint32_t>> revChildren;
+    for (uint64_t i = 0; i < nRecords; ++i) {
+        RecInfo& r = recs[i];
+        if (!r.parsed || !r.inUse || r.names.empty()) continue;
+        for (const auto& nm : r.names) {
+            if (nm.ns != 0xFF) revChildren[nm.parent.rec].push_back((uint32_t)i);
+        }
+    }
+
+    uint64_t files = 0;
+    uint64_t dirs = 0;
+    size_t diagIndexBlocks = 0;
+    size_t diagIndexChildren = 0;
+    size_t diagFallbackDirs = 0;
+    bool incomplete = false;
+    std::vector<std::pair<uint64_t, ChildEntry>> kids;
+    const DirStepOutcome step = WalkDirectoryStep(
+        recs, nRecords, revChildren, memReader, clusterSize, bytesPerSector,
+        normRoot, dirRec, dirRel, onEntry, onError, onProgress, cancel, files, dirs,
+        diagIndexBlocks, diagIndexChildren, diagFallbackDirs, kids, incomplete);
+    if (outDiagFallbackDirs) *outDiagFallbackDirs = diagFallbackDirs;
+    if (outDiagIncomplete) *outDiagIncomplete = incomplete;
+
+    if (step == DirStepOutcome::EmitMft) {
+        for (const auto& k : kids) outEntries.emplace_back(k.second.name, k.first);
+        return DirWalkOutcome::MftResolved;
+    }
+    if (step == DirStepOutcome::FallbackAborted) return DirWalkOutcome::FallbackAborted;
+    if (step == DirStepOutcome::FallbackDeviceLost) return DirWalkOutcome::FallbackDeviceLost;
+    if (step == DirStepOutcome::FallbackUnreadable) return DirWalkOutcome::FallbackUnreadable;
+    return DirWalkOutcome::FallbackOk;
 }
 
 } // namespace bv

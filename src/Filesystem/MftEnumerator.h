@@ -118,6 +118,40 @@ public:
         uint64_t& outFiles, uint64_t& outDirs, const EntryCallback& onEntry,
         const ErrorCallback& onError, const ProgressCallback& onProgress,
         const std::atomic_bool* cancel);
+
+    // Outcome of WalkDirectoryStepForTest: mirrors the MFT walk's per-directory
+    // decision, including whether the Win32 fallback was triggered.
+    enum class DirWalkOutcome {
+        MftResolved,        // directory reconstructed from the MFT: no fallback
+        FallbackOk,         // Win32 fallback emitted the directory's subtree
+        FallbackAborted,    // consumer stopped the fallback subtree walk
+        FallbackDeviceLost, // storage disappeared during the fallback
+        FallbackUnreadable  // unreadable through both backends: scan incomplete
+    };
+
+    // Test-only seam that runs the SAME per-directory walk step enumerate()
+    // uses (WalkDirectoryStep): parses `records`, resolves directory `dirRec`'s
+    // $I30, and -- when the MFT cannot reconstruct it -- runs the per-directory
+    // Win32 fallback on the real subtree rooted at `normRoot` (a temp tree,
+    // never a hardcoded drive letter). This exercises the real trigger path
+    // walk -> $I30 failure -> Win32 fallback deterministically, without a live
+    // NTFS volume. `dirRel` is the directory's scan-root-relative prefix.
+    // `outEntries` receives the MFT-resolved children (relativePath, recordNo)
+    // when the outcome is MftResolved; otherwise the subtree was emitted via
+    // `onEntry` (Win32-sourced entries carry fileId==0). `outDiagFallbackDirs`
+    // (optional) receives the number of directories that fell back, so a test
+    // can assert the fallback fired exactly where expected. `outDiagIncomplete`
+    // (optional) receives whether the directory was reported unreadable through
+    // both backends (the per-directory equivalent of enumerate()'s `incomplete`
+    // flag, which makes the production walk return false).
+    static DirWalkOutcome WalkDirectoryStepForTest(
+        const std::map<uint64_t, std::vector<uint8_t>>& records, uint64_t dirRec,
+        const std::wstring& dirRel, const std::wstring& normRoot,
+        std::vector<std::pair<std::wstring, uint64_t>>& outEntries,
+        const EntryCallback& onEntry, const ErrorCallback& onError,
+        const ProgressCallback& onProgress, const std::atomic_bool* cancel,
+        size_t* outDiagFallbackDirs = nullptr, uint32_t clusterSize = 4096,
+        uint32_t bytesPerSector = 512, bool* outDiagIncomplete = nullptr);
 };
 
 } // namespace bv
