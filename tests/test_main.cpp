@@ -2113,6 +2113,97 @@ TEST("mft: walk -> extension record carrying $FILE_NAME is not emitted as a phan
     CHECK_EQ(mftEntries[0].second, 4701u); // the BASE record, never the extension 4702
 });
 
+TEST("mft: walk -> base owning $FILE_NAME + extension $FILE_NAMEs stays one identity per dir (dedupe + hard link)", [] {
+    // The complement of the regression above: the base record e31b1e5 fixes can
+    // also ALREADY carry a $FILE_NAME of its own while its extension records
+    // relocate MORE $FILE_NAMEs. Three distinct invariants are pinned here and
+    // each must hold together (none was exercised by the synthetic suite before):
+    //
+    //   * Caso C -- an extension record repeats the base's OWN (parent,ns,name)
+    //     $FILE_NAME: the MergePassAFromRecord dedupe must drop the duplicate, so
+    //     the name list stays {mixed.bin} and the directory emits ONE child.
+    //   * Caso E (hard link via extension) -- a second parent (dir 4600) indexes
+    //     the SAME base record, and its $FILE_NAME (alias.bin) lives ONLY in the
+    //     extension record 4702. By construction real NTFS hard links come BEFORE
+    //     the merge, so the base's link under dir 4600 must be emitted exactly
+    //     once, appended with the extension's name -- never as a phantom child of
+    //     record 4702.
+    //   * Caso D -- multiple extension records (4702 + 4703) must all collapse
+    //     into the base identity; neither extension may surface as a child.
+    //
+    //   dir 4700 index -> base 4701 "mixed.bin"
+    //   dir 4600 index -> base 4701 "alias.bin"
+    //   base 4701: $FILE_NAME(parent 4700, "mixed.bin") + $DATA 128, no baseRef
+    //   ext1 4702 (baseRef 4701): $FILE_NAME(parent 4600, "alias.bin")
+    //   ext2 4703 (baseRef 4701): $FILE_NAME(parent 4700, "mixed.bin")  [dup of base]
+    const uint64_t baseRef = 4701ull | (1ull << 48);
+    std::map<uint64_t, std::vector<uint8_t>> records;
+
+    auto d0 = BuildFileRecord(4700, 1, 0x0003, 0); // in-use + directory
+    AppendResidentAttr(d0, 0x30, L"", BuildFileNameValue(4699, 1, L"dir4700", 1));
+    AppendResidentAttr(d0, 0x90, L"$I30",
+                       BuildIndexRootValueWith({{baseRef, L"mixed.bin"}}));
+    FinishRecord(d0);
+    records[4700] = std::move(d0);
+
+    auto d1 = BuildFileRecord(4600, 1, 0x0003, 0); // in-use + directory
+    AppendResidentAttr(d1, 0x30, L"", BuildFileNameValue(4599, 1, L"dir4600", 1));
+    AppendResidentAttr(d1, 0x90, L"$I30",
+                       BuildIndexRootValueWith({{baseRef, L"alias.bin"}}));
+    FinishRecord(d1);
+    records[4600] = std::move(d1);
+
+    auto base = BuildFileRecord(4701, 1, 0x0001, 0); // in-use + file, owns mixed.bin
+    AppendResidentAttr(base, 0x30, L"", BuildFileNameValue(4700, 1, L"mixed.bin", 1));
+    AppendResidentAttr(base, 0x80, L"", std::vector<uint8_t>(128, 0xAB));
+    FinishRecord(base);
+    records[4701] = std::move(base);
+
+    auto ext1 = BuildFileRecord(4702, 1, 0x0001, baseRef); // hard-link name here
+    AppendResidentAttr(ext1, 0x30, L"", BuildFileNameValue(4600, 1, L"alias.bin", 1));
+    FinishRecord(ext1);
+    records[4702] = std::move(ext1);
+
+    auto ext2 = BuildFileRecord(4703, 1, 0x0001, baseRef); // duplicate of base's own
+    AppendResidentAttr(ext2, 0x30, L"", BuildFileNameValue(4700, 1, L"mixed.bin", 1));
+    FinishRecord(ext2);
+    records[4703] = std::move(ext2);
+
+    std::vector<std::pair<std::wstring, uint64_t>> d0Entries;
+    std::vector<std::pair<std::wstring, uint64_t>> d1Entries;
+    std::vector<FileEntry> fbEntries;
+    size_t fallbackDirs = 0;
+    std::atomic_bool cancel{false};
+    const auto walk0 = MftEnumerator::WalkDirectoryStepForTest(
+        records, 4700, L"", L"", d0Entries,
+        [&](FileEntry&& e) { fbEntries.push_back(std::move(e)); return true; },
+        [](const ScanError&) {}, [](uint64_t, uint64_t, const std::wstring&) {},
+        &cancel, &fallbackDirs);
+    CHECK(walk0 == MftEnumerator::DirWalkOutcome::MftResolved);
+    CHECK_EQ(fallbackDirs, 0u);
+    CHECK_EQ(d0Entries.size(), 1u); // dedupe: the duplicate ext name adds no child
+    if (d0Entries.size() == 1) {
+        CHECK(d0Entries[0].first == L"mixed.bin");
+        CHECK_EQ(d0Entries[0].second, 4701u); // the base, never an extension
+    }
+
+    size_t fallbackDirs2 = 0;
+    std::atomic_bool cancel2{false};
+    const auto walk1 = MftEnumerator::WalkDirectoryStepForTest(
+        records, 4600, L"", L"", d1Entries,
+        [&](FileEntry&& e) { fbEntries.push_back(std::move(e)); return true; },
+        [](const ScanError&) {}, [](uint64_t, uint64_t, const std::wstring&) {},
+        &cancel2, &fallbackDirs2);
+    CHECK(walk1 == MftEnumerator::DirWalkOutcome::MftResolved);
+    CHECK_EQ(fallbackDirs2, 0u);
+    CHECK_EQ(d1Entries.size(), 1u); // hard link resolves exactly once
+    if (d1Entries.size() == 1) {
+        CHECK(d1Entries[0].first == L"alias.bin");
+        CHECK_EQ(d1Entries[0].second, 4701u); // same base record: a real hard link
+    }
+    CHECK(fbEntries.empty()); // Win32 fallback never ran
+});
+
 TEST("mft: cancellation during Win32 fallback stops the walk, never reports a failure", [] {
     // Deterministic, no-sleep test of cancellation *during* the per-directory
     // fallback. The fallback drives Win32Enumerator on a real temp tree; the
