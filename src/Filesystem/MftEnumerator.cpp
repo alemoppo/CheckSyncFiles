@@ -306,6 +306,7 @@ struct RecInfo {
     bool isDir = false;
     bool isReparse = false;
     uint16_t seq = 0;
+    FileRef baseRef;       // base record reference (@+32); rec==0 => base record
     uint64_t mtime = 0;    // best-known last-write time
     uint64_t dataSize = 0; // $DATA logical size (authoritative)
     std::vector<NameInfo> names;      // every $FILE_NAME attribute
@@ -403,6 +404,7 @@ void ParseRecord(const uint8_t* rec, size_t bufSize, RecInfo& out) {
     const uint16_t attrOffset = *reinterpret_cast<const uint16_t*>(rec + 20);
     if (attrOffset < 48 || (size_t)attrOffset + 24 > bufSize) return;
     out.seq = *reinterpret_cast<const uint16_t*>(rec + 16);
+    out.baseRef = SplitRef(*reinterpret_cast<const uint64_t*>(rec + 32));
     const uint16_t hdr = *reinterpret_cast<const uint16_t*>(rec + 22);
     out.inUse = (hdr & 1) != 0;
     out.isDir = (hdr & 2) != 0;
@@ -739,12 +741,22 @@ bool ParseAttrListData(const uint8_t* p, size_t n, std::vector<MftAttrListEntry>
 // test seam, so the seam fails if this merge ever regresses. `recIndex` is the
 // parsed record's number, `rec` its (fixup-applied) bytes; `recs` is the whole
 // per-record table; `diag` counts merged pieces (BV_MFT_DEBUG_FILE).
+//
+// The extension's $FILE_NAME attributes are annexed too: NTFS relocates them
+// there when the base record's fixed 1 KB slot overflows (a large $DATA run
+// list, as observed on the real E: volume). The base record then holds NO
+// $FILE_NAME at all, and the parent directory's $I30 still references only the
+// base record. Without the merge the base record would be anonymous: it would
+// be picked up by the parent-pointer union only as a zero-name child, and the
+// extension record itself would be emitted as a phantom zero-size twin of the
+// file.
 void MergePassAFromRecord(std::vector<RecInfo>& recs, uint64_t recIndex,
                           const uint8_t* rec, size_t& diag) {
-    const FileRef baseRef = SplitRef(*reinterpret_cast<const uint64_t*>(rec + 32));
+    (void)rec;
+    const RecInfo& r = recs[recIndex];
+    const FileRef baseRef = r.baseRef;
     if (baseRef.rec != 0 && baseRef.rec != recIndex && baseRef.rec < recs.size()) {
         RecInfo& base = recs[baseRef.rec];
-        const RecInfo& r = recs[recIndex];
         if (base.parsed && base.inUse && base.seq == baseRef.seq) {
             if (base.idxRoot.empty() && !r.idxRoot.empty()) {
                 base.idxRoot = r.idxRoot;
@@ -755,6 +767,21 @@ void MergePassAFromRecord(std::vector<RecInfo>& recs, uint64_t recIndex,
                 if (VcnRangeKnown(base.idxAllocHdrs, h)) continue;
                 base.idxAllocHdrs.push_back(h);
                 ++diag;
+            }
+            for (const auto& nm : r.names) {
+                bool dup = false;
+                for (const auto& bn : base.names) {
+                    if (bn.parent.rec == nm.parent.rec && bn.parent.seq == nm.parent.seq &&
+                        bn.ns == nm.ns && bn.name == nm.name) {
+                        dup = true;
+                        break;
+                    }
+                }
+                if (!dup) {
+                    base.names.push_back(nm);
+                    ++diag;
+                    if (base.mtime == 0) base.mtime = nm.mtime;
+                }
             }
         }
     }
@@ -977,6 +1004,10 @@ DirStepOutcome WalkDirectoryStep(
                 for (uint32_t cr : it->second) {
                     RecInfo& cRec = recs[cr];
                     if (!cRec.parsed || !cRec.inUse) continue;
+                    // Extension records are never standalone children: their base
+                    // record is the true $I30 entry, and the extension's $FILE_NAME
+                    // was merged into the base by Pass A.
+                    if (cRec.baseRef.rec != 0) continue;
                     // stale parent references (reused directory record) are caught
                     // by the sequence check: only links carrying this directory's
                     // live sequence are trusted.
@@ -1273,6 +1304,13 @@ const uint64_t segSize = vd.BytesPerFileRecordSegment;
         }
         const RecInfo& r = recs[i];
         if (!r.parsed || !r.inUse || r.names.empty()) continue;
+        // An extension record (baseRef != 0) is a fragment of its base record:
+        // its $FILE_NAME was annexed into the base by Pass A, and the record
+        // itself is never a standalone directory child (its base is referenced
+        // by the $I30 instead). Excluding it keeps a file's name from a second
+        // emission and, critically, stops the union from inventing a zero-size
+        // phantom child from an extension record that carries no $DATA.
+        if (r.baseRef.rec != 0) continue;
         for (const auto& nm : r.names) {
             if (nm.ns != 0xFF) revChildren[nm.parent.rec].push_back((uint32_t)i);
         }
@@ -1588,6 +1626,10 @@ MftEnumerator::DirWalkOutcome MftEnumerator::WalkDirectoryStepForTest(
     for (uint64_t i = 0; i < nRecords; ++i) {
         RecInfo& r = recs[i];
         if (!r.parsed || !r.inUse || r.names.empty()) continue;
+        // Extension records (baseRef != 0) are fragments of their base record;
+        // their $FILE_NAME was annexed into the base by Pass A, so they must not
+        // also be registered here as standalone children of the parent.
+        if (r.baseRef.rec != 0) continue;
         for (const auto& nm : r.names) {
             if (nm.ns != 0xFF) revChildren[nm.parent.rec].push_back((uint32_t)i);
         }

@@ -2051,6 +2051,68 @@ TEST("mft: walk -> unresolvable $I30 -> Win32 fallback (real temp tree)", [] {
     }
 });
 
+TEST("mft: walk -> extension record carrying $FILE_NAME is not emitted as a phantom child", [] {
+    // Regression for the real E: volume bug (mcnext "sNa-sNb.zip"). NTFS moved a
+    // file's $FILE_NAME into an EXTENSION record (base record reference @+32 != 0)
+    // when the base record's fixed 1 KB slot overflowed with a huge $DATA run
+    // list. The base record then holds NO $FILE_NAME at all, and the parent
+    // directory's $I30 still references only the BASE record. Before the fix the
+    // parent-pointer union registered the extension record (its $FILE_NAME points
+    // at this directory) as a standalone child, so the walk emitted the same path
+    // TWICE: once from the $I30 with the base's real size, once as a phantom under
+    // the extension record, whose size is 0 (extension records carry no $DATA) --
+    // the CSV signature seen on E: (DIM_DIVERSA + EXTRA for the same path).
+    // After the fix the walk must list the file exactly once, under the BASE
+    // record, and the extension record must never surface as a child.
+    const uint64_t baseRef = 4701ull | (1ull << 48);
+    const std::vector<uint8_t> dataVal(128, 0xAB); // resident base $DATA
+
+    std::map<uint64_t, std::vector<uint8_t>> records;
+    auto d = BuildFileRecord(4700, 1, 0x0003, 0); // parent dir: in-use + directory
+    AppendResidentAttr(d, 0x30, L"", BuildFileNameValue(4699, 1, L"dir4700", 1));
+    AppendResidentAttr(d, 0x90, L"$I30",
+                       BuildIndexRootValueWith({{baseRef, L"s2a-s2b.zip"}}));
+    FinishRecord(d);
+    records[4700] = std::move(d);
+
+    auto base = BuildFileRecord(4701, 1, 0x0001, 0); // base: in-use + file, NO $FILE_NAME
+    AppendResidentAttr(base, 0x80, L"", dataVal);
+    FinishRecord(base);
+    const std::vector<uint8_t> baseBytes = base; // copy before the move below
+    records[4701] = std::move(base);
+
+    auto ext = BuildFileRecord(4702, 1, 0x0001, baseRef); // extension of 4701
+    AppendResidentAttr(ext, 0x30, L"", BuildFileNameValue(4700, 1, L"s2a-s2b.zip", 0));
+    FinishRecord(ext);
+    records[4702] = std::move(ext);
+
+    // The base carries the real size ($DATA) but no name; the extension carries
+    // the name but no $DATA (size 0) -- the phantom-twins arrangement on E:.
+    const auto baseResult = MftEnumerator::ParseRecordForTest(baseBytes);
+    CHECK(baseResult.parsed && baseResult.inUse && !baseResult.isDir);
+    CHECK_EQ(baseResult.dataSize, 128u);
+    const auto extResult = MftEnumerator::ParseRecordForTest(records[4702]);
+    CHECK(extResult.parsed && extResult.inUse);
+    CHECK_EQ(extResult.dataSize, 0u);
+
+    std::vector<std::pair<std::wstring, uint64_t>> mftEntries;
+    std::vector<FileEntry> fbEntries;
+    size_t fallbackDirs = 0;
+    std::atomic_bool cancel{false};
+    const auto out = MftEnumerator::WalkDirectoryStepForTest(
+        records, 4700, L"", L"", mftEntries,
+        [&](FileEntry&& e) { fbEntries.push_back(std::move(e)); return true; },
+        [](const ScanError&) {}, [](uint64_t, uint64_t, const std::wstring&) {},
+        &cancel, &fallbackDirs);
+
+    CHECK(out == MftEnumerator::DirWalkOutcome::MftResolved);
+    CHECK_EQ(fallbackDirs, 0u);
+    CHECK(fbEntries.empty()); // Win32 never ran
+    CHECK_EQ(mftEntries.size(), 1u); // exactly one emission, never a phantom twin
+    CHECK(mftEntries[0].first == L"s2a-s2b.zip");
+    CHECK_EQ(mftEntries[0].second, 4701u); // the BASE record, never the extension 4702
+});
+
 TEST("mft: cancellation during Win32 fallback stops the walk, never reports a failure", [] {
     // Deterministic, no-sleep test of cancellation *during* the per-directory
     // fallback. The fallback drives Win32Enumerator on a real temp tree; the
