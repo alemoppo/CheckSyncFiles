@@ -2,8 +2,6 @@
 
 #include <vector>
 
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
 #include <bcrypt.h>
 
 #include "Filesystem/PathUtil.h"
@@ -16,15 +14,53 @@ namespace {
 
 constexpr DWORD kiChunk = 1024 * 1024; // 1 MiB streaming buffer
 
-// Shared implementation. `Profile` selects at compile time whether the QPC
-// instrumentation is compiled in: the non-profiling instantiation (the common
-// path, used by the two-argument Sha256File) is identical to the original loop
-// with zero timing overhead, while the profiling instantiation records
-// read/hash/total time and the bytes read around the existing ReadFile /
-// BCryptHashData calls WITHOUT changing the loop structure or behaviour.
+// Path-opening wrapper used by the two public Sha256File overloads: open the
+// file, hash the handle, close it, and report `totalTicks` over the WHOLE
+// Sha256File() span (open -> close), matching the pre-refactor semantics. The
+// actual ReadFile / BCryptHashData loop lives in Sha256FileFromHandle below and
+// is shared with HashOneSide's unified single-handle flow.
 template <bool Profile>
 HashStatus Sha256FileImpl(const std::wstring& path, std::array<uint8_t, 32>& digest,
                           profiling::FileTimings* timings) {
+    const uint64_t t0 = profiling::QpcNow();
+    const std::wstring win = pathutil::AddLongPathPrefix(path);
+    HANDLE h = CreateFileW(win.c_str(), GENERIC_READ,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                           OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+    if (h == INVALID_HANDLE_VALUE) {
+        if constexpr (Profile) {
+            if (timings) {
+                timings->readTicks = 0;
+                timings->hashTicks = 0;
+                timings->bytesRead = 0;
+                timings->totalTicks = profiling::QpcNow() - t0;
+            }
+        }
+        return GetLastError() == ERROR_ACCESS_DENIED ? HashStatus::NoAccess
+                                                     : HashStatus::ReadError;
+    }
+
+    const HashStatus result = Sha256FileFromHandle<Profile>(h, digest, timings);
+    CloseHandle(h);
+    if constexpr (Profile) {
+        if (timings) timings->totalTicks = profiling::QpcNow() - t0;
+    }
+    return result;
+}
+
+} // namespace
+
+// Read + hash of an ALREADY-OPEN handle. It NEVER closes `h` (the caller owns
+// and closes the handle), so HashOneSide can reuse it after T1 and re-stat it
+// at T2 without extra opens. `Profile` selects at compile time whether the QPC
+// instrumentation is compiled in: the non-profiling instantiation is identical
+// to the original loop with zero timing overhead, while the profiling
+// instantiation records read/hash/total time and the bytes read around the
+// existing ReadFile / BCryptHashData calls WITHOUT changing the loop structure
+// or behaviour.
+template <bool Profile>
+HashStatus Sha256FileFromHandle(HANDLE h, std::array<uint8_t, 32>& digest,
+                                profiling::FileTimings* timings) {
     const uint64_t t0 = profiling::QpcNow();
     const auto finalize = [&](uint64_t readT, uint64_t hashT, uint64_t bytes) {
         if constexpr (Profile) {
@@ -37,27 +73,15 @@ HashStatus Sha256FileImpl(const std::wstring& path, std::array<uint8_t, 32>& dig
         }
     };
 
-    const std::wstring win = pathutil::AddLongPathPrefix(path);
-    HANDLE h = CreateFileW(win.c_str(), GENERIC_READ,
-                           FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
-                           OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
-    if (h == INVALID_HANDLE_VALUE) {
-        finalize(0, 0, 0);
-        return GetLastError() == ERROR_ACCESS_DENIED ? HashStatus::NoAccess
-                                                     : HashStatus::ReadError;
-    }
-
     BCRYPT_ALG_HANDLE alg = nullptr;
     if (!BCRYPT_SUCCESS(BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM,
                                                     nullptr, 0))) {
-        CloseHandle(h);
         finalize(0, 0, 0);
         return HashStatus::ReadError;
     }
     BCRYPT_HASH_HANDLE hash = nullptr;
     if (!BCRYPT_SUCCESS(BCryptCreateHash(alg, &hash, nullptr, 0, nullptr, 0, 0))) {
         BCryptCloseAlgorithmProvider(alg, 0);
-        CloseHandle(h);
         finalize(0, 0, 0);
         return HashStatus::ReadError;
     }
@@ -102,12 +126,17 @@ HashStatus Sha256FileImpl(const std::wstring& path, std::array<uint8_t, 32>& dig
 
     BCryptDestroyHash(hash);
     BCryptCloseAlgorithmProvider(alg, 0);
-    CloseHandle(h);
     finalize(readT, hashT, bytes);
     return result;
 }
 
-} // namespace
+// Explicit instantiations declared in the header: make both compile-time
+// variants linkable from HashUtil.cpp without putting the BCrypt/Windows types
+// in the public header.
+template HashStatus Sha256FileFromHandle<false>(HANDLE, std::array<uint8_t, 32>&,
+                                                profiling::FileTimings*);
+template HashStatus Sha256FileFromHandle<true>(HANDLE, std::array<uint8_t, 32>&,
+                                               profiling::FileTimings*);
 
 HashStatus Sha256File(const std::wstring& path, std::array<uint8_t, 32>& digest) {
     return Sha256FileImpl<false>(path, digest, nullptr);
@@ -118,20 +147,22 @@ HashStatus Sha256File(const std::wstring& path, std::array<uint8_t, 32>& digest,
     return Sha256FileImpl<true>(path, digest, timings);
 }
 
+bool StatHandle(HANDLE h, uint64_t& size, uint64_t& lastWriteTime) {
+    BY_HANDLE_FILE_INFORMATION info{};
+    if (!GetFileInformationByHandle(h, &info)) return false;
+    size = (static_cast<uint64_t>(info.nFileSizeHigh) << 32) | info.nFileSizeLow;
+    lastWriteTime = (static_cast<uint64_t>(info.ftLastWriteTime.dwHighDateTime) << 32) |
+                    info.ftLastWriteTime.dwLowDateTime;
+    return true;
+}
+
 bool StatFile(const std::wstring& path, uint64_t& size, uint64_t& lastWriteTime) {
     const std::wstring win = pathutil::AddLongPathPrefix(path);
     HANDLE h = CreateFileW(win.c_str(), GENERIC_READ,
                            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                            nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h == INVALID_HANDLE_VALUE) return false;
-
-    BY_HANDLE_FILE_INFORMATION info{};
-    bool ok = GetFileInformationByHandle(h, &info);
-    if (ok) {
-        size = (static_cast<uint64_t>(info.nFileSizeHigh) << 32) | info.nFileSizeLow;
-        lastWriteTime = (static_cast<uint64_t>(info.ftLastWriteTime.dwHighDateTime) << 32) |
-                        info.ftLastWriteTime.dwLowDateTime;
-    }
+    const bool ok = StatHandle(h, size, lastWriteTime);
     CloseHandle(h);
     return ok;
 }

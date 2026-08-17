@@ -44,6 +44,7 @@
 #include "Filesystem/Win32Enumerator.h"
 #include "Hashing/HashCache.h"
 #include "Hashing/Sha256.h"
+#include "Hashing/HashUtil.h"
 #include "Profiling/HashProfile.h"
 #include "ScanController.h"
 #include "ScanOrchestrator.h"
@@ -3180,6 +3181,151 @@ TEST("cache: concurrent Lookup/Store from many threads stays consistent", [] {
     hashing::HashCache reloaded(file, err2);
     CHECK(err2.empty());
     CHECK_EQ(reloaded.size(), static_cast<size_t>(kThreads * kEntriesEach));
+});
+
+// ---------------------------------------------------------------------------
+// Unified single-handle hash flow (T1 -> lookup? -> hash -> T2 -> close).
+// HashOneSide now opens the file once and runs the change-during-scan control
+// (T1/T2) on the SAME handle used for hashing, instead of StatFile/Sha256File/
+// StatFile with three opens. These tests pin the observable behaviour: T1
+// mismatch, T1 valid + T2 unchanged, cache hit (no hash, no T2), access error,
+// and the T2 comparison seam.
+// ---------------------------------------------------------------------------
+
+TEST("hashing: unified handle T1 mismatch flags changed, digest still correct", [] {
+    // T1 captures size/mtime BEFORE hashing and compares against the expected
+    // (enumeration-time) values; a mismatch sets `changed` inside HashOneSide,
+    // but the file is still read and hashed (the verdict is decided by the
+    // caller via HashPhase).
+    const auto dir = MakeTempDir();
+    const std::wstring file = dir + L"\\a.txt";
+    CHECK(WriteFileBytes(file, "hello world", 11));
+    uint64_t sz = 0, mt = 0;
+    CHECK(hashing::StatFile(file, sz, mt));
+
+    std::atomic<size_t> hits{0};
+    hashing::Digest d{};
+    bool changed = false;
+    hashing::HashStatus st = hashing::HashStatus::ReadError;
+    // mtime bumped: T1 != expected -> changed, but the file is read and hashed.
+    hashing::HashOneSide(file, sz, mt + 1, changed, st, d, true, nullptr, hits);
+    CHECK(st == hashing::HashStatus::Ok);
+    CHECK(changed);
+
+    // The returned digest must equal the real SHA-256 of the file (hash ran).
+    hashing::Digest ref{};
+    CHECK(hashing::Sha256File(file, ref) == hashing::HashStatus::Ok);
+    CHECK(d == ref);
+});
+
+TEST("hashing: unified handle T1 valid + hash + T2 unchanged yields Ok, not changed", [] {
+    // Matching expected metadata and no mutation during the read: T2 sees the
+    // very same size/mtime, `changed` stays false and the digest is correct.
+    const auto dir = MakeTempDir();
+    const std::wstring file = dir + L"\\b.txt";
+    CHECK(WriteFileBytes(file, "content", 7));
+    uint64_t sz = 0, mt = 0;
+    CHECK(hashing::StatFile(file, sz, mt));
+
+    std::atomic<size_t> hits{0};
+    hashing::Digest d{};
+    bool changed = true; // must be cleared when the file is truly stable
+    hashing::HashStatus st = hashing::HashStatus::ReadError;
+    hashing::HashOneSide(file, sz, mt, changed, st, d, true, nullptr, hits);
+    CHECK(st == hashing::HashStatus::Ok);
+    CHECK(!changed);
+    hashing::Digest ref{};
+    CHECK(hashing::Sha256File(file, ref) == hashing::HashStatus::Ok);
+    CHECK(d == ref);
+});
+
+TEST("hashing: unified handle returns NoAccess when the file cannot be opened", [] {
+    const auto dir = MakeTempDir();
+    const std::wstring ghost = dir + L"\\missing_during_scan.txt";
+
+    std::atomic<size_t> hits{0};
+    hashing::Digest d{};
+    bool changed = false;
+    hashing::HashStatus st = hashing::HashStatus::ReadError;
+    // valid=true but the path does not exist: the single CreateFile fails.
+    hashing::HashOneSide(ghost, 0, 0, changed, st, d, true, nullptr, hits);
+    CHECK(st == hashing::HashStatus::NoAccess);
+    CHECK(!changed);
+    CHECK_EQ(hits.load(), 0u);
+
+    // valid=false stays the discarded/cancelled path: ReadError, never NoAccess.
+    st = hashing::HashStatus::ReadError;
+    hashing::HashOneSide(ghost, 0, 0, changed, st, d, false, nullptr, hits);
+    CHECK(st == hashing::HashStatus::ReadError);
+});
+
+TEST("hashing: unified handle T1/T2 comparison seam detects any metadata drift", [] {
+    // The T2 change-during-scan decision is HashMetadataChanged(before, after).
+    // A real mutation in the tiny window between T1 and T2 (the hash of a small
+    // file) cannot be produced deterministically without sleeps, so this seam
+    // pins the comparison logic directly instead of racing the hashing thread.
+    using hashing::HashMetadataChanged;
+    CHECK(!HashMetadataChanged(100, 1000, 100, 1000)); // untouched
+    CHECK(HashMetadataChanged(100, 1000, 101, 1000));  // size changed
+    CHECK(HashMetadataChanged(100, 1000, 100, 1001));  // mtime changed
+    CHECK(HashMetadataChanged(100, 1000, 101, 1001));  // both changed
+    CHECK(HashMetadataChanged(0, 0, 0, 1));
+    CHECK(!HashMetadataChanged(0, 0, 0, 0));
+});
+
+TEST("hashing: unified handle cache hit skips hashing and T2", [] {
+    const auto dir = MakeTempDir();
+    const std::wstring file = dir + L"\\c.txt";
+    CHECK(WriteFileBytes(file, "hello world", 11));
+    uint64_t sz = 0, mt = 0;
+    CHECK(hashing::StatFile(file, sz, mt));
+
+    const std::wstring cacheFile = MakeTempDir() + L"\\hash_uni.bin";
+    std::wstring err;
+    hashing::HashCache cache(cacheFile, err);
+    CHECK(err.empty());
+    std::atomic<size_t> hits{0};
+
+    // Profiler proves WHERE the work happens: T1/T2 and the hash job are
+    // counted by the control points, without touching the scanned tree.
+    bv::profiling::HashProfiler prof(/*verboseJobs=*/true);
+    prof.setEnabled(true);
+
+    // Call 1: cold cache -> T1 + hash + T2 + store (one hash job).
+    {
+        bv::profiling::HashSession session(&prof);
+        hashing::Digest d{};
+        bool changed = true;
+        hashing::HashStatus st = hashing::HashStatus::ReadError;
+        hashing::HashOneSide(file, sz, mt, changed, st, d, true, &cache, hits, &session,
+                             bv::profiling::Side::Source);
+        CHECK(st == hashing::HashStatus::Ok);
+        CHECK(!changed);
+        CHECK_EQ(hits.load(), 0u);
+        CHECK_EQ(prof.jobRecords().size(), 1u); // one real hash job
+    }
+
+    // Call 2: unchanged file -> cache hit. MUST skip hashing AND skip T2.
+    {
+        bv::profiling::HashSession session(&prof);
+        hashing::Digest d{};
+        bool changed = true;
+        hashing::HashStatus st = hashing::HashStatus::ReadError;
+        hashing::HashOneSide(file, sz, mt, changed, st, d, true, &cache, hits, &session,
+                             bv::profiling::Side::Source);
+        CHECK(st == hashing::HashStatus::Ok);
+        CHECK(!changed);
+        CHECK_EQ(hits.load(), 1u);
+        CHECK_MSG(d != hashing::Digest{}, "digest must come from the cache");
+        CHECK_EQ(prof.jobRecords().size(), 1u); // still exactly one hash job
+    }
+
+    bv::profiling::HashProfileReport rep;
+    prof.Finalize(rep);
+    const auto& a = rep.side[0];
+    CHECK_EQ(a.files, 1u);       // hashed exactly once (no re-read on the hit)
+    CHECK_EQ(a.statT1Count, 2u); // T1 ran on BOTH calls (metadata must be fresh)
+    CHECK_EQ(a.statT2Count, 1u); // T2 ran only on the miss, never on the hit
 });
 
 TEST("comparator: file changed between enumeration and hash is flagged", [] {
