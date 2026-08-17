@@ -55,6 +55,7 @@ bool Win32Enumerator::enumerate(const std::wstring& root,
 
     uint64_t totalFiles = 0;
     uint64_t totalDirs = 0;
+    uint64_t totalBytes = 0;
 
     while (!stack.empty()) {
         Frame f = stack.back();
@@ -81,7 +82,7 @@ bool Win32Enumerator::enumerate(const std::wstring& root,
                 onError({f.rel, L"Unable to enumerate directory", err});
             }
             if (onProgress) {
-                onProgress(totalFiles, totalDirs, f.rel);
+                onProgress(totalFiles, totalDirs, totalBytes, f.rel);
             }
             continue;
         }
@@ -116,6 +117,7 @@ bool Win32Enumerator::enumerate(const std::wstring& root,
                 ++totalDirs;
             } else {
                 ++totalFiles;
+                totalBytes += e.size;
             }
 
             // Record the entry itself, then decide whether to descend.
@@ -147,7 +149,7 @@ bool Win32Enumerator::enumerate(const std::wstring& root,
             onError({f.rel, L"Error while reading directory", loopErr});
         }
         if (onProgress) {
-            onProgress(totalFiles, totalDirs, f.rel);
+            onProgress(totalFiles, totalDirs, totalBytes, f.rel);
         }
     }
 

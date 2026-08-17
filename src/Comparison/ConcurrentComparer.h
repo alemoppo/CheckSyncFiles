@@ -60,7 +60,8 @@ public:
     };
 
     using ProgressCallback =
-        std::function<void(uint64_t files, uint64_t dirs, const std::wstring& currentPath)>;
+        std::function<void(uint64_t files, uint64_t dirs, uint64_t bytes,
+                           const std::wstring& currentPath)>;
     using HashProgressCallback = std::function<void(uint64_t done, uint64_t total)>;
     using EnumeratorFactory = std::function<std::unique_ptr<IFileEnumerator>()>;
 
@@ -110,6 +111,7 @@ private:
     struct WorkerState {
         uint64_t lastFiles = 0; // per-worker cumulative progress baselines
         uint64_t lastDirs = 0;
+        uint64_t lastBytes = 0;
     };
 
     // Outcome of a single enumerator run, used to decide the fallback
@@ -180,6 +182,7 @@ private:
     std::atomic<size_t> cacheHits_{0};
     std::atomic<uint64_t> totalFiles_{0};
     std::atomic<uint64_t> totalDirs_{0};
+    std::atomic<uint64_t> totalBytes_{0};
     ProgressCallback onProgress_;
     HashProgressCallback onHashProgress_;
 

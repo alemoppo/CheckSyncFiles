@@ -42,6 +42,7 @@ struct Layout {
 
     int y1 = 0, y2 = 0, y3 = 0, y3b = 0, y4 = 0, y5 = 0;
     int y6 = 0, y7 = 0, y8 = 0, yList = 0, listBottom = 0, summaryY = 0;
+    int metricsY = 0; // dedicated footer row for Tempo / Velocita
 
     SDL_FRect sourceField, destField;
     SDL_FRect sourceBrowse, destBrowse;
@@ -69,8 +70,9 @@ Layout ComputeLayout(int W, int H) {
     L.y7 = L.y6 + 30;
     L.y8 = L.y7 + 32;
     L.yList = L.y8 + 34;
-    L.listBottom = H - 30;
+    L.listBottom = H - 50;
     L.summaryY = H - 26;
+    L.metricsY = H - 48;
 
     L.sourceField = {static_cast<float>(L.fieldX), static_cast<float>(L.y1),
                      static_cast<float>(L.fieldW), static_cast<float>(kFieldH)};
@@ -234,6 +236,19 @@ void DrawTextCenterIn(SDL_Renderer* ren, TTF_Font* font, const std::string& s,
     SDL_RenderTexture(ren, t, nullptr, &d);
 }
 
+// Draws text aligned to the right edge (rightX is the right bound of the text).
+void DrawTextRight(SDL_Renderer* ren, TTF_Font* font, const std::string& s, int rightX,
+                   int y, RGBA c) {
+    SDL_Color col{c.r, c.g, c.b, c.a};
+    int tw = 0, th = 0;
+    SDL_Texture* t = TextTextureCached(ren, font, s, col, tw, th);
+    if (!t) return;
+    SDL_SetTextureBlendMode(t, SDL_BLENDMODE_BLEND);
+    const SDL_FRect d{static_cast<float>(rightX - tw), static_cast<float>(y),
+                      static_cast<float>(tw), static_cast<float>(th)};
+    SDL_RenderTexture(ren, t, nullptr, &d);
+}
+
 void DrawPickerButton(SDL_Renderer* ren, TTF_Font* font, const SDL_FRect& r, bool hover) {
     FillRect(ren, static_cast<int>(r.x), static_cast<int>(r.y),
              static_cast<int>(r.w), static_cast<int>(r.h), hover ? kAccentHover : kPanel);
@@ -350,6 +365,31 @@ std::wstring FormatRateW(uint64_t bytes, double seconds) {
     }
     wchar_t buf[64];
     swprintf(buf, 64, L"%.2f %ls", v, units[u]);
+    return buf;
+}
+
+std::wstring FormatHms(double seconds) {
+    long long total = static_cast<long long>(seconds < 0.0 ? 0.0 : seconds);
+    const long long h = total / 3600;
+    total %= 3600;
+    const long long m = total / 60;
+    total %= 60;
+    wchar_t buf[32];
+    swprintf(buf, 32, L"%02lld:%02lld:%02lld", h, m, total);
+    return buf;
+}
+
+std::wstring FormatRateCountW(uint64_t count, double seconds) {
+    if (seconds <= 0.0 || count == 0) return L"n/d";
+    double v = static_cast<double>(count) / seconds;
+    const wchar_t* units[] = {L"voci/s", L"k voci/s", L"M voci/s", L"G voci/s"};
+    int u = 0;
+    while (v >= 1000.0 && u < 3) {
+        v /= 1000.0;
+        ++u;
+    }
+    wchar_t buf[64];
+    swprintf(buf, 64, L"%.1f %ls", v, units[u]);
     return buf;
 }
 
@@ -949,6 +989,22 @@ void AppUI::render(const bv::ScanOrchestrator::UiSnapshot& st) {
     const unsigned int threadCountUsed = st.threadCountUsed;
     const std::wstring& statusNote = st.statusNote;
 
+    // Live clock / byte rate for the running operation, drawn on the dedicated
+    // footer row (metricsY) so it never collides with the status line.
+    std::wstring footerMetrics;
+
+    // Arm the live clock on the first frame that observes the run, and reset it
+    // as soon as the run ends so a later run starts from zero again.
+    if (running) {
+        if (!runStarted_) {
+            runStarted_ = true;
+            runStartTicks_ = SDL_GetTicks();
+            lastLiveBytes_ = 0;
+        }
+    } else {
+        runStarted_ = false;
+    }
+
     // Title
     DrawText(renderer_, fontBold_, "Backup Verifier — Verifica backup (sola lettura)",
              kMargin, 10, kTextHi);
@@ -1124,6 +1180,18 @@ void AppUI::render(const bv::ScanOrchestrator::UiSnapshot& st) {
             if (shortP.size() > 60) shortP = L"..." + shortP.substr(shortP.size() - 57);
             status += L"  [" + shortP + L"]";
         }
+        if (runStarted_) {
+            if (progress.bytes > 0) lastLiveBytes_ = progress.bytes;
+            const double elapsed = (SDL_GetTicks() - runStartTicks_) / 1000.0;
+            footerMetrics = L"Tempo: " + FormatHms(elapsed);
+            const uint64_t items = progress.files + progress.dirs;
+            if (items > 0) {
+                footerMetrics += L"   Velocita: " + FormatRateCountW(items, elapsed);
+            }
+            if (lastLiveBytes_ > 0) {
+                footerMetrics += L"   " + FormatRateW(lastLiveBytes_, elapsed);
+            }
+        }
     } else if (st.resultsReady && st.cancelled) {
         status = L"Scansione interrotta dall'utente.";
     } else if (st.resultsReady && (!st.sourceOk || !st.destinationOk)) {
@@ -1132,14 +1200,25 @@ void AppUI::render(const bv::ScanOrchestrator::UiSnapshot& st) {
         status = L"Scansione incompleta: una o entrambe le radici non sono state "
                  L"scandite completamente.";
     } else if (st.resultsReady) {
-        status = L"Scansione completata.  Velocita: " +
-                 FormatRateW(uiResults_.stats.bytesSource, st.lastSecondsTotal);
+        status = L"Scansione completata.";
+        if (st.lastSecondsTotal > 0.0) {
+            footerMetrics = L"Tempo totale: " + FormatHms(st.lastSecondsTotal);
+            footerMetrics += L"   Velocita: " +
+                             FormatRateW(uiResults_.stats.bytesSource, st.lastSecondsTotal);
+            footerMetrics += L"   " +
+                             FormatRateCountW(uiResults_.stats.sourceFiles,
+                                              st.lastSecondsTotal);
+        }
     }
     if (!statusNote.empty()) {
         status += (status == L"Pronto. Specificare sorgente e destinazione." ? L"" : L"   —  ") +
                   statusNote;
     }
     DrawText(renderer_, fontBody_, ToUtf8(status), kMargin, L.y6, kTextHi);
+    if (!footerMetrics.empty()) {
+        DrawTextRight(renderer_, fontBody_, ToUtf8(footerMetrics), winW_ - kMargin, L.metricsY,
+                      kTextLo);
+    }
 
     // ---- Progress bar ----
     const int barW = winW_ - 2 * kMargin;

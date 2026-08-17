@@ -99,6 +99,7 @@ ConcurrentComparer::Result ConcurrentComparer::runImpl(
     cacheHits_.store(0, std::memory_order_relaxed);
     totalFiles_.store(0, std::memory_order_relaxed);
     totalDirs_.store(0, std::memory_order_relaxed);
+    totalBytes_.store(0, std::memory_order_relaxed);
 
     // Content-hash overlap context for the workers (set before they start, then
     // only read, except for the two atomic counters).
@@ -357,14 +358,17 @@ ConcurrentComparer::EnumAttempt ConcurrentComparer::runOneStep(
             return true;
         },
         [&](const ScanError& err) { stagedErrors.push_back(err); },
-        [&](uint64_t files, uint64_t dirs, const std::wstring& path) {
+        [&](uint64_t files, uint64_t dirs, uint64_t bytes, const std::wstring& path) {
             totalFiles_.fetch_add(files - state.lastFiles, std::memory_order_relaxed);
             state.lastFiles = files;
             totalDirs_.fetch_add(dirs - state.lastDirs, std::memory_order_relaxed);
             state.lastDirs = dirs;
+            totalBytes_.fetch_add(bytes - state.lastBytes, std::memory_order_relaxed);
+            state.lastBytes = bytes;
             if (onProgress_) {
                 onProgress_(totalFiles_.load(std::memory_order_relaxed),
-                            totalDirs_.load(std::memory_order_relaxed), path);
+                            totalDirs_.load(std::memory_order_relaxed),
+                            totalBytes_.load(std::memory_order_relaxed), path);
             }
         },
         cancel_);

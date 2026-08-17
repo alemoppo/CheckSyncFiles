@@ -1848,19 +1848,21 @@ TEST("mft: per-directory Win32 fallback enumerates a subtree with prefixed paths
     std::vector<std::wstring> progPaths;
     uint64_t fbFiles = 0;
     uint64_t fbDirs = 0;
+    uint64_t fbBytes = 0;
     const auto st = MftEnumerator::EnumerateWin32Subtree(
-        dir, L"fb", fbFiles, fbDirs,
+        dir, L"fb", fbFiles, fbDirs, fbBytes,
         [&](FileEntry&& e) {
             rels.push_back(e.relativePath);
             return true;
         },
         [](const ScanError&) {},
-        [&](uint64_t, uint64_t, const std::wstring& p) { progPaths.push_back(p); }, nullptr);
+        [&](uint64_t, uint64_t, uint64_t, const std::wstring& p) { progPaths.push_back(p); }, nullptr);
     CHECK(st == MftEnumerator::SubtreeStatus::Ok);
     CHECK_EQ(rels.size(), 6u);
     if (rels.size() != 6) return;
     CHECK_EQ(fbFiles, 4u);
     CHECK_EQ(fbDirs, 2u);
+    CHECK_EQ(fbBytes, 10u); // 1+2+3+4 bytes of the four files
     CHECK(std::find(rels.begin(), rels.end(), L"fb\\a.txt") != rels.end());
     CHECK(std::find(rels.begin(), rels.end(), L"fb\\b.bin") != rels.end());
     CHECK(std::find(rels.begin(), rels.end(), L"fb\\sub") != rels.end());
@@ -1876,8 +1878,9 @@ TEST("mft: per-directory Win32 fallback enumerates a subtree with prefixed paths
     std::vector<std::wstring> rootRels;
     uint64_t rf = 0;
     uint64_t rd = 0;
+    uint64_t rbytes = 0;
     const auto st2 = MftEnumerator::EnumerateWin32Subtree(
-        dir, L"", rf, rd,
+        dir, L"", rf, rd, rbytes,
         [&](FileEntry&& e) {
             rootRels.push_back(e.relativePath);
             return true;
@@ -1887,23 +1890,26 @@ TEST("mft: per-directory Win32 fallback enumerates a subtree with prefixed paths
     CHECK_EQ(rootRels.size(), 6u);
     CHECK_EQ(rf, 4u);
     CHECK_EQ(rd, 2u);
+    CHECK_EQ(rbytes, 10u);
     CHECK(std::find(rootRels.begin(), rootRels.end(), L"a.txt") != rootRels.end());
     CHECK(std::find(rootRels.begin(), rootRels.end(), L"sub\\deep\\d.txt") != rootRels.end());
 
     // Consumer abort: onEntry returns false -> Aborted, never Ok.
     uint64_t af = 0;
     uint64_t ad = 0;
+    uint64_t abyte = 0;
     int seen = 0;
     const auto st3 = MftEnumerator::EnumerateWin32Subtree(
-        dir, L"", af, ad, [&](FileEntry&&) { return ++seen < 3; },
+        dir, L"", af, ad, abyte, [&](FileEntry&&) { return ++seen < 3; },
         [](const ScanError&) {}, {}, nullptr);
     CHECK(st3 == MftEnumerator::SubtreeStatus::Aborted);
 
     // Unreadable root (does not exist): Unreadable, not DeviceLost.
     uint64_t uf = 0;
     uint64_t ud = 0;
+    uint64_t ubyte = 0;
     const auto st4 = MftEnumerator::EnumerateWin32Subtree(
-        dir + L"\\no_such_dir", L"", uf, ud, [](FileEntry&&) { return true; },
+        dir + L"\\no_such_dir", L"", uf, ud, ubyte, [](FileEntry&&) { return true; },
         [](const ScanError&) {}, {}, nullptr);
     CHECK(st4 == MftEnumerator::SubtreeStatus::Unreadable);
 });
@@ -1931,12 +1937,12 @@ TEST("mft: fallback Win32 error path is relative to the scan root (prefixed once
     ScopeGuard restore{[&] { RestoreAccess(dir + L"\\sub\\denied"); }};
 
     std::vector<ScanError> errs;
-    uint64_t ef = 0, ed = 0;
+    uint64_t ef = 0, ed = 0, eb = 0;
     const auto st = MftEnumerator::EnumerateWin32Subtree(
-        dir, L"fb", ef, ed,
+        dir, L"fb", ef, ed, eb,
         [](FileEntry&&) { return true; },
         [&](const ScanError& e) { errs.push_back(e); },
-        [](uint64_t, uint64_t, const std::wstring&) {}, nullptr);
+        [](uint64_t, uint64_t, uint64_t, const std::wstring&) {}, nullptr);
 
     // The walk completed cleanly for the rest of the tree (the denied dir is a
     // non-fatal error, never a device loss / unreadable root).
@@ -1990,7 +1996,7 @@ TEST("mft: walk -> unresolvable $I30 -> Win32 fallback (real temp tree)", [] {
                 return true;
             },
             [](const ScanError&) {},
-            [](uint64_t, uint64_t, const std::wstring&) {}, &cancel, &fallbackDirs);
+            [](uint64_t, uint64_t, uint64_t, const std::wstring&) {}, &cancel, &fallbackDirs);
 
         // The fallback fired exactly once for directory 4609.
         CHECK(out == MftEnumerator::DirWalkOutcome::FallbackOk);
@@ -2040,7 +2046,7 @@ TEST("mft: walk -> unresolvable $I30 -> Win32 fallback (real temp tree)", [] {
                 return true;
             },
             [](const ScanError&) {},
-            [](uint64_t, uint64_t, const std::wstring&) {}, nullptr, &fallbackDirs);
+            [](uint64_t, uint64_t, uint64_t, const std::wstring&) {}, nullptr, &fallbackDirs);
 
         CHECK(out == MftEnumerator::DirWalkOutcome::MftResolved);
         CHECK_EQ(fallbackDirs, 0u);
@@ -2102,7 +2108,7 @@ TEST("mft: walk -> extension record carrying $FILE_NAME is not emitted as a phan
     const auto out = MftEnumerator::WalkDirectoryStepForTest(
         records, 4700, L"", L"", mftEntries,
         [&](FileEntry&& e) { fbEntries.push_back(std::move(e)); return true; },
-        [](const ScanError&) {}, [](uint64_t, uint64_t, const std::wstring&) {},
+        [](const ScanError&) {}, [](uint64_t, uint64_t, uint64_t, const std::wstring&) {},
         &cancel, &fallbackDirs);
 
     CHECK(out == MftEnumerator::DirWalkOutcome::MftResolved);
@@ -2177,7 +2183,7 @@ TEST("mft: walk -> base owning $FILE_NAME + extension $FILE_NAMEs stays one iden
     const auto walk0 = MftEnumerator::WalkDirectoryStepForTest(
         records, 4700, L"", L"", d0Entries,
         [&](FileEntry&& e) { fbEntries.push_back(std::move(e)); return true; },
-        [](const ScanError&) {}, [](uint64_t, uint64_t, const std::wstring&) {},
+        [](const ScanError&) {}, [](uint64_t, uint64_t, uint64_t, const std::wstring&) {},
         &cancel, &fallbackDirs);
     CHECK(walk0 == MftEnumerator::DirWalkOutcome::MftResolved);
     CHECK_EQ(fallbackDirs, 0u);
@@ -2192,7 +2198,7 @@ TEST("mft: walk -> base owning $FILE_NAME + extension $FILE_NAMEs stays one iden
     const auto walk1 = MftEnumerator::WalkDirectoryStepForTest(
         records, 4600, L"", L"", d1Entries,
         [&](FileEntry&& e) { fbEntries.push_back(std::move(e)); return true; },
-        [](const ScanError&) {}, [](uint64_t, uint64_t, const std::wstring&) {},
+        [](const ScanError&) {}, [](uint64_t, uint64_t, uint64_t, const std::wstring&) {},
         &cancel2, &fallbackDirs2);
     CHECK(walk1 == MftEnumerator::DirWalkOutcome::MftResolved);
     CHECK_EQ(fallbackDirs2, 0u);
@@ -2222,16 +2228,16 @@ TEST("mft: cancellation during Win32 fallback stops the walk, never reports a fa
     std::atomic_bool cancel{false};
     std::vector<FileEntry> seen;
     size_t emitted = 0;
-    uint64_t ef = 0, ed = 0;
+    uint64_t ef = 0, ed = 0, ebytes = 0;
     const auto st = MftEnumerator::EnumerateWin32Subtree(
-        dir, L"", ef, ed,
+        dir, L"", ef, ed, ebytes,
         [&](FileEntry&& e) {
             seen.push_back(std::move(e));
             ++emitted;
             cancel.store(true, std::memory_order_release); // request cancel mid-walk
             return true;
         },
-        [](const ScanError&) {}, [](uint64_t, uint64_t, const std::wstring&) {}, &cancel);
+        [](const ScanError&) {}, [](uint64_t, uint64_t, uint64_t, const std::wstring&) {}, &cancel);
 
     // Cancel was honored at the first opportunity: Win32Enumerator stops emitting
     // on the next loop check, so exactly the one entry that requested cancellation
@@ -2282,7 +2288,7 @@ TEST("mft: fallback Win32 returns Unreadable -> WalkDirectoryStep returns Fallba
             records, 4609, L"", missingRoot, mftEntries,
             [&](FileEntry&&) { CHECK_MSG(false, "no entries should be emitted on failure"); return true; },
             [&](const ScanError& e) { errs.push_back(e); },
-            [](uint64_t, uint64_t, const std::wstring&) {}, &cancel, &fallbackDirs,
+            [](uint64_t, uint64_t, uint64_t, const std::wstring&) {}, &cancel, &fallbackDirs,
             4096, 512, &incomplete);
 
         // The Win32 fallback was attempted (dir was unreadable on both sides).
@@ -2343,7 +2349,7 @@ TEST("mft: cancellation propagates through WalkDirectoryStep -> caller (clean st
                 return true;
             },
             [](const ScanError&) {},
-            [](uint64_t, uint64_t, const std::wstring&) {}, &cancel, &fallbackDirs);
+            [](uint64_t, uint64_t, uint64_t, const std::wstring&) {}, &cancel, &fallbackDirs);
 
         // The fallback fired for the directory with the unresolvable child.
         CHECK_EQ(fallbackDirs, 1u);
@@ -2386,7 +2392,7 @@ TEST("mft: cancellation propagates through WalkDirectoryStep -> caller (clean st
                 return false; // consumer aborts
             },
             [](const ScanError&) {},
-            [](uint64_t, uint64_t, const std::wstring&) {}, &cancel, &fallbackDirs);
+            [](uint64_t, uint64_t, uint64_t, const std::wstring&) {}, &cancel, &fallbackDirs);
 
         CHECK_EQ(fallbackDirs, 1u);
         // Aborted propagated, NOT swallowed as FallbackOk.
@@ -3077,16 +3083,17 @@ public:
     bool enumerate(const std::wstring&, const EntryCallback& onEntry, const ErrorCallback&,
                    const ProgressCallback& onProgress, const std::atomic_bool* cancel) override {
         if (before_) before_();
-        uint64_t files = 0, dirs = 0;
+        uint64_t files = 0, dirs = 0, bytes = 0;
         for (FileEntry& e : entries_) {
             if (cancel && cancel->load(std::memory_order_relaxed)) return false;
             if (e.isDirectory) {
                 ++dirs;
             } else {
                 ++files;
+                bytes += e.size;
             }
             if (!onEntry(FileEntry(e))) return false;
-            if (onProgress) onProgress(files, dirs, L"");
+            if (onProgress) onProgress(files, dirs, bytes, L"");
         }
         if (after_) after_();
         return true;

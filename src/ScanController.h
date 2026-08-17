@@ -50,6 +50,7 @@ struct ScanProgress {
     ScanPhase phase = ScanPhase::EnumerateSource;
     uint64_t files = 0;   // files visited in the current phase
     uint64_t dirs = 0;    // directories visited in the current phase
+    uint64_t bytes = 0;   // cumulative size of the files visited in this phase
     std::wstring currentPath; // directory currently being processed
     // Number of hash workers actually running during ScanPhase::Hashing
     // (live, updated while the phase is in progress); 0 in the other phases.

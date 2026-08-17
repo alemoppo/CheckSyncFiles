@@ -30,8 +30,10 @@ public:
     using ErrorCallback = std::function<void(const ScanError&)>;
     // Called after each directory is finished (so the totals grow); currentPath
     // is the directory just completed (owned by the enumerator during the call).
+    // `bytes` is the cumulative size of the files reported so far.
     using ProgressCallback =
-        std::function<void(uint64_t files, uint64_t dirs, const std::wstring& currentPath)>;
+        std::function<void(uint64_t files, uint64_t dirs, uint64_t bytes,
+                           const std::wstring& currentPath)>;
 
     virtual ~IFileEnumerator() = default;
 

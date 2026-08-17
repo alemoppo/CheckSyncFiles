@@ -126,9 +126,9 @@ public:
     // no volume/admin needed).
     static SubtreeStatus EnumerateWin32Subtree(
         const std::wstring& absDir, const std::wstring& relPrefix,
-        uint64_t& outFiles, uint64_t& outDirs, const EntryCallback& onEntry,
-        const ErrorCallback& onError, const ProgressCallback& onProgress,
-        const std::atomic_bool* cancel);
+        uint64_t& outFiles, uint64_t& outDirs, uint64_t& outBytes,
+        const EntryCallback& onEntry, const ErrorCallback& onError,
+        const ProgressCallback& onProgress, const std::atomic_bool* cancel);
 
     // Outcome of WalkDirectoryStepForTest: mirrors the MFT walk's per-directory
     // decision, including whether the Win32 fallback was triggered.

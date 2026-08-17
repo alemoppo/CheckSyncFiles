@@ -154,12 +154,13 @@ ScanReport ScanController::run(const ScanOptions& options) {
     std::atomic<unsigned int> hashThreadsActive{0};
 
     const auto emitProgress = [&](ScanPhase phase, uint64_t files, uint64_t dirs,
-                                  const std::wstring& path) {
+                                  uint64_t bytes, const std::wstring& path) {
         if (options.onProgress) {
             ScanProgress p;
             p.phase = phase;
             p.files = files;
             p.dirs = dirs;
+            p.bytes = bytes;
             p.currentPath = path;
             p.threads = hashThreadsActive.load(std::memory_order_relaxed);
             options.onProgress(p);
@@ -229,8 +230,8 @@ ScanReport ScanController::run(const ScanOptions& options) {
         }
     } else if (haveSnapshot) {
         const IFileEnumerator::ProgressCallback sourceProgress =
-            [&](uint64_t files, uint64_t dirs, const std::wstring& path) {
-                emitProgress(ScanPhase::EnumerateSource, files, dirs, path);
+            [&](uint64_t files, uint64_t dirs, uint64_t bytes, const std::wstring& path) {
+                emitProgress(ScanPhase::EnumerateSource, files, dirs, bytes, path);
             };
         FileIndex::BuildResult build;
         bool sourceOk = false;
@@ -300,7 +301,7 @@ ScanReport ScanController::run(const ScanOptions& options) {
                 ThreadPool sourcePool(srcThreads);
                 std::atomic<size_t> hits{0};
                 const auto hashProgress = [&](uint64_t done, uint64_t total) {
-                    emitProgress(ScanPhase::Hashing, done, total, L"");
+                    emitProgress(ScanPhase::Hashing, done, total, 0, L"");
                 };
                 const double th0 = NowSeconds();
                 HashSourceIndex(sourceIndex, options.source, sourcePool, options.cancel,
@@ -353,8 +354,8 @@ ScanReport ScanController::run(const ScanOptions& options) {
         if (mode == ScanMode::Content) report.hashThreadsUsed = hashPool.threadCount();
 
         const IFileEnumerator::ProgressCallback enumProgress =
-            [&](uint64_t files, uint64_t dirs, const std::wstring& path) {
-                emitProgress(ScanPhase::CompareDestination, files, dirs, path);
+            [&](uint64_t files, uint64_t dirs, uint64_t bytes, const std::wstring& path) {
+                emitProgress(ScanPhase::CompareDestination, files, dirs, bytes, path);
             };
         double hashStart = 0.0;
         double compareHashSeconds = 0.0;
@@ -365,7 +366,7 @@ ScanReport ScanController::run(const ScanOptions& options) {
                 hashStart = NowSeconds();
                 hashThreadsActive.store(hashPool.threadCount(), std::memory_order_relaxed);
             }
-            emitProgress(ScanPhase::Hashing, done, total, L"");
+            emitProgress(ScanPhase::Hashing, done, total, 0, L"");
             if (done >= total) {
                 hashing = false;
                 hashThreadsActive.store(0, std::memory_order_relaxed);

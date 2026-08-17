@@ -838,10 +838,12 @@ bool MftEnumerator::IsSupported(const std::wstring& root) {
 
 MftEnumerator::SubtreeStatus MftEnumerator::EnumerateWin32Subtree(
     const std::wstring& absDir, const std::wstring& relPrefix, uint64_t& outFiles,
-    uint64_t& outDirs, const EntryCallback& onEntry, const ErrorCallback& onError,
-    const ProgressCallback& onProgress, const std::atomic_bool* cancel) {
+    uint64_t& outDirs, uint64_t& outBytes, const EntryCallback& onEntry,
+    const ErrorCallback& onError, const ProgressCallback& onProgress,
+    const std::atomic_bool* cancel) {
     outFiles = 0;
     outDirs = 0;
+    outBytes = 0;
 
     // Join the scan-root-relative prefix onto every emitted relative path so
     // the subtree plugs into the same tree the MFT walk is building. Counts are
@@ -855,6 +857,7 @@ MftEnumerator::SubtreeStatus MftEnumerator::EnumerateWin32Subtree(
             ++outDirs;
         } else {
             ++outFiles;
+            outBytes += e.size;
         }
         if (!onEntry(std::move(e))) {
             consumerAbort = true;
@@ -876,10 +879,10 @@ MftEnumerator::SubtreeStatus MftEnumerator::EnumerateWin32Subtree(
             onError(prefixed);
         }
     };
-    const ProgressCallback subProgress = [&](uint64_t files, uint64_t dirs,
+    const ProgressCallback subProgress = [&](uint64_t files, uint64_t dirs, uint64_t bytes,
                                              const std::wstring& path) {
         if (onProgress) {
-            onProgress(files, dirs,
+            onProgress(files, dirs, bytes,
                        path.empty() ? relPrefix : pathutil::JoinRel(relPrefix, path));
         }
     };
@@ -939,7 +942,7 @@ DirStepOutcome WalkDirectoryStep(
     const IFileEnumerator::EntryCallback& onEntry,
     const IFileEnumerator::ErrorCallback& onError,
     const IFileEnumerator::ProgressCallback& onProgress,
-    const std::atomic_bool* cancel, uint64_t& files, uint64_t& dirs,
+    const std::atomic_bool* cancel, uint64_t& files, uint64_t& dirs, uint64_t& bytes,
     size_t& diagIndexBlocks, size_t& diagIndexChildren, size_t& diagWin32FallbackDirs,
     std::vector<std::pair<uint64_t, ChildEntry>>& kids, bool& incomplete) {
     RecInfo& d = recs[dirRec];
@@ -1035,16 +1038,20 @@ DirStepOutcome WalkDirectoryStep(
             dirRel.empty() ? normRoot : pathutil::MakeAbsolute(normRoot, dirRel);
         const uint64_t baseFiles = files;
         const uint64_t baseDirs = dirs;
+        const uint64_t baseBytes = bytes;
         uint64_t fbFiles = 0;
         uint64_t fbDirs = 0;
+        uint64_t fbBytes = 0;
         const IFileEnumerator::ProgressCallback fbProgress = [&](uint64_t f, uint64_t d,
+                                                                 uint64_t b,
                                                                  const std::wstring& p) {
-            if (onProgress) onProgress(baseFiles + f, baseDirs + d, p);
+            if (onProgress) onProgress(baseFiles + f, baseDirs + d, baseBytes + b, p);
         };
         const MftEnumerator::SubtreeStatus st = MftEnumerator::EnumerateWin32Subtree(
-            absDir, dirRel, fbFiles, fbDirs, onEntry, onError, fbProgress, cancel);
+            absDir, dirRel, fbFiles, fbDirs, fbBytes, onEntry, onError, fbProgress, cancel);
         files += fbFiles;
         dirs += fbDirs;
+        bytes += fbBytes;
         if (st == MftEnumerator::SubtreeStatus::Aborted) {
             return DirStepOutcome::FallbackAborted;
         }
@@ -1323,6 +1330,7 @@ const uint64_t segSize = vd.BytesPerFileRecordSegment;
 
     uint64_t files = 0;
     uint64_t dirs = 0;
+    uint64_t bytes = 0;
     // Opt-in ground-truth counters (see MftDiagFilePath below).
     size_t diagIndexBlocks = 0;
     size_t diagIndexChildren = 0;
@@ -1348,7 +1356,7 @@ const uint64_t segSize = vd.BytesPerFileRecordSegment;
         std::vector<std::pair<uint64_t, ChildEntry>> kids;
         const DirStepOutcome step = WalkDirectoryStep(
             recs, nRecords, revChildren, rawReader, cluster, bytesPerSector, normRoot,
-            dirRec, dirRel, onEntry, onError, onProgress, cancel, files, dirs,
+            dirRec, dirRel, onEntry, onError, onProgress, cancel, files, dirs, bytes,
             diagIndexBlocks, diagIndexChildren, diagWin32FallbackDirs, kids, incomplete);
         if (step == DirStepOutcome::FallbackAborted) {
             CloseHandle(hVol);
@@ -1393,6 +1401,7 @@ const uint64_t segSize = vd.BytesPerFileRecordSegment;
                 ++dirs;
             } else {
                 ++files;
+                bytes += e.size;
             }
             if (!onEntry(std::move(e))) {
                 CloseHandle(hVol);
@@ -1403,7 +1412,7 @@ const uint64_t segSize = vd.BytesPerFileRecordSegment;
                 work.push_back({cr, childRel});
             }
         }
-        if (onProgress) onProgress(files, dirs, dirRel);
+        if (onProgress) onProgress(files, dirs, bytes, dirRel);
     }
 
     (void)onError;
@@ -1637,6 +1646,7 @@ MftEnumerator::DirWalkOutcome MftEnumerator::WalkDirectoryStepForTest(
 
     uint64_t files = 0;
     uint64_t dirs = 0;
+    uint64_t bytes = 0;
     size_t diagIndexBlocks = 0;
     size_t diagIndexChildren = 0;
     size_t diagFallbackDirs = 0;
@@ -1645,7 +1655,7 @@ MftEnumerator::DirWalkOutcome MftEnumerator::WalkDirectoryStepForTest(
     const DirStepOutcome step = WalkDirectoryStep(
         recs, nRecords, revChildren, memReader, clusterSize, bytesPerSector,
         normRoot, dirRec, dirRel, onEntry, onError, onProgress, cancel, files, dirs,
-        diagIndexBlocks, diagIndexChildren, diagFallbackDirs, kids, incomplete);
+        bytes, diagIndexBlocks, diagIndexChildren, diagFallbackDirs, kids, incomplete);
     if (outDiagFallbackDirs) *outDiagFallbackDirs = diagFallbackDirs;
     if (outDiagIncomplete) *outDiagIncomplete = incomplete;
 

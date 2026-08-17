@@ -84,6 +84,14 @@ private:
     // applied once a whole tick accumulates.
     float wheelAccum_ = 0.0f;
 
+    // Live elapsed-time clock for the running operation: the tick is captured
+    // on the first frame that observes the run, then counts up while running.
+    Uint64 runStartTicks_ = 0;
+    bool runStarted_ = false;
+    // Last live byte count seen during the run (kept across the Hashing phase,
+    // which reports candidates but no bytes), used for the live byte-rate.
+    uint64_t lastLiveBytes_ = 0;
+
     // Cursor position (in UTF-16 code units) inside the focused path field.
     // Lives here because the field text is stored in the orchestrator; this is
     // the only UI-side bit of the editing state.
