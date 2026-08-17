@@ -58,6 +58,13 @@ public:
         bool inUse = false;
         bool isDir = false;
         uint64_t dataSize = 0; // size of the unnamed $DATA stream only
+        // Timestamps parsed from the record. mtime comes from $FILE_NAME
+        // (offset +0x10); standardMtime from $STANDARD_INFORMATION (offset +0x08).
+        // lastWriteTime is the value enumerate() emits in FileEntry: SI when
+        // present, else the $FILE_NAME timestamp (see the MFT mtime fix).
+        uint64_t mtime = 0;
+        uint64_t standardMtime = 0;
+        uint64_t lastWriteTime = 0;
     };
 
     // Test-only seams for the MFT record parser. They operate on raw bytes (as read

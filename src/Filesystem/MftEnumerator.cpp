@@ -83,6 +83,7 @@ namespace bv {
 
 namespace {
 
+constexpr uint32_t kAttrStdInfo = 0x10;    // NTFS_ATTR_STANDARD_INFORMATION
 constexpr uint32_t kAttrFileName = 0x30;   // NTFS_ATTR_FILENAME
 constexpr uint32_t kAttrAttrList = 0x20;   // NTFS_ATTR_ATTRIBUTE_LIST
 constexpr uint32_t kAttrData = 0x80;       // NTFS_ATTR_DATA
@@ -307,7 +308,11 @@ struct RecInfo {
     bool isReparse = false;
     uint16_t seq = 0;
     FileRef baseRef;       // base record reference (@+32); rec==0 => base record
-    uint64_t mtime = 0;    // best-known last-write time
+    uint64_t mtime = 0;         // last-write time from $FILE_NAME (offset +0x10)
+    uint64_t standardMtime = 0; // modified/last-write time from $STANDARD_INFORMATION
+                                // (offset +0x08 of the value); the timestamp
+                                // GetFileInformationByHandle() reports, so this is
+                                // what FileEntry.lastWriteTime must be compared against
     uint64_t dataSize = 0; // $DATA logical size (authoritative)
     std::vector<NameInfo> names;      // every $FILE_NAME attribute
     std::vector<IndexChild> children; // $I30 children resolved so far
@@ -425,7 +430,19 @@ void ParseRecord(const uint8_t* rec, size_t bufSize, RecInfo& out) {
         // Attribute values must lie inside [a, a+len), never spilling into the
         // following attribute; the value bounds below are checked against `len`.
 
-        if (type == kAttrFileName && !nonResident) { // resident $FILE_NAME
+        if (type == kAttrStdInfo && !nonResident) { // resident $STANDARD_INFORMATION
+            // Value layout: +0x00 creation, +0x08 modified/last-write, +0x10 MFT
+            // changed, +0x18 accessed (each a 64-bit FILETIME). The modified
+            // time at +0x08 is what GetFileInformationByHandle()'s
+            // ftLastWriteTime reflects, so it is the value the content-hash
+            // verification compares against -- NOT the $FILE_NAME timestamp.
+            const uint16_t valueOff = *reinterpret_cast<const uint16_t*>(a + 20);
+            const uint32_t valueLen = *reinterpret_cast<const uint32_t*>(a + 16);
+            if (valueOff >= 24 && valueLen >= 0x10 &&
+                (size_t)valueOff + 0x10 <= len) {
+                out.standardMtime = *reinterpret_cast<const uint64_t*>(a + valueOff + 0x08);
+            }
+        } else if (type == kAttrFileName && !nonResident) { // resident $FILE_NAME
             const uint16_t valueOff = *reinterpret_cast<const uint16_t*>(a + 20);
             const uint32_t valueLen = *reinterpret_cast<const uint32_t*>(a + 16);
             if (valueOff >= 24 && (size_t)valueOff + valueLen <= len) {
@@ -782,6 +799,13 @@ void MergePassAFromRecord(std::vector<RecInfo>& recs, uint64_t recIndex,
                     ++diag;
                     if (base.mtime == 0) base.mtime = nm.mtime;
                 }
+            }
+            // $STANDARD_INFORMATION normally belongs to the base record, but when
+            // NTFS relocated it to an extension record (record overflow) the base
+            // may hold none; propagate it exactly like mtime above so
+            // FileEntry.lastWriteTime still prefers the SI timestamp.
+            if (base.standardMtime == 0 && r.standardMtime != 0) {
+                base.standardMtime = r.standardMtime;
             }
         }
     }
@@ -1392,7 +1416,10 @@ const uint64_t segSize = vd.BytesPerFileRecordSegment;
             FileEntry e;
             e.relativePath = childRel;
             e.size = cRec.isDir ? 0 : (cRec.dataSize ? cRec.dataSize : 0);
-            e.lastWriteTime = cRec.mtime;
+            // Prefer the $STANDARD_INFORMATION modified time (the timestamp
+            // GetFileInformationByHandle() reports during content hashing); fall
+            // back to the $FILE_NAME timestamp when SI is missing/unreadable.
+            e.lastWriteTime = cRec.standardMtime ? cRec.standardMtime : cRec.mtime;
             e.fileId = cr;
             e.attributes = (cRec.isDir ? FILE_ATTRIBUTE_DIRECTORY : 0) |
                            (cRec.isReparse ? FILE_ATTRIBUTE_REPARSE_POINT : 0);
@@ -1464,6 +1491,9 @@ MftEnumerator::MftParseResult MftEnumerator::ParseRecordForTest(
     r.inUse = info.inUse;
     r.isDir = info.isDir;
     r.dataSize = info.dataSize;
+    r.mtime = info.mtime;
+    r.standardMtime = info.standardMtime;
+    r.lastWriteTime = info.standardMtime ? info.standardMtime : info.mtime;
     return r;
 }
 

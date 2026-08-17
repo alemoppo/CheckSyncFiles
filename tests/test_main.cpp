@@ -1363,6 +1363,29 @@ std::vector<uint8_t> BuildFileNameValue(uint64_t parentRec, uint16_t parentSeq,
     return v;
 }
 
+// $FILE_NAME value with an explicit modified-time field (offset +0x10), so a
+// fixture can make the $FILE_NAME timestamp distinct from $STANDARD_INFORMATION.
+std::vector<uint8_t> BuildFileNameValueWithMtime(uint64_t parentRec, uint16_t parentSeq,
+                                                 const std::wstring& name, uint8_t ns,
+                                                 uint64_t mtime) {
+    auto v = BuildFileNameValue(parentRec, parentSeq, name, ns);
+    *reinterpret_cast<uint64_t*>(v.data() + 0x10) = mtime;
+    return v;
+}
+
+// $STANDARD_INFORMATION value (72 bytes on modern NTFS): creation @+0x00,
+// modified/last-write @+0x08, MFT changed @+0x10, accessed @+0x18. The
+// modified field is the timestamp GetFileInformationByHandle() reports.
+std::vector<uint8_t> BuildStandardInfoValue(uint64_t creation, uint64_t modified,
+                                            uint64_t mftChanged, uint64_t accessed) {
+    std::vector<uint8_t> v(72, 0);
+    *reinterpret_cast<uint64_t*>(v.data() + 0x00) = creation;
+    *reinterpret_cast<uint64_t*>(v.data() + 0x08) = modified;
+    *reinterpret_cast<uint64_t*>(v.data() + 0x10) = mftChanged;
+    *reinterpret_cast<uint64_t*>(v.data() + 0x18) = accessed;
+    return v;
+}
+
 // Append one resident attribute (24-byte header + optional UTF-16 name + value).
 void AppendResidentAttr(std::vector<uint8_t>& rec, uint32_t type,
                         const std::wstring& name, const std::vector<uint8_t>& value) {
@@ -4481,6 +4504,48 @@ TEST("mft: ParseRecord non-resident named ADS only dataSize 0", [] {
     auto result = MftEnumerator::ParseRecordForTest(r);
     // dataSize deve rimanere 0 (nessun unnamed $DATA), il named ADS deve essere ignorato.
     CHECK_EQ(result.dataSize, 0u);
+});
+
+// ---------------------------------------------------------------------------
+// Phase 4b: MFT lastWriteTime source ($STANDARD_INFORMATION preferred)
+
+// The MFT mtime fix: FileEntry.lastWriteTime must come from
+// $STANDARD_INFORMATION (+0x08 modified time) -- the timestamp
+// GetFileInformationByHandle() reports during content hashing -- NOT from
+// $FILE_NAME (+0x10). The two diverge systematically on real volumes, and
+// comparing the $FILE_NAME value against the hashing-time stat produced a
+// volume-wide false MODIFICATO_DURANTE_SCAN.
+TEST("mft: lastWriteTime prefers $STANDARD_INFORMATION over $FILE_NAME", [] {
+    const uint64_t fnMtime = 0x1122334455667788ull;   // $FILE_NAME mtime
+    const uint64_t siModified = 0x8877665544332211ull; // SI modified (distinct)
+    auto r = BuildFileRecord(1100, 1, 0x0001, 0); // in-use + file
+    AppendResidentAttr(r, 0x10 /* kAttrStdInfo */, L"",
+                       BuildStandardInfoValue(0x1111, siModified, 0x2222, 0x3333));
+    AppendResidentAttr(r, 0x30 /* kAttrFileName */, L"",
+                       BuildFileNameValueWithMtime(4609, 1, L"t.txt", 1, fnMtime));
+    FinishRecord(r);
+    const auto result = MftEnumerator::ParseRecordForTest(r);
+    CHECK(result.parsed && result.inUse && !result.isDir);
+    CHECK_EQ(result.mtime, fnMtime);
+    CHECK_EQ(result.standardMtime, siModified);
+    CHECK(result.standardMtime != result.mtime);
+    // FileEntry.lastWriteTime must pick the SI timestamp.
+    CHECK_EQ(result.lastWriteTime, siModified);
+});
+
+// Fallback: no $STANDARD_INFORMATION -> lastWriteTime falls back to the
+// $FILE_NAME timestamp (the pre-fix behaviour).
+TEST("mft: lastWriteTime falls back to $FILE_NAME without $STANDARD_INFORMATION", [] {
+    const uint64_t fnMtime = 0x1122334455667788ull;
+    auto r = BuildFileRecord(1101, 1, 0x0001, 0); // in-use + file, no SI
+    AppendResidentAttr(r, 0x30 /* kAttrFileName */, L"",
+                       BuildFileNameValueWithMtime(4609, 1, L"t.txt", 1, fnMtime));
+    FinishRecord(r);
+    const auto result = MftEnumerator::ParseRecordForTest(r);
+    CHECK(result.parsed && result.inUse && !result.isDir);
+    CHECK_EQ(result.mtime, fnMtime);
+    CHECK_EQ(result.standardMtime, 0ull); // no SI attribute
+    CHECK_EQ(result.lastWriteTime, fnMtime); // fallback to $FILE_NAME
 });
 
 // ---------------------------------------------------------------------------
