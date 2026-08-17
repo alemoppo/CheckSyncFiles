@@ -58,7 +58,8 @@ void HashSourceIndex(FileIndex& index, const std::wstring& root, ThreadPool& poo
                      const std::atomic_bool* cancel, hashing::HashCache* cache,
                      std::atomic<size_t>& cacheHits,
                      const std::function<void(uint64_t done, uint64_t total)>& onProgress,
-                     std::function<void()> onBatchSubmitted) {
+                     std::function<void()> onBatchSubmitted,
+                     profiling::HashProfiler* prof) {
     std::vector<std::wstring> files;
     for (const auto& kv : index.entries()) {
         if (!kv.second.isDirectory) files.push_back(kv.second.relativePath);
@@ -76,7 +77,8 @@ void HashSourceIndex(FileIndex& index, const std::wstring& root, ThreadPool& poo
             // batch scope ends, so both stay valid for the whole task lifetime.
             // `root` is a const reference parameter alive through this call.
             const size_t relIndex = done + i;
-            pool.submit([&files, &slots, relIndex, i, &root, cache, &cacheHits, cancel] {
+            pool.submit([&files, &slots, relIndex, i, &root, cache, &cacheHits, cancel, prof] {
+                profiling::HashSession session(prof);
                 HashSlot& slot = slots[i];
                 if (cancel && cancel->load(std::memory_order_relaxed)) {
                     slot.skipped = true;
@@ -94,7 +96,14 @@ void HashSourceIndex(FileIndex& index, const std::wstring& root, ThreadPool& poo
                     cacheHits.fetch_add(1, std::memory_order_relaxed);
                     return;
                 }
-                if (hashing::Sha256File(abs, slot.digest) == hashing::HashStatus::Ok) {
+                profiling::FileTimings ft;
+                const bool pf = prof && prof->enabled();
+                if (pf) prof->FileBegin(session, profiling::Side::Source, abs, sz);
+                const bool ok =
+                    hashing::Sha256File(abs, slot.digest, pf ? &ft : nullptr) ==
+                    hashing::HashStatus::Ok;
+                if (pf) prof->FileEnd(session, profiling::Side::Source, abs, sz, ft, ok);
+                if (ok) {
                     if (cache) cache->Store(abs, sz, mt, slot.digest);
                 } else {
                     slot.skipped = true;
@@ -115,6 +124,11 @@ ScanReport ScanController::run(const ScanOptions& options) {
     ScanReport report;
     report.backendUsed = EnumeratorBackend::Win32;
     report.modeUsed = options.mode;
+
+    // When the caller provided a profiler it is always enabled (the caller
+    // decides whether to collect by handing it over or not).
+    profiling::HashProfiler* hashProf = options.hashProfiler;
+    if (hashProf) hashProf->setEnabled(true);
 
     const double t0 = NowSeconds();
     const bool haveCompare = !options.compareFrom.empty();
@@ -305,12 +319,17 @@ ScanReport ScanController::run(const ScanOptions& options) {
                 };
                 const double th0 = NowSeconds();
                 HashSourceIndex(sourceIndex, options.source, sourcePool, options.cancel,
-                                cache.get(), hits, hashProgress);
+                                cache.get(), hits, hashProgress, {}, hashProf);
                 hashThreadsActive.store(0, std::memory_order_relaxed);
                 report.secondsHashing += NowSeconds() - th0;
                 report.hashCacheHits += hits.load();
                 report.hashThreadsUsed = srcThreads;
                 report.hashingErrors += sourcePool.taskErrors();
+                if (hashProf) {
+                    const ThreadPool::ThreadPoolMetrics m = sourcePool.metrics();
+                    hashProf->MergePool(m.maxOutstanding, m.maxQueueDepth, m.backpressureWaits,
+                                        m.backpressureWaitTicks, m.waitAllCount, m.waitAllTicks);
+                }
             }
 
             // If hashing was interrupted (cancellation landed while a batch was
@@ -378,7 +397,8 @@ ScanReport ScanController::run(const ScanOptions& options) {
                                     options.destination,
                                     sourceFromIndex ? ConcurrentComparer::SourceKind::FromIndex
                                                     : ConcurrentComparer::SourceKind::Live,
-                                    sourceFromIndex ? &sourceIndex : nullptr, options.cancel);
+                                    sourceFromIndex ? &sourceIndex : nullptr, options.cancel,
+                                    hashProf);
 
         ConcurrentComparer::Result cr = comparer.run(hashPool, enumProgress, hashProgress,
                                                      cache.get());
@@ -393,6 +413,11 @@ ScanReport ScanController::run(const ScanOptions& options) {
         report.hashCacheHits += comparer.cacheHits();
         report.hashingErrors += hashPool.taskErrors();
         for (std::wstring& n : cr.notes) report.notes.push_back(std::move(n));
+        if (hashProf) {
+            const ThreadPool::ThreadPoolMetrics m = hashPool.metrics();
+            hashProf->MergePool(m.maxOutstanding, m.maxQueueDepth, m.backpressureWaits,
+                                m.backpressureWaitTicks, m.waitAllCount, m.waitAllTicks);
+        }
 
         if (cache) {
             std::wstring werr;
@@ -434,6 +459,8 @@ ScanReport ScanController::run(const ScanOptions& options) {
     report.secondsDestinationPass = t3 - t0 - report.secondsEnumerateSource -
                                     report.secondsHashing;
     report.secondsTotal = t3 - t0;
+
+    if (hashProf) hashProf->Finalize(report.hashProfile);
 
     return report;
 }

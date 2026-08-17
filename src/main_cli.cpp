@@ -12,6 +12,7 @@
 #include <string>
 
 #include "ScanController.h"
+#include "Profiling/HashProfile.h"
 #include "Util/StrictNumbers.h"
 
 #define WIN32_LEAN_AND_MEAN
@@ -41,6 +42,8 @@ const wchar_t* kUsage =
     L"  --snapshot-out <file>    salva l'indice della sorgente (con hash in modalita content)\n"
     L"  --compare <snapshot>     confronta --dest contro uno snapshot (niente --source)\n"
     L"  --hash-cache <file>      riusa le impronte SHA-256 non scaricate (percorso+dim+data)\n"
+    L"  --profile-hash           raccoglie e stampa le statistiche del profilo hash\n"
+    L"  --profile-hash-jobs      come sopra e in piu' una riga per ogni file hashato\n"
     L"  -h, --help               mostra questo aiuto\n";
 
 struct Args {
@@ -59,6 +62,8 @@ struct Args {
     std::wstring snapshotOut;
     std::wstring compareFrom;
     std::wstring hashCacheFile;
+    bool profileHash = false;
+    bool profileHashJobs = false;
 };
 
 bool ParseArgs(int argc, wchar_t** argv, Args& out) {
@@ -114,6 +119,11 @@ bool ParseArgs(int argc, wchar_t** argv, Args& out) {
             out.compareFrom = argv[++i];
         } else if (a == L"--hash-cache" && i + 1 < argc) {
             out.hashCacheFile = argv[++i];
+        } else if (a == L"--profile-hash") {
+            out.profileHash = true;
+        } else if (a == L"--profile-hash-jobs") {
+            out.profileHash = true;
+            out.profileHashJobs = true;
         } else if (a == L"-h" || a == L"--help") {
             out.help = true;
         } else {
@@ -201,6 +211,121 @@ std::wstring FormatRate(uint64_t bytes, double seconds) {
     return buf;
 }
 
+// Seconds as a fixed-width wall-clock string with millisecond resolution.
+std::wstring FmtSec(double seconds) {
+    const int sec = static_cast<int>(seconds);
+    const int h = sec / 3600, m = (sec % 3600) / 60, s = sec % 60;
+    const int ms = static_cast<int>((seconds - sec) * 1000.0 + 0.5);
+    if (h > 0) {
+        wchar_t buf[64];
+        swprintf(buf, 64, L"%02d:%02d:%02d.%03d", h, m, s, ms);
+        return buf;
+    }
+    wchar_t buf[32];
+    swprintf(buf, 32, L"%02d.%03d s", s, ms);
+    return buf;
+}
+
+// Peak rate as MB/s (1 MB = 1024^2 bytes).
+std::wstring FmtMBS(uint64_t bytes, double seconds) {
+    if (seconds <= 0.0) return L"n/d";
+    const double mbs = (static_cast<double>(bytes) / (1024.0 * 1024.0)) / seconds;
+    wchar_t buf[64];
+    swprintf(buf, 64, L"%.1f MB/s", mbs);
+    return buf;
+}
+
+std::wstring FmtPct(double pct) {
+    wchar_t buf[32];
+    swprintf(buf, 32, L"%.1f %%", pct);
+    return buf;
+}
+
+// Fixed number of decimal places, decimal comma.
+std::wstring FormatFixed(double value, int decimals) {
+    wchar_t buf[64];
+    swprintf(buf, 64, L"%.*f", decimals, value);
+    std::wstring s = buf;
+    return s;
+}
+
+void PrintHashProfile(const bv::profiling::HashProfileReport& p) {
+    using bv::profiling::QpcToSeconds;
+    const auto& a = p.side[static_cast<int>(bv::profiling::Side::Source)];
+    const auto& b = p.side[static_cast<int>(bv::profiling::Side::Dest)];
+
+    std::wcout << L"\n=== CONTENT HASH PROFILING ===\n";
+    std::wcout << L"\nHash jobs:\n";
+    std::wcout << L"  total:                 " << Group(p.tasks) << L"\n";
+    std::wcout << L"  failed (threw):        " << Group(p.taskFailed) << L"\n";
+    std::wcout << L"  active at end:         " << p.activeJobsAtEnd << L" (deve essere 0)\n";
+
+    std::wcout << L"\nWorkers:\n";
+    std::wcout << L"  max active jobs:       " << p.maxActiveJobs << L"\n";
+
+    auto printSide = [&](const wchar_t* name, const bv::profiling::SideAggregate& s) {
+        const double readSec = QpcToSeconds(s.readTicks);
+        const double hashSec = QpcToSeconds(s.hashTicks);
+        const double totalSec = QpcToSeconds(s.totalTicks);
+        std::wcout << L"\nSide " << name << L":\n";
+        std::wcout << L"  files:                 " << Group(s.files) << L"\n";
+        std::wcout << L"  bytes (letti):         " << HumanBytes(s.bytes) << L"\n";
+        std::wcout << L"  falliti:               " << Group(s.failed) << L"\n";
+        std::wcout << L"  read time:             " << FmtSec(readSec) << L"\n";
+        std::wcout << L"  hash time:             " << FmtSec(hashSec) << L"\n";
+        std::wcout << L"  total time:            " << FmtSec(totalSec) << L"\n";
+        std::wcout << L"  MB/s read:             " << FmtMBS(s.bytes, readSec) << L"\n";
+        std::wcout << L"  MB/s sha:              " << FmtMBS(s.bytes, hashSec) << L"\n";
+        std::wcout << L"  MB/s total:            " << FmtMBS(s.bytes, totalSec) << L"\n";
+    };
+    printSide(L"A (sorgente)", a);
+    printSide(L"B (destinazione)", b);
+
+    auto printStat = [&](const wchar_t* name, const bv::profiling::SideAggregate& s) {
+        const double t1 = QpcToSeconds(s.statT1Ticks);
+        const double t2 = QpcToSeconds(s.statT2Ticks);
+        const double t12 = t1 + t2;
+        const double avgMs = s.files > 0 ? t12 / s.files * 1000.0 : 0.0;
+        std::wcout << L"\n" << name << L":\n";
+        std::wcout << L"  T1 (StatFile pre-hash): " << Group(s.statT1Count) << L" chiamate  "
+                   << FmtSec(t1) << L"\n";
+        std::wcout << L"  T2 (StatFile post-hash):" << Group(s.statT2Count) << L" chiamate  "
+                   << FmtSec(t2) << L"\n";
+        std::wcout << L"  T1+T2:                  " << Group(s.statT1Count + s.statT2Count)
+                   << L" chiamate  " << FmtSec(t12) << L"  media/file: "
+                   << FormatFixed(avgMs, 3) << L" ms\n";
+    };
+    const double totStatTicks = a.statT1Ticks + a.statT2Ticks + b.statT1Ticks + b.statT2Ticks;
+    const uint64_t totStatCalls = a.statT1Count + a.statT2Count + b.statT1Count + b.statT2Count;
+    std::wcout << L"\n=== COSTO CONTROLLO T1/T2 (StatFile -> GetFileInformationByHandle) ===";
+    printStat(L"Side A", a);
+    printStat(L"Side B", b);
+    std::wcout << L"\nTotale A+B: " << Group(totStatCalls) << L" chiamate  "
+               << FmtSec(QpcToSeconds(totStatTicks))
+               << L"  (confrontare con il Tempo totale della scansione qui sopra)\n";
+
+    const double minActive = std::min(p.activeSecondsA, p.activeSecondsB);
+    std::wcout << L"\nConcurrency:\n";
+    std::wcout << L"  max A attivi:          " << p.maxActiveA << L"\n";
+    std::wcout << L"  max B attivi:          " << p.maxActiveB << L"\n";
+    std::wcout << L"  max A+B attivi:        " << p.maxAB << L"\n";
+    std::wcout << L"  A attivo:              " << FmtSec(p.activeSecondsA) << L"\n";
+    std::wcout << L"  B attivo:              " << FmtSec(p.activeSecondsB) << L"\n";
+    std::wcout << L"  A+B sovrapposti:       " << FmtSec(p.overlapSeconds)
+               << L"  (" << FmtPct(minActive > 0.0
+                                      ? p.overlapSeconds / minActive * 100.0
+                                      : 0.0)
+               << L" del tempo del lato meno attivo)\n";
+
+    std::wcout << L"\nBackpressure (ThreadPool):\n";
+    std::wcout << L"  wait count:            " << Group(p.backpressureWaits) << L"\n";
+    std::wcout << L"  total wait:            " << FmtSec(p.backpressureWaitSeconds) << L"\n";
+    std::wcout << L"  waitAll count:         " << Group(p.waitAllCount) << L"\n";
+    std::wcout << L"  total waitAll:         " << FmtSec(p.waitAllSeconds) << L"\n";
+    std::wcout << L"  max outstanding:       " << p.maxOutstandingTasks << L"\n";
+    std::wcout << L"  max queue depth:       " << p.maxQueueDepth << L"\n";
+}
+
 void PrintResults(const bv::ResultSet& r) {
     const bv::Stats& s = r.stats;
     std::wcout << L"\n=== RISULTATO ===\n";
@@ -249,6 +374,15 @@ int MainImpl(int argc, wchar_t** argv) {
     options.exportPath = args.exportPath;
     options.exportFormat = args.exportFormat;
     options.hashCacheFile = args.hashCacheFile;
+
+    // Caller-owned profiler: the controller feeds it and copies the aggregates
+    // into ScanReport::hashProfile; we keep ownership to read the verbose
+    // per-job records afterwards.
+    bv::profiling::HashProfiler hashProfiler(args.profileHashJobs);
+    if (args.profileHash || args.profileHashJobs) {
+        hashProfiler.setEnabled(true);
+        options.hashProfiler = &hashProfiler;
+    }
 
     if (args.progress) {
         options.onProgress = [](const bv::ScanProgress& p) {
@@ -351,6 +485,22 @@ bv::ScanController controller(options.caseSensitive);
                << L"\n";
     std::wcout << L"Velocita effettiva:      "
                << FormatRate(report.results.stats.bytesSource, report.secondsTotal) << L"\n";
+
+    if (options.hashProfiler) {
+        PrintHashProfile(report.hashProfile);
+        if (args.profileHashJobs) {
+            std::wcout << L"\n=== HASH JOB LOG (una riga per file hashato) ===\n";
+            for (const auto& r : hashProfiler.jobRecords()) {
+                std::wcout << L"job=" << r.jobId << L" side=" << bv::profiling::SideName(r.side)
+                           << L" size=" << Group(r.expectedSize)
+                           << L" bytes=" << Group(r.bytesRead)
+                           << L" read=" << FmtSec(bv::profiling::QpcToSeconds(r.readTicks))
+                           << L" hash=" << FmtSec(bv::profiling::QpcToSeconds(r.hashTicks))
+                           << L" total=" << FmtSec(bv::profiling::QpcToSeconds(r.totalTicks))
+                           << L" ok=" << (r.ok ? 1 : 0) << L" path=" << r.path << L"\n";
+            }
+        }
+    }
 
     if (!report.sourceOk) {
         std::wcout << L"\nATTENZIONE: la radice sorgente non e accessibile.\n";

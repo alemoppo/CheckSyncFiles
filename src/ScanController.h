@@ -10,6 +10,7 @@
 #include "Comparison/ScanMode.h"
 #include "Export/ExportUtil.h"
 #include "Filesystem/FileEnumerator.h"
+#include "Profiling/HashProfile.h"
 
 namespace bv {
 
@@ -29,7 +30,8 @@ void HashSourceIndex(FileIndex& index, const std::wstring& root, ThreadPool& poo
                      const std::atomic_bool* cancel, hashing::HashCache* cache,
                      std::atomic<size_t>& cacheHits,
                      const std::function<void(uint64_t done, uint64_t total)>& onProgress,
-                     std::function<void()> onBatchSubmitted = {});
+                     std::function<void()> onBatchSubmitted = {},
+                     profiling::HashProfiler* prof = nullptr);
 
 // High level phases of a run, reported through ScanProgress.
 enum class ScanPhase : uint8_t {
@@ -91,6 +93,11 @@ struct ScanOptions {
     // Optional pointer to an external cancel flag. When set to true, the scan
     // stops gracefully at the next safe point. Owned by the caller.
     std::atomic_bool* cancel = nullptr;
+    // Optional caller-owned content-hash profiler. When non-null it is enabled,
+    // fed from every hash phase of the run, and a copy of its aggregate report
+    // is stored in ScanReport::hashProfile. The caller keeps ownership so it can
+    // read the verbose per-job records afterwards. Default: profiling off.
+    profiling::HashProfiler* hashProfiler = nullptr;
 };
 
 struct ScanReport {
@@ -124,6 +131,9 @@ struct ScanReport {
     // (last-wins). Non-zero means the user should be warned that a name was
     // dropped from the source index.
     size_t pathCollisions = 0;
+    // Aggregate content-hash profiling report (filled only when
+    // ScanOptions::hashProfiler is non-null).
+    profiling::HashProfileReport hashProfile;
 };
 
 // Orchestrates a comparison run:

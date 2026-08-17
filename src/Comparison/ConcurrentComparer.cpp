@@ -237,7 +237,7 @@ void ConcurrentComparer::FlushHashCandidates(std::vector<ContentCandidate>& pend
         pending.resize(start);
         SubmitHashCandidates(batch, *hashPool_, offlineSource_,
                              offlineSource_ ? fromIndex_ : nullptr, sourceRoot_, destRoot_, sink,
-                             cancel_, cache_, cacheHits_, &hashDone_);
+                             cancel_, cache_, cacheHits_, &hashDone_, profile_);
         // The submitted tasks count themselves done as they finish; report
         // completion so far so progress keeps moving while the workers are still
         // enumerating.

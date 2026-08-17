@@ -7,6 +7,7 @@
 
 #include "Hashing/HashCache.h"
 #include "Hashing/Sha256.h"
+#include "Profiling/HashProfile.h"
 
 namespace bv {
 namespace hashing {
@@ -24,9 +25,16 @@ using Digest = std::array<uint8_t, 32>;
 //
 // Shared by the serial comparator and the concurrent comparer. Thread-safe:
 // safe to call concurrently from any number of pool workers.
+//
+// `session`/`side` are profiling-only: when `session` points at an enabled
+// profiler the Sha256File call is wrapped in FileBegin/FileEnd so the run can
+// collect per-side timing / concurrency / overlap statistics. Passing a null
+// session (the default) adds no overhead.
 void HashOneSide(const std::wstring& absPath, uint64_t expectedSize, uint64_t expectedMtime,
                  bool& changed, HashStatus& status, Digest& digest, bool valid,
-                 HashCache* cache, std::atomic<size_t>& cacheHits);
+                 HashCache* cache, std::atomic<size_t>& cacheHits,
+                 profiling::HashSession* session = nullptr,
+                 profiling::Side side = profiling::Side::Source);
 
 } // namespace hashing
 } // namespace bv

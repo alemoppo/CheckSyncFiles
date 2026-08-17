@@ -17,6 +17,7 @@
 #include "Filesystem/FileEnumerator.h"
 #include "Filesystem/FileIndex.h"
 #include "Hashing/HashCache.h"
+#include "Profiling/HashProfile.h"
 #include "Threading/ThreadPool.h"
 
 namespace bv {
@@ -76,12 +77,15 @@ public:
     // `acceptMft` allows the MFT scanner on each local NTFS root (with automatic
     // Win32 fallback only when the MFT fails before emitting any entry).
     // `fromIndex` is required when sourceKind == FromIndex and ignored otherwise.
+    // `profiler` (optional) collects content-hash timing/concurrency metrics.
     ConcurrentComparer(bool caseSensitive, ScanMode mode, bool acceptMft,
                        std::wstring sourceRoot, std::wstring destRoot, SourceKind sourceKind,
-                       FileIndex* fromIndex, const std::atomic_bool* cancel = nullptr)
+                       FileIndex* fromIndex, const std::atomic_bool* cancel = nullptr,
+                       profiling::HashProfiler* profiler = nullptr)
         : caseSensitive_(caseSensitive), mode_(mode), acceptMft_(acceptMft),
           sourceRoot_(std::move(sourceRoot)), destRoot_(std::move(destRoot)),
-          sourceKind_(sourceKind), fromIndex_(fromIndex), cancel_(cancel) {}
+          sourceKind_(sourceKind), fromIndex_(fromIndex), cancel_(cancel),
+          profile_(profiler) {}
 
     // Real-world entry: builds the per-side enumerator plan from `acceptMft`.
     Result run(ThreadPool& hashPool, const ProgressCallback& onProgress = {},
@@ -201,6 +205,7 @@ private:
     // Serializes onHashProgress_ invocations: both workers and the final drain
     // can emit hash progress from different threads.
     std::mutex hashProgressMutex_;
+    profiling::HashProfiler* profile_ = nullptr; // optional content-hash profiler
 };
 
 } // namespace bv

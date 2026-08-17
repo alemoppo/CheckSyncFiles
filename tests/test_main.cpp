@@ -44,6 +44,7 @@
 #include "Filesystem/Win32Enumerator.h"
 #include "Hashing/HashCache.h"
 #include "Hashing/Sha256.h"
+#include "Profiling/HashProfile.h"
 #include "ScanController.h"
 #include "ScanOrchestrator.h"
 #include "TestHarness.h"
@@ -894,6 +895,221 @@ TEST("threadpool: waitOutstandingBelow() throttles, not drains", [] {
     gate1p.set_value();
     pool.waitAll();
     CHECK_EQ(started.load(), k);
+});
+
+// ---------------------------------------------------------------------------
+// Content-hash profiling (Phase: instrumentation)
+// ---------------------------------------------------------------------------
+
+TEST("sha256: timings fill bytesRead and separate read/hash time", [] {
+    // A file larger than the 1 MiB streaming chunk forces several ReadFile /
+    // BCryptHashData iterations, so the cumulative counters are exercised.
+    const auto dir = MakeTempDir();
+    const std::wstring path = dir + L"\\big.bin";
+    const size_t kBytes = 2 * 1024 * 1024 + 12345; // > 1 MiB chunk, odd tail
+    {
+        std::vector<char> data(kBytes, 'x');
+        const HANDLE h = CreateFileW(pathutil::AddLongPathPrefix(path).c_str(), GENERIC_WRITE,
+                                     0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        CHECK(h != INVALID_HANDLE_VALUE);
+        if (h != INVALID_HANDLE_VALUE) {
+            DWORD written = 0;
+            CHECK(WriteFile(h, data.data(), static_cast<DWORD>(data.size()), &written, nullptr));
+            CloseHandle(h);
+        }
+    }
+
+    std::array<uint8_t, 32> plain;
+    CHECK(hashing::Sha256File(path, plain) == hashing::HashStatus::Ok);
+
+    std::array<uint8_t, 32> profiled;
+    bv::profiling::FileTimings t;
+    CHECK(hashing::Sha256File(path, profiled, &t) == hashing::HashStatus::Ok);
+    CHECK(plain == profiled); // timing must not change the digest
+    CHECK_EQ(t.bytesRead, static_cast<uint64_t>(kBytes));
+    CHECK(t.totalTicks > 0);
+    // read + hash fit inside the total span; both are non-negative by construction.
+    CHECK(t.readTicks + t.hashTicks <= t.totalTicks);
+});
+
+TEST("profiling: live-live candidates record both sides per job", [] {
+    const auto dir = MakeTempDir();
+    const std::wstring src = dir + L"\\src";
+    const std::wstring dst = dir + L"\\dst";
+    fs::create_directories(src);
+    fs::create_directories(dst);
+    const std::vector<std::pair<std::wstring, size_t>> files = {
+        {L"a.txt", 1000}, {L"b.bin", 2500000}, {L"sub\\c.txt", 4096}};
+    for (const auto& [rel, n] : files) {
+        const std::wstring relDir = (rel.find(L'\\') != std::wstring::npos)
+                                        ? rel.substr(0, rel.find(L'\\'))
+                                        : L"";
+        if (!relDir.empty()) {
+            fs::create_directories(src + L"\\" + relDir);
+            fs::create_directories(dst + L"\\" + relDir);
+        }
+        const std::string body(n, 'z');
+        CHECK(WriteFileBytes(src + L"\\" + rel, body.data(), body.size()));
+        CHECK(WriteFileBytes(dst + L"\\" + rel, body.data(), body.size()));
+    }
+
+    std::vector<ContentCandidate> candidates;
+    for (const auto& [rel, n] : files) {
+        uint64_t sz = 0, mt = 0;
+        CHECK(hashing::StatFile(src + L"\\" + rel, sz, mt));
+        uint64_t dsz = 0, dmt = 0;
+        CHECK(hashing::StatFile(dst + L"\\" + rel, dsz, dmt));
+        ContentCandidate c;
+        c.relativePath = rel;
+        c.sizeSource = sz;
+        c.sizeDest = dsz;
+        c.srcMtime = mt;
+        c.dstMtime = dmt;
+        candidates.push_back(std::move(c));
+    }
+
+    std::atomic<size_t> hits{0};
+    std::atomic_bool cancel{false};
+    bv::profiling::HashProfiler prof(/*verboseJobs=*/true);
+    prof.setEnabled(true);
+    {
+        ConcurrentSink sink;
+        ThreadPool pool(2);
+        SubmitHashCandidates(candidates, pool, /*offline=*/false, nullptr, src, dst, sink,
+                             &cancel, nullptr, hits, nullptr, &prof);
+        pool.waitAll();
+        const ResultSet r = sink.take();
+        CHECK_EQ(r.stats.identicalFiles, 3ull);
+        CHECK_EQ(r.stats.changedDuringScan, 0ull);
+    }
+
+    bv::profiling::HashProfileReport rep;
+    prof.Finalize(rep);
+    CHECK_EQ(rep.tasks, 3ull);             // one task per candidate
+    CHECK_EQ(rep.taskFailed, 0ull);
+    CHECK_EQ(rep.activeJobsAtEnd, 0ull);   // every task released its slot
+    CHECK_MSG(rep.maxActiveJobs >= 1, "at least one hash job ran");
+    const auto& a = rep.side[static_cast<int>(bv::profiling::Side::Source)];
+    const auto& b = rep.side[static_cast<int>(bv::profiling::Side::Dest)];
+    CHECK_EQ(a.files, 3ull);
+    CHECK_EQ(b.files, 3ull);
+    CHECK_EQ(a.bytes, b.bytes);
+    CHECK_EQ(a.failed, 0ull);
+    CHECK_EQ(b.failed, 0ull);
+    CHECK(a.totalTicks > 0 && b.totalTicks > 0);
+    // Each side was hashed once per candidate: 3 A records + 3 B records.
+    CHECK_EQ(prof.jobRecords().size(), 6ull);
+    for (const auto& r : prof.jobRecords()) {
+        CHECK(r.ok);
+        CHECK_EQ(r.bytesRead, r.expectedSize);
+        CHECK(r.readTicks + r.hashTicks <= r.totalTicks);
+    }
+});
+
+TEST("profiling: disabled profiler records nothing", [] {
+    const auto dir = MakeTempDir();
+    const std::wstring src = dir + L"\\src";
+    const std::wstring dst = dir + L"\\dst";
+    fs::create_directories(src);
+    fs::create_directories(dst);
+    CHECK(WriteFileBytes(src + L"\\f.txt", "hello", 5));
+    CHECK(WriteFileBytes(dst + L"\\f.txt", "hello", 5));
+
+    std::vector<ContentCandidate> candidates;
+    {
+        uint64_t sz = 0, mt = 0;
+        uint64_t dsz = 0, dmt = 0;
+        CHECK(hashing::StatFile(src + L"\\f.txt", sz, mt));
+        CHECK(hashing::StatFile(dst + L"\\f.txt", dsz, dmt));
+        ContentCandidate c;
+        c.relativePath = L"f.txt";
+        c.sizeSource = sz;
+        c.sizeDest = dsz;
+        c.srcMtime = mt;
+        c.dstMtime = dmt;
+        candidates.push_back(std::move(c));
+    }
+
+    std::atomic<size_t> hits{0};
+    std::atomic_bool cancel{false};
+    bv::profiling::HashProfiler prof; // left disabled
+    {
+        ConcurrentSink sink;
+        ThreadPool pool(2);
+        SubmitHashCandidates(candidates, pool, /*offline=*/false, nullptr, src, dst, sink,
+                             &cancel, nullptr, hits, nullptr, &prof);
+        pool.waitAll();
+        const ResultSet r = sink.take();
+        CHECK_EQ(r.stats.identicalFiles, 1ull); // behaviour unchanged
+    }
+    bv::profiling::HashProfileReport rep;
+    prof.Finalize(rep);
+    CHECK_EQ(rep.tasks, 0ull);
+    CHECK(prof.jobRecords().empty());
+});
+
+TEST("threadpool: metrics track backpressure waits and outstanding", [] {
+    bv::ThreadPool pool(1);
+    std::atomic<bool> taskStarted{false};
+    std::atomic<bool> waitReturned{false};
+    std::promise<void> gate;
+
+    pool.submit([&] {
+        taskStarted.store(true, std::memory_order_release);
+        gate.get_future().wait();
+    });
+    while (!taskStarted.load(std::memory_order_acquire)) std::this_thread::yield();
+    pool.submit([] {}); // second task queued behind the blocked one
+    // A moment later the pool's passive counters must reflect 2 outstanding /
+    // 1 queued, and the blocking wait below must be measured.
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    {
+        const auto m = pool.metrics();
+        CHECK_MSG(m.maxOutstanding >= 2, "submitted-but-not-finished must be >= 2");
+        CHECK_MSG(m.maxQueueDepth >= 1, "one task must sit in the queue");
+    }
+    std::thread waiter([&] {
+        pool.waitOutstandingBelow(0);
+        waitReturned.store(true, std::memory_order_release);
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    CHECK_MSG(!waitReturned.load(std::memory_order_acquire),
+              "waitOutstandingBelow(0) returned while a task was blocked");
+    gate.set_value();
+    waiter.join();
+    CHECK(waitReturned.load(std::memory_order_acquire));
+    const auto m = pool.metrics();
+    CHECK_MSG(m.backpressureWaits >= 1, "the blocking wait must be counted");
+    CHECK_MSG(m.backpressureWaitTicks > 0, "the blocking wait must be timed");
+    pool.waitAll();
+});
+
+TEST("profiling: ScanController content run fills report and keeps results", [] {
+    const auto dir = MakeTempDir();
+    const size_t count = 200;
+    const std::wstring src = dir + L"\\src";
+    const std::wstring dst = dir + L"\\dst";
+    testgen::CreateStressTree(src, count);
+    fs::copy(src, dst, fs::copy_options::recursive);
+
+    bv::ScanOptions opts;
+    opts.source = src;
+    opts.destination = dst;
+    opts.mode = bv::ScanMode::Content;
+    opts.hashThreads = 2;
+    bv::profiling::HashProfiler prof;
+    opts.hashProfiler = &prof;
+    ScanController controller(false);
+    const ScanReport report = controller.run(opts);
+
+    CHECK_EQ(report.results.stats.identicalFiles, count);
+    CHECK(report.results.problems.empty());
+    CHECK_EQ(report.hashProfile.tasks, count);
+    CHECK_EQ(report.hashProfile.activeJobsAtEnd, 0ull);
+    CHECK_EQ(report.hashProfile.side[0].files, count);
+    CHECK_EQ(report.hashProfile.side[1].files, count);
+    CHECK_EQ(report.hashProfile.side[0].bytes, report.hashProfile.side[1].bytes);
+    CHECK(report.hashProfile.side[0].bytes > 0);
 });
 
 TEST("ioclass: classify local vs network", [] {

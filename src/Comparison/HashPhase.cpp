@@ -41,7 +41,8 @@ void AddStats(Stats& target, const Stats& add) {
 void HashOneCandidateInto(const ContentCandidate& c, bool offlineSource, FileIndex* index,
                           const std::wstring& sourceRoot, const std::wstring& destRoot,
                           ConcurrentSink& sink, const std::atomic_bool* cancel,
-                          hashing::HashCache* cache, std::atomic<size_t>& cacheHits) {
+                          hashing::HashCache* cache, std::atomic<size_t>& cacheHits,
+                          profiling::HashSession* session) {
     auto& stats = sink.stats();
     const auto inc = [&stats](std::atomic<uint64_t>& x) {
         x.fetch_add(1, std::memory_order_relaxed);
@@ -88,12 +89,14 @@ void HashOneCandidateInto(const ContentCandidate& c, bool offlineSource, FileInd
         srcStatus = hasSrc ? hashing::HashStatus::Ok : hashing::HashStatus::ReadError;
     } else {
         hashing::HashOneSide(pathutil::MakeAbsolute(sourceRoot, c.relativePath), c.sizeSource,
-                             c.srcMtime, changed, srcStatus, srcDigest, true, cache, cacheHits);
+                             c.srcMtime, changed, srcStatus, srcDigest, true, cache, cacheHits,
+                             session, profiling::Side::Source);
         hasSrc = (srcStatus == hashing::HashStatus::Ok);
     }
     bool dstChanged = false;
     hashing::HashOneSide(pathutil::MakeAbsolute(destRoot, c.relativePath), c.sizeDest, c.dstMtime,
-                         dstChanged, dstStatus, dstDigest, true, cache, cacheHits);
+                         dstChanged, dstStatus, dstDigest, true, cache, cacheHits, session,
+                         profiling::Side::Dest);
     hasDst = (dstStatus == hashing::HashStatus::Ok);
     changed = changed || dstChanged;
 
@@ -142,21 +145,26 @@ void SubmitHashCandidates(const std::vector<ContentCandidate>& candidates, Threa
                           const std::wstring& sourceRoot, const std::wstring& destRoot,
                           ConcurrentSink& sink, const std::atomic_bool* cancel,
                           hashing::HashCache* cache, std::atomic<size_t>& cacheHits,
-                          std::atomic<uint64_t>* hashDone) {
+                          std::atomic<uint64_t>* hashDone, profiling::HashProfiler* prof) {
     for (const ContentCandidate& c : candidates) {
         // The candidate is captured BY VALUE: the batch vector may be reused or
         // destroyed as soon as this call returns, and a task can never confuse
         // one candidate with a neighbouring element.
         pool.submit([c, offlineSource, index, &sourceRoot, &destRoot, &sink, cancel, cache,
-                     &cacheHits, hashDone] {
+                     &cacheHits, hashDone, prof] {
+            // HashSession owns the profiler task slot: it bumps/decrements the
+            // active-job counters and issues this task's unique job id, and it
+            // is destroyed on every exit path (including a thrown exception).
+            profiling::HashSession session(prof);
             // HashOneCandidateInto never throws in practice (every failure is
             // folded into the sink), but if it did the candidate would still be
             // counted as done so progress can reach 100%; the pool also records
             // the throw as a task error for the caller.
             try {
                 HashOneCandidateInto(c, offlineSource, index, sourceRoot, destRoot, sink, cancel,
-                                     cache, cacheHits);
+                                     cache, cacheHits, &session);
             } catch (...) {
+                if (prof) prof->TaskFailed();
                 if (hashDone) hashDone->fetch_add(1, std::memory_order_relaxed);
                 throw;
             }
@@ -169,7 +177,8 @@ void RunHashPhase(const std::vector<ContentCandidate>& candidates, ThreadPool& p
                   bool offlineSource, FileIndex* index, const std::wstring& sourceRoot,
                   const std::wstring& destRoot, ResultSet& out, const std::atomic_bool* cancel,
                   const std::function<void(uint64_t done, uint64_t total)>& onProgress,
-                  hashing::HashCache* cache, std::atomic<size_t>& cacheHits) {
+                  hashing::HashCache* cache, std::atomic<size_t>& cacheHits,
+                  profiling::HashProfiler* prof) {
     ConcurrentSink sink;
     const size_t total = candidates.size();
     size_t done = 0;
@@ -179,7 +188,7 @@ void RunHashPhase(const std::vector<ContentCandidate>& candidates, ThreadPool& p
         const size_t n = std::min(kHashBatchSize, total - done);
         std::vector<ContentCandidate> batch(candidates.begin() + done, candidates.begin() + done + n);
         SubmitHashCandidates(batch, pool, offlineSource, index, sourceRoot, destRoot, sink,
-                             cancel, cache, cacheHits);
+                             cancel, cache, cacheHits, nullptr, prof);
         pool.waitAll();
         done += n;
         if (onProgress) onProgress(done, total);

@@ -53,6 +53,14 @@ public:
             if (stopping_) return;
             tasks_.emplace(std::forward<F>(f));
             ++issued_;
+            // Profiling-only maxima (relaxed atomics; no behavioural change).
+            const uint64_t outstanding = issued_ - completed_;
+            const uint64_t running = runningTasks_.load(std::memory_order_relaxed);
+            if (outstanding > maxOutstanding_.load(std::memory_order_relaxed))
+                maxOutstanding_.store(outstanding, std::memory_order_relaxed);
+            const uint64_t queueDepth = outstanding > running ? outstanding - running : 0;
+            if (queueDepth > maxQueueDepth_.load(std::memory_order_relaxed))
+                maxQueueDepth_.store(queueDepth, std::memory_order_relaxed);
         }
         cv_.notify_one();
     }
@@ -77,6 +85,20 @@ public:
     // the final report) instead of swallowing it silently.
     uint64_t taskErrors() const { return taskErrors_.load(std::memory_order_relaxed); }
 
+    // Snapshot of the pool's profiling counters. These are passive maxima /
+    // blocking gauges recorded without altering the scheduling, backpressure or
+    // synchronization semantics; used only to report how the pool actually
+    // behaved during a scan.
+    struct ThreadPoolMetrics {
+        uint64_t maxOutstanding = 0;       // max submitted-but-not-finished tasks
+        uint64_t maxQueueDepth = 0;        // max tasks queued (not yet started)
+        uint64_t backpressureWaits = 0;    // times waitOutstandingBelow() blocked
+        uint64_t backpressureWaitTicks = 0; // QPC ticks spent inside that wait
+        uint64_t waitAllCount = 0;          // times waitAll() blocked
+        uint64_t waitAllTicks = 0;          // QPC ticks spent inside waitAll()
+    };
+    ThreadPoolMetrics metrics() const;
+
 private:
     void workerLoop();
 
@@ -90,6 +112,15 @@ private:
     uint64_t completed_ = 0;  // total tasks finished (issued_ - completed_ = in flight)
     std::atomic<uint64_t> taskErrors_{0};
     unsigned int nThreads_;
+
+    // Profiling counters (passive, relaxed atomics; never gate or block).
+    std::atomic<uint64_t> runningTasks_{0};       // workers currently executing
+    std::atomic<uint64_t> maxOutstanding_{0};     // max submitted-but-not-finished
+    std::atomic<uint64_t> maxQueueDepth_{0};      // max queued-but-not-started
+    std::atomic<uint64_t> backpressureWaits_{0};
+    std::atomic<uint64_t> backpressureWaitTicks_{0};
+    std::atomic<uint64_t> waitAllCount_{0};
+    std::atomic<uint64_t> waitAllTicks_{0};
 };
 
 // Picks a sensible default worker count for an IO class. Never exceeds a small
