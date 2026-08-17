@@ -11,7 +11,8 @@ namespace hashing {
 void HashOneSide(const std::wstring& absPath, uint64_t expectedSize, uint64_t expectedMtime,
                  bool& changed, HashStatus& status, Digest& digest, bool valid,
                  HashCache* cache, std::atomic<size_t>& cacheHits,
-                 profiling::HashSession* session, profiling::Side side) {
+                 profiling::HashSession* session, profiling::Side side,
+                 const std::atomic_bool* cancel) {
     if (!valid) {
         status = HashStatus::ReadError;
         return;
@@ -67,9 +68,9 @@ void HashOneSide(const std::wstring& absPath, uint64_t expectedSize, uint64_t ex
     profiling::FileTimings ft;
     if (prof) session->prof->FileBegin(*session, side, absPath, expectedSize);
     if (prof) {
-        status = Sha256FileFromHandle<true>(h, digest, &ft);
+        status = Sha256FileFromHandle<true>(h, digest, &ft, cancel);
     } else {
-        status = Sha256FileFromHandle<false>(h, digest, nullptr);
+        status = Sha256FileFromHandle<false>(h, digest, nullptr, cancel);
     }
     if (prof) session->prof->FileEnd(*session, side, absPath, expectedSize, ft,
                                      status == HashStatus::Ok);

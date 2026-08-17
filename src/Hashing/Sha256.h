@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <string>
 
@@ -16,6 +17,7 @@ namespace hashing {
 
 enum class HashStatus : uint8_t {
     Ok,        // digest filled with the SHA-256 (32 bytes)
+    Cancelled, // stopped early because the cancel flag was set (no digest)
     NoAccess,  // could not open the file (access denied)
     ReadError, // open succeeded but read / digest failed
 };
@@ -25,14 +27,14 @@ enum class HashStatus : uint8_t {
 // Reads the file in 1 MiB chunks so files larger than 4 GiB work. Only returns
 // Ok and fills `digest` when every byte has been hashed successfully. Uses the
 // long-path prefix internally, so paths beyond MAX_PATH are handled.
-HashStatus Sha256File(const std::wstring& path, std::array<uint8_t, 32>& digest);
-
-// Same, but additionally fills `timings` (when non-null) with per-file
-// read/hash/total QPC timing and the number of bytes actually read. Passing a
-// non-null pointer is the only way to enable the timing capture; the two-argument
-// form above compiles to the exact same code path with zero timing overhead.
+//
+// `cancel`, when non-null, is polled once per 1 MiB chunk: if it turns true the
+// stream stops early and returns Cancelled (no digest, no fake read error) so a
+// running hashing pool can be drained quickly on Interrompi instead of reading
+// the rest of every in-flight file to the end.
 HashStatus Sha256File(const std::wstring& path, std::array<uint8_t, 32>& digest,
-                      profiling::FileTimings* timings);
+                      profiling::FileTimings* timings = nullptr,
+                      const std::atomic_bool* cancel = nullptr);
 
 // Opens the file read-only and reports its current size and last-write time
 // (FILETIME ticks). Returns false when the file cannot be opened. Used by the
@@ -54,7 +56,8 @@ bool StatFile(const std::wstring& path, uint64_t& size, uint64_t& lastWriteTime)
 // Sha256.cpp, so `HashOneSide` can pick either at the call site.
 template <bool Profile>
 HashStatus Sha256FileFromHandle(HANDLE h, std::array<uint8_t, 32>& digest,
-                                profiling::FileTimings* timings);
+                                profiling::FileTimings* timings,
+                                const std::atomic_bool* cancel = nullptr);
 
 // Reports the current size and last-write time (FILETIME ticks) of an
 // ALREADY-OPEN handle, reusing exactly the conversion StatFile() performs on

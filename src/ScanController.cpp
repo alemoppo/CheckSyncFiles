@@ -100,7 +100,7 @@ void HashSourceIndex(FileIndex& index, const std::wstring& root, ThreadPool& poo
                 const bool pf = prof && prof->enabled();
                 if (pf) prof->FileBegin(session, profiling::Side::Source, abs, sz);
                 const bool ok =
-                    hashing::Sha256File(abs, slot.digest, pf ? &ft : nullptr) ==
+                    hashing::Sha256File(abs, slot.digest, pf ? &ft : nullptr, cancel) ==
                     hashing::HashStatus::Ok;
                 if (pf) prof->FileEnd(session, profiling::Side::Source, abs, sz, ft, ok);
                 if (ok) {

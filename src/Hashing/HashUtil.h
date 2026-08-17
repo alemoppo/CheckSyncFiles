@@ -34,7 +34,8 @@ void HashOneSide(const std::wstring& absPath, uint64_t expectedSize, uint64_t ex
                  bool& changed, HashStatus& status, Digest& digest, bool valid,
                  HashCache* cache, std::atomic<size_t>& cacheHits,
                  profiling::HashSession* session = nullptr,
-                 profiling::Side side = profiling::Side::Source);
+                 profiling::Side side = profiling::Side::Source,
+                 const std::atomic_bool* cancel = nullptr);
 
 } // namespace hashing
 } // namespace bv

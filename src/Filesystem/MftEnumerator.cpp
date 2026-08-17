@@ -132,6 +132,91 @@ std::wstring MftDiagFilePath() {
 }
 
 // ---------------------------------------------------------------------------
+// TEMPORARY DIAGNOSTIC PROFILER (cold-run bottleneck decomposition).
+//
+// Behaviour-neutral: when BV_MFT_PROFILE is not set (or empty) every timer and
+// counter below is compiled out via the `prof` bool, so normal operation is
+// byte-for-byte unchanged. When set, BV_MFT_PROFILE is a base path and a
+// per-volume report "<base>.<DRIVE>.txt" is appended at the end of each
+// enumerate(); <DRIVE> (uppercase root letter) keeps the concurrently-running
+// A and B workers writing to separate files with no locking.
+// ---------------------------------------------------------------------------
+
+inline uint64_t MftNow() {
+    LARGE_INTEGER q;
+    QueryPerformanceCounter(&q);
+    return static_cast<uint64_t>(q.QuadPart);
+}
+
+inline double MftSecs(uint64_t ticks) {
+    static const LARGE_INTEGER freq = [] {
+        LARGE_INTEGER f{};
+        QueryPerformanceFrequency(&f);
+        return f;
+    }();
+    if (freq.QuadPart == 0) return 0.0;
+    return static_cast<double>(ticks) / static_cast<double>(freq.QuadPart);
+}
+
+bool MftProfileEnabled() {
+    static const bool on = [] {
+        WCHAR buf[1024];
+        return GetEnvironmentVariableW(L"BV_MFT_PROFILE", buf, 1024) > 0;
+    }();
+    return on;
+}
+
+std::wstring MftProfilePath(const std::wstring& normRoot) {
+    WCHAR buf[1024];
+    const DWORD n = GetEnvironmentVariableW(L"BV_MFT_PROFILE", buf, 1024);
+    if (n == 0 || n >= 1024) return std::wstring();
+    std::wstring base = buf;
+    wchar_t drive = L'?';
+    if (normRoot.size() >= 2 && normRoot[1] == L':') drive = (wchar_t)towupper(normRoot[0]);
+    return base + L"." + drive + L".txt";
+}
+
+// One per-phase accumulator: elapsed QPC ticks, operation count, bytes involved.
+struct MftPhaseStat {
+    uint64_t ticks = 0;
+    uint64_t ops = 0;
+    uint64_t bytes = 0;
+};
+
+inline void MftAdd(MftPhaseStat& p, uint64_t t, uint64_t ops = 0, uint64_t bytes = 0) {
+    p.ticks += t;
+    p.ops += ops;
+    p.bytes += bytes;
+}
+
+struct MftProfileStat {
+    MftPhaseStat openVolume;   // backup privilege + root handle + volume open + NTFS data + flush
+    MftPhaseStat rec0;         // record 0 read + $MFT run-map parse
+    MftPhaseStat mftRead;      // $MFT raw sweep: ReadFile calls, bytes, seeks, records examined
+    MftPhaseStat passA;        // ApplyFixup + ParseRecord + MergePassA (CPU, = loop - mftRead)
+    MftPhaseStat passB;        // $ATTRIBUTE_LIST follow (ReadNonResidentAttr + merge)
+    MftPhaseStat reverseIndex; // parent-pointer reverse index build (CPU)
+    MftPhaseStat walkStep;     // per-directory WalkDirectoryStep (index read + parse + union + fallback)
+    MftPhaseStat raw;          // rawReader aggregate (Pass-B attr-list reads + walk index reads)
+    MftPhaseStat emit;         // consumer onEntry (MatchTable insert + classify), MFT-path only
+    MftPhaseStat fallback;     // per-directory Win32 fallback count + time
+    MftPhaseStat other;        // residual (computed)
+    uint64_t rawBytesAfterPassB = 0;   // raw.bytes snapshot right after Pass B
+    uint64_t rawCallsAfterPassB = 0;   // raw.ops   snapshot right after Pass B
+    uint64_t rawTicksAfterPassB = 0;   // raw.ticks snapshot right after Pass B
+    uint64_t mftSeeks = 0;             // SetFilePointerEx calls during the $MFT sweep
+    uint64_t mftRuns = 0;              // number of $MFT data runs (fragmentation)
+    uint64_t nRecords = 0;             // total MFT records present
+
+    void writeLine(FILE* f, const char* name, const MftPhaseStat& p) const {
+        const double s = MftSecs(p.ticks);
+        std::fprintf(f, "%-14s ss=%.4f ops=%-9llu bytes=%-11llu avg_us=%.3f ms=%.4f\n",
+                     name, s, (unsigned long long)p.ops, (unsigned long long)p.bytes,
+                     p.ops ? s * 1e6 / (double)p.ops : 0.0, s * 1e3);
+    }
+};
+
+// ---------------------------------------------------------------------------
 // NTFS primitive parsing
 // ---------------------------------------------------------------------------
 
@@ -611,7 +696,8 @@ size_t ParseIndexAllocationData(std::vector<uint8_t>& data, size_t blockSize,
 template <typename RawReader>
 bool ReadNonResidentAttrInto(const RawReader& read, uint64_t cluster,
                              const std::vector<uint8_t>& hdrCopy,
-                             std::vector<uint8_t>& out, size_t dstOff) {
+                             std::vector<uint8_t>& out, size_t dstOff,
+                             const std::atomic_bool* cancel = nullptr) {
     if (hdrCopy.size() < 56) return false;
     const uint16_t mapOff = *reinterpret_cast<const uint16_t*>(hdrCopy.data() + 32);
     const int64_t lowVcn = *reinterpret_cast<const int64_t*>(hdrCopy.data() + 16);
@@ -636,6 +722,7 @@ bool ReadNonResidentAttrInto(const RawReader& read, uint64_t cluster,
         r += lenb + offb;
         if (first) { lcn = lcnD; first = false; } else { lcn += lcnD; }
         for (int64_t k = 0; k < len; ++k) {
+            if (cancel && cancel->load(std::memory_order_relaxed)) return false; // poll the flag
             const size_t byteOff = dstOff + (size_t)(vcn - lowVcn) * cluster;
             if (byteOff + cluster <= out.size()) {
                 read((uint64_t)(lcn + k) * cluster, out.data() + byteOff, (size_t)cluster);
@@ -650,7 +737,8 @@ bool ReadNonResidentAttrInto(const RawReader& read, uint64_t cluster,
 // copy (used for $ATTRIBUTE_LIST, which is one whole attribute).
 template <typename RawReader>
 bool ReadNonResidentAttr(const RawReader& read, uint64_t cluster,
-                         const std::vector<uint8_t>& hdrCopy, std::vector<uint8_t>& out) {
+                         const std::vector<uint8_t>& hdrCopy, std::vector<uint8_t>& out,
+                         const std::atomic_bool* cancel = nullptr) {
     if (hdrCopy.size() < 56) return false;
     const int64_t lowVcn = *reinterpret_cast<const int64_t*>(hdrCopy.data() + 16);
     const int64_t highVcn = *reinterpret_cast<const int64_t*>(hdrCopy.data() + 24);
@@ -659,7 +747,7 @@ bool ReadNonResidentAttr(const RawReader& read, uint64_t cluster,
     const uint64_t totalBytes = (uint64_t)(highVcn - lowVcn + 1) * cluster;
     if (totalBytes > kMaxAttrData || totalBytes < dataSize) return false;
     std::vector<uint8_t> tmp((size_t)totalBytes);
-    if (!ReadNonResidentAttrInto(read, cluster, hdrCopy, tmp, 0)) return false;
+    if (!ReadNonResidentAttrInto(read, cluster, hdrCopy, tmp, 0, cancel)) return false;
     if (tmp.size() > dataSize) tmp.resize((size_t)dataSize);
     out.swap(tmp);
     return !out.empty();
@@ -675,7 +763,8 @@ bool ReadNonResidentAttr(const RawReader& read, uint64_t cluster,
 template <typename RawReader>
 bool ReadIndexAllocationStream(const RawReader& read, uint64_t cluster,
                                const std::vector<std::vector<uint8_t>>& hdrs,
-                               std::vector<uint8_t>& out) {
+                               std::vector<uint8_t>& out,
+                               const std::atomic_bool* cancel = nullptr) {
     if (hdrs.empty()) return false;
     struct Piece {
         int64_t low;
@@ -700,7 +789,7 @@ bool ReadIndexAllocationStream(const RawReader& read, uint64_t cluster,
     std::vector<uint8_t> tmp((size_t)spanBytes);
     for (const auto& pc : pieces) {
         const size_t dstOff = (size_t)(pc.low - minVcn) * cluster;
-        if (!ReadNonResidentAttrInto(read, cluster, *pc.h, tmp, dstOff)) return false;
+        if (!ReadNonResidentAttrInto(read, cluster, *pc.h, tmp, dstOff, cancel)) return false;
     }
     // The real (valid-data) size is stored in the piece that starts at VCN 0.
     uint64_t realSize = *reinterpret_cast<const uint64_t*>(pieces.front().h->data() + 48);
@@ -985,7 +1074,7 @@ DirStepOutcome WalkDirectoryStep(
         }
         if (!d.idxAllocHdrs.empty()) {
             std::vector<uint8_t> data;
-            if (!ReadIndexAllocationStream(read, cluster, d.idxAllocHdrs, data)) {
+            if (!ReadIndexAllocationStream(read, cluster, d.idxAllocHdrs, data, cancel)) {
                 needWin32Fallback = true;
             } else {
                 const size_t blk = (d.idxBlockSize >= kMinIndexBlockSize &&
@@ -1110,6 +1199,16 @@ bool MftEnumerator::enumerate(const std::wstring& root,
     }
     if (!IsSupported(normRoot)) { BVDBG("mft[1b] not NTFS\\n"); return false; }
 
+    // TEMPORARY DIAGNOSTIC PROFILER (see the helpers above). `prof` is false
+    // unless BV_MFT_PROFILE is set, so all timers below are inert in normal runs.
+    const bool prof = MftProfileEnabled();
+    MftProfileStat profile;
+    const std::wstring profPath = prof ? MftProfilePath(normRoot) : std::wstring();
+    const uint64_t runT0 = MftNow();
+
+    // TEMPORARY DIAGNOSTIC: open-volume + NTFS geometry + flush.
+    const uint64_t openT0 = prof ? MftNow() : 0;
+
     EnableBackupPrivileges();
     const std::wstring drive = std::wstring(1, normRoot[0]) + L":\\";
     const std::wstring devVol = L"\\\\.\\" + drive.substr(0, 2); // e.g. "\\\\.\\C:"
@@ -1160,16 +1259,21 @@ const uint64_t segSize = vd.BytesPerFileRecordSegment;
     // freshly-created tree may be read back in a partially-flushed state.
     FlushFileBuffers(hVol);
     const uint64_t nRecords = mftBytes / segSize;
+    if (prof) MftAdd(profile.openVolume, MftNow() - openT0);
 
     // Raw reader for attribute payloads: the $ATTRIBUTE_LIST and $INDEX_ALLOCATION
     // read path (ReadNonResidentAttr / ReadIndexAllocationStream) fetches bytes
     // through this so the in-memory test seam can drive the SAME code with
     // fixture bytes instead of a volume HANDLE.
     const auto rawReader = [&](uint64_t off, uint8_t* dst, size_t len) {
-        return ReadVolAt(hVol, off, dst, (DWORD)len);
+        const uint64_t rawT0 = prof ? MftNow() : 0;
+        const bool ok = ReadVolAt(hVol, off, dst, (DWORD)len);
+        if (prof) MftAdd(profile.raw, MftNow() - rawT0, 1, len);
+        return ok;
     };
 
     // ---- $MFT data-run map from record 0 (fragmentation-aware) -------------
+    const uint64_t rec0T0 = prof ? MftNow() : 0;
     std::vector<uint8_t> rec0((size_t)segSize);
     if (!ReadVolAt(hVol, mftStartBytes, rec0.data(), (DWORD)segSize) ||
         !ApplyFixup(rec0.data(), rec0.size())) {
@@ -1201,6 +1305,11 @@ const uint64_t segSize = vd.BytesPerFileRecordSegment;
     }
     std::sort(runs.begin(), runs.end(),
               [](const MftRun& x, const MftRun& y) { return x.startVcn < y.startVcn; });
+    if (prof) {
+        MftAdd(profile.rec0, MftNow() - rec0T0, 1, segSize);
+        profile.mftRuns = runs.size();
+        profile.nRecords = nRecords;
+    }
 
     // Iterate every MFT record, in record order, reading each run's physical
     // clusters. `cb` receives (recordIndex, recordBytes, recordSize).
@@ -1220,8 +1329,18 @@ const uint64_t segSize = vd.BytesPerFileRecordSegment;
                 LARGE_INTEGER li;
                 li.QuadPart = (LONGLONG)((uint64_t)run.lcn * cluster + within);
                 DWORD got = 0;
-                if (!SetFilePointerEx(hVol, li, nullptr, FILE_BEGIN) ||
-                    !ReadFile(hVol, buf.data(), want, &got, nullptr) || got == 0) break;
+                const uint64_t readT0 = prof ? MftNow() : 0;
+                const BOOL seekOk = SetFilePointerEx(hVol, li, nullptr, FILE_BEGIN);
+                const BOOL readOk =
+                    seekOk && ReadFile(hVol, buf.data(), want, &got, nullptr) && got != 0;
+                if (prof) {
+                    // One seek per physical run start + one ReadFile per 8 MiB chunk.
+                    // With got==want the sweep is sequential within a run; seeks
+                    // across runs count fragmentation, not random single-record I/O.
+                    MftAdd(profile.mftRead, MftNow() - readT0, readOk ? 1 : 0, readOk ? got : 0);
+                    if (seekOk) ++profile.mftSeeks;
+                }
+                if (!readOk) break;
                 const uint64_t baseRec = (runStartMft + within) / segSize;
                 const size_t nRecs = got / segSize;
                 for (size_t i = 0; i < nRecs; ++i) {
@@ -1240,7 +1359,9 @@ const uint64_t segSize = vd.BytesPerFileRecordSegment;
     // extension records (via base-record reference or $ATTRIBUTE_LIST). Reported
     // through BV_MFT_DEBUG_FILE; see the regression test.
     size_t diagExtI30Merged = 0;
+    const uint64_t passAT0 = prof ? MftNow() : 0;
     foreachRecord([&](uint64_t recIndex, uint8_t* rec, size_t n) {
+        if (prof) ++profile.passA.ops; // records examined (ParseRecord entries)
         RecInfo& r = recs[recIndex];
         if (!ApplyFixup(rec, n)) return;
         ParseRecord(rec, n, r);
@@ -1251,6 +1372,7 @@ const uint64_t segSize = vd.BytesPerFileRecordSegment;
         // rejects references to a reused record.
         MergePassAFromRecord(recs, recIndex, rec, diagExtI30Merged);
     });
+    if (prof) MftAdd(profile.passA, MftNow() - passAT0);
     if (cancelledNow()) {
         CloseHandle(hVol);
         return true; // aborted during the raw MFT sweep
@@ -1268,6 +1390,7 @@ const uint64_t segSize = vd.BytesPerFileRecordSegment;
     // the order-independent fallback when the list itself is unreadable).
     // Non-$I30 attributes (SI, FN, SD, $DATA, ...) are deliberately ignored:
     // they are either parsed inline already or irrelevant to tree reconstruction.
+    const uint64_t passBT0 = prof ? MftNow() : 0;
     for (uint64_t i = 0; i < nRecords; ++i) {
         if (cancelledNow()) {
             CloseHandle(hVol);
@@ -1280,10 +1403,19 @@ const uint64_t segSize = vd.BytesPerFileRecordSegment;
         std::vector<uint8_t> listData;
         if (!r.attrList.empty()) {
             listData = r.attrList;
-        } else if (!ReadNonResidentAttr(rawReader, cluster, r.attrListHdr, listData)) {
+        } else if (!ReadNonResidentAttr(rawReader, cluster, r.attrListHdr, listData, cancel)) {
             continue; // cannot follow: the $I30 checks in the walk stay honest
         }
         MergePassBFromList(recs, i, r, listData, diagExtI30Merged);
+        if (prof) ++profile.passB.ops;
+    }
+    if (prof) {
+        MftAdd(profile.passB, MftNow() - passBT0);
+        // Snapshot the rawReader totals right after Pass B: the delta up to the
+        // end of the walk is attributable to $INDEX_ALLOCATION index reads only.
+        profile.rawBytesAfterPassB = profile.raw.bytes;
+        profile.rawCallsAfterPassB = profile.raw.ops;
+        profile.rawTicksAfterPassB = profile.raw.ticks;
     }
 
     bool incomplete = false;
@@ -1328,6 +1460,7 @@ const uint64_t segSize = vd.BytesPerFileRecordSegment;
     // Each entry links a record whose win32 $FILE_NAME points to that parent.
     std::unordered_map<uint64_t, std::vector<uint32_t>> revChildren;
     revChildren.reserve(nRecords);
+    const uint64_t revT0 = prof ? MftNow() : 0;
     for (uint64_t i = 0; i < nRecords; ++i) {
         if (cancelledNow()) {
             CloseHandle(hVol);
@@ -1346,6 +1479,7 @@ const uint64_t segSize = vd.BytesPerFileRecordSegment;
             if (nm.ns != 0xFF) revChildren[nm.parent.rec].push_back((uint32_t)i);
         }
     }
+    if (prof) MftAdd(profile.reverseIndex, MftNow() - revT0);
 
     // ---- Top-down walk from the root ---------------------------------------
 
@@ -1378,6 +1512,7 @@ const uint64_t segSize = vd.BytesPerFileRecordSegment;
         const std::wstring dirRel = top.second;
 
         std::vector<std::pair<uint64_t, ChildEntry>> kids;
+        const uint64_t walkT0 = prof ? MftNow() : 0;
         const DirStepOutcome step = WalkDirectoryStep(
             recs, nRecords, revChildren, rawReader, cluster, bytesPerSector, normRoot,
             dirRec, dirRel, onEntry, onError, onProgress, cancel, files, dirs, bytes,
@@ -1398,6 +1533,7 @@ const uint64_t segSize = vd.BytesPerFileRecordSegment;
             continue;
         }
         if (step == DirStepOutcome::FallbackOk) continue;
+        if (prof) MftAdd(profile.walkStep, MftNow() - walkT0, 1);
 
         // Emit children in alphabetical order (depth-first), skipping the
         // volume metafile band ($MFT, $Boot, ...).
@@ -1430,9 +1566,13 @@ const uint64_t segSize = vd.BytesPerFileRecordSegment;
                 ++files;
                 bytes += e.size;
             }
+            const uint64_t emitT0 = prof ? MftNow() : 0;
             if (!onEntry(std::move(e))) {
                 CloseHandle(hVol);
                 return true; // consumer aborted
+            }
+            if (prof) {
+                MftAdd(profile.emit, MftNow() - emitT0, 1);
             }
 
             if (cRec.isDir && !cRec.isReparse) {
@@ -1459,6 +1599,71 @@ const uint64_t segSize = vd.BytesPerFileRecordSegment;
                          (unsigned long long)diagIndexChildren,
                          (unsigned long long)diagExtI30Merged,
                          (unsigned long long)diagWin32FallbackDirs);
+            std::fclose(f);
+        }
+    }
+    // TEMPORARY DIAGNOSTIC: dump the per-phase breakdown.
+    if (prof && !profPath.empty()) {
+        const uint64_t runTicks = MftNow() - runT0;
+        // passA.ticks covers the whole foreachRecord loop (reads + parse);
+        // isolate the pure parse CPU by removing the $MFT read time.
+        MftPhaseStat passACpu;
+        passACpu.ticks = profile.passA.ticks > profile.mftRead.ticks
+                             ? profile.passA.ticks - profile.mftRead.ticks
+                             : 0;
+        passACpu.ops = profile.passA.ops;
+        // rawReader delta after Pass B = $INDEX_ALLOCATION reads during the walk.
+        MftPhaseStat indexRead;
+        indexRead.ticks = profile.raw.ticks - profile.rawTicksAfterPassB;
+        indexRead.ops = profile.raw.ops - profile.rawCallsAfterPassB;
+        indexRead.bytes = profile.raw.bytes - profile.rawBytesAfterPassB;
+        // walkStep minus the index reads = index parse + child union + sort.
+        MftPhaseStat walkCpu;
+        walkCpu.ticks = profile.walkStep.ticks > indexRead.ticks
+                            ? profile.walkStep.ticks - indexRead.ticks
+                            : 0;
+        walkCpu.ops = profile.walkStep.ops;
+        // Residual: everything not attributed above.
+        MftPhaseStat other;
+        other.ticks = runTicks;
+        auto subtract = [&](const MftPhaseStat& p) {
+            other.ticks = other.ticks > p.ticks ? other.ticks - p.ticks : 0;
+        };
+        subtract(profile.openVolume);
+        subtract(profile.rec0);
+        subtract(profile.mftRead);
+        subtract(profile.passA);
+        subtract(profile.passB);
+        subtract(profile.reverseIndex);
+        subtract(profile.walkStep);
+        subtract(profile.emit);
+        profile.other = other;
+        profile.fallback.ops = diagWin32FallbackDirs;
+
+        if (FILE* f = _wfopen(profPath.c_str(), L"a")) {
+            std::fprintf(f,
+                         "=== MFT %lc rm=%d nRec=%llu mftBytes=%llu runs=%llu reads=%llu "
+                         "seeks=%llu rawByte=%llu runSecs %.3f ===\n",
+                         (wint_t)(normRoot.size() >= 2 ? normRoot[0] : L'?'), incomplete ? 0 : 1,
+                         (unsigned long long)profile.nRecords,
+                         (unsigned long long)profile.mftRead.bytes,
+                         (unsigned long long)profile.mftRuns,
+                         (unsigned long long)profile.mftRead.ops,
+                         (unsigned long long)profile.mftSeeks,
+                         (unsigned long long)profile.raw.bytes, MftSecs(runTicks));
+            profile.writeLine(f, "openVolume", profile.openVolume);
+            profile.writeLine(f, "rec0", profile.rec0);
+            profile.writeLine(f, "mftRead", profile.mftRead);
+            profile.writeLine(f, "passA_parse", passACpu);
+            profile.writeLine(f, "passB", profile.passB);
+            profile.writeLine(f, "reverseIdx", profile.reverseIndex);
+            profile.writeLine(f, "walkStep", profile.walkStep);
+            profile.writeLine(f, "indexRead", indexRead);
+            profile.writeLine(f, "walkCpu", walkCpu);
+            profile.writeLine(f, "emit_consumer", profile.emit);
+            profile.writeLine(f, "fallback", profile.fallback);
+            profile.writeLine(f, "other", profile.other);
+            std::fprintf(f, "---\n");
             std::fclose(f);
         }
     }

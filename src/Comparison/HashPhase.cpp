@@ -90,14 +90,20 @@ void HashOneCandidateInto(const ContentCandidate& c, bool offlineSource, FileInd
     } else {
         hashing::HashOneSide(pathutil::MakeAbsolute(sourceRoot, c.relativePath), c.sizeSource,
                              c.srcMtime, changed, srcStatus, srcDigest, true, cache, cacheHits,
-                             session, profiling::Side::Source);
+                             session, profiling::Side::Source, cancel);
         hasSrc = (srcStatus == hashing::HashStatus::Ok);
+        if (srcStatus == hashing::HashStatus::Cancelled ||
+            (cancel && cancel->load(std::memory_order_relaxed))) return; // no verdict (cancelled)
     }
     bool dstChanged = false;
+    // Don't start hashing the destination if cancellation landed on the source side.
+    if (cancel && cancel->load(std::memory_order_relaxed)) return;
     hashing::HashOneSide(pathutil::MakeAbsolute(destRoot, c.relativePath), c.sizeDest, c.dstMtime,
                          dstChanged, dstStatus, dstDigest, true, cache, cacheHits, session,
-                         profiling::Side::Dest);
+                         profiling::Side::Dest, cancel);
     hasDst = (dstStatus == hashing::HashStatus::Ok);
+    if (dstStatus == hashing::HashStatus::Cancelled ||
+        (cancel && cancel->load(std::memory_order_relaxed))) return; // no verdict (cancelled)
     changed = changed || dstChanged;
 
     if (changed) {

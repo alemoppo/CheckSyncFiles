@@ -21,7 +21,7 @@ constexpr DWORD kiChunk = 1024 * 1024; // 1 MiB streaming buffer
 // is shared with HashOneSide's unified single-handle flow.
 template <bool Profile>
 HashStatus Sha256FileImpl(const std::wstring& path, std::array<uint8_t, 32>& digest,
-                          profiling::FileTimings* timings) {
+                          profiling::FileTimings* timings, const std::atomic_bool* cancel) {
     const uint64_t t0 = profiling::QpcNow();
     const std::wstring win = pathutil::AddLongPathPrefix(path);
     HANDLE h = CreateFileW(win.c_str(), GENERIC_READ,
@@ -40,7 +40,7 @@ HashStatus Sha256FileImpl(const std::wstring& path, std::array<uint8_t, 32>& dig
                                                      : HashStatus::ReadError;
     }
 
-    const HashStatus result = Sha256FileFromHandle<Profile>(h, digest, timings);
+    const HashStatus result = Sha256FileFromHandle<Profile>(h, digest, timings, cancel);
     CloseHandle(h);
     if constexpr (Profile) {
         if (timings) timings->totalTicks = profiling::QpcNow() - t0;
@@ -60,7 +60,8 @@ HashStatus Sha256FileImpl(const std::wstring& path, std::array<uint8_t, 32>& dig
 // or behaviour.
 template <bool Profile>
 HashStatus Sha256FileFromHandle(HANDLE h, std::array<uint8_t, 32>& digest,
-                                profiling::FileTimings* timings) {
+                                profiling::FileTimings* timings,
+                                const std::atomic_bool* cancel) {
     const uint64_t t0 = profiling::QpcNow();
     const auto finalize = [&](uint64_t readT, uint64_t hashT, uint64_t bytes) {
         if constexpr (Profile) {
@@ -88,10 +89,19 @@ HashStatus Sha256FileFromHandle(HANDLE h, std::array<uint8_t, 32>& digest,
 
     std::vector<uint8_t> buf(kiChunk);
     bool complete = true;
+    bool cancelled = false;
     uint64_t readT = 0;
     uint64_t hashT = 0;
     uint64_t bytes = 0;
     for (;;) {
+        if (cancel && cancel->load(std::memory_order_relaxed)) {
+            // Cancel lands: stop streaming now. The whole file was NOT hashed, so
+            // this is neither Ok nor a read error -- the caller must treat it as
+            // "no verdict" (exactly like a job that never started under cancel).
+            cancelled = true;
+            complete = false;
+            break;
+        }
         uint64_t tr0 = 0;
         if constexpr (Profile) tr0 = profiling::QpcNow();
         DWORD read = 0;
@@ -116,9 +126,11 @@ HashStatus Sha256FileFromHandle(HANDLE h, std::array<uint8_t, 32>& digest,
     }
 
     HashStatus result;
-    if (complete &&
-        BCRYPT_SUCCESS(BCryptFinishHash(hash, digest.data(),
-                                        static_cast<ULONG>(digest.size()), 0))) {
+    if (cancelled) {
+        result = HashStatus::Cancelled;
+    } else if (complete &&
+               BCRYPT_SUCCESS(BCryptFinishHash(hash, digest.data(),
+                                               static_cast<ULONG>(digest.size()), 0))) {
         result = HashStatus::Ok;
     } else {
         result = HashStatus::ReadError;
@@ -134,17 +146,16 @@ HashStatus Sha256FileFromHandle(HANDLE h, std::array<uint8_t, 32>& digest,
 // variants linkable from HashUtil.cpp without putting the BCrypt/Windows types
 // in the public header.
 template HashStatus Sha256FileFromHandle<false>(HANDLE, std::array<uint8_t, 32>&,
-                                                profiling::FileTimings*);
+                                                profiling::FileTimings*,
+                                                const std::atomic_bool*);
 template HashStatus Sha256FileFromHandle<true>(HANDLE, std::array<uint8_t, 32>&,
-                                               profiling::FileTimings*);
-
-HashStatus Sha256File(const std::wstring& path, std::array<uint8_t, 32>& digest) {
-    return Sha256FileImpl<false>(path, digest, nullptr);
-}
+                                               profiling::FileTimings*,
+                                               const std::atomic_bool*);
 
 HashStatus Sha256File(const std::wstring& path, std::array<uint8_t, 32>& digest,
-                      profiling::FileTimings* timings) {
-    return Sha256FileImpl<true>(path, digest, timings);
+                      profiling::FileTimings* timings, const std::atomic_bool* cancel) {
+    return timings ? Sha256FileImpl<true>(path, digest, timings, cancel)
+                   : Sha256FileImpl<false>(path, digest, nullptr, cancel);
 }
 
 bool StatHandle(HANDLE h, uint64_t& size, uint64_t& lastWriteTime) {

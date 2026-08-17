@@ -550,6 +550,73 @@ TEST("sha256: known vector for 'abc'", [] {
     }
 });
 
+TEST("cancel: mid-file hash is aborted by the cancel flag (not a read error)", [] {
+    // A hashing pool job that is mid-flight inside Sha256File() when the user
+    // presses Interrompi must stop within ~1 MiB (the chunk granularity the cancel
+    // flag is polled at) and must NOT be reported as a read error or an Ok digest
+    // -- exactly the "no verdict for a cancelled job" rule the comparer enforces.
+    const auto dir = MakeTempDir();
+    const std::wstring path = dir + L"\\big.bin";
+    // 64 MiB: large enough that the 1 MiB read loop runs several iterations even
+    // on a fast SSD, so a cancel set ~5 ms in is observed mid-read.
+    const DWORD kSize = 64 * 1024 * 1024;
+    {
+        const std::wstring win = pathutil::AddLongPathPrefix(path);
+        HANDLE h = CreateFileW(win.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                               FILE_ATTRIBUTE_NORMAL, nullptr);
+        CHECK(h != INVALID_HANDLE_VALUE);
+        if (h != INVALID_HANDLE_VALUE) {
+            std::vector<uint8_t> buf(1024 * 1024, 0xAA); // 1 MiB pattern
+            for (DWORD off = 0; off + buf.size() <= kSize; off += buf.size()) {
+                DWORD w = 0;
+                WriteFile(h, buf.data(), static_cast<DWORD>(buf.size()), &w, nullptr);
+            }
+            CloseHandle(h);
+        }
+    }
+
+    const std::wstring cachePath = dir + L"\\hash_cache.bin";
+    std::wstring cacheErr;
+    hashing::HashCache cache(cachePath, cacheErr);
+    CHECK(cacheErr.empty());
+    std::atomic<size_t> hits{0};
+
+    // Flip cancel shortly after hashing starts. Because the read loop polls the
+    // flag per 1 MiB chunk, the job must abort (not finish) and report Cancelled.
+    std::atomic_bool cancel{false};
+    std::thread armer([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        cancel.store(true, std::memory_order_release);
+    });
+
+    std::array<uint8_t, 32> digest{};
+    hashing::HashStatus st = hashing::HashStatus::ReadError;
+    bool changed = false;
+    uint64_t sz = 0, mt = 0;
+    CHECK(hashing::StatFile(path, sz, mt));
+    hashing::HashOneSide(path, sz, mt, changed, st, digest, true, &cache, hits,
+                         nullptr, profiling::Side::Source, &cancel);
+    armer.join();
+
+    CHECK(st == hashing::HashStatus::Cancelled);
+    CHECK(!changed);
+    // No cache entry must have been written for the aborted file: a later lookup
+    // cannot return the (incomplete) digest.
+    std::array<uint8_t, 32> probe{};
+    CHECK(!cache.Lookup(path, sz, mt, probe));
+    CHECK(hits.load() == 0);
+});
+
+TEST("cancel: a clean pre-cancelled hash returns Cancelled immediately", [] {
+    const auto dir = MakeTempDir();
+    const std::wstring path = dir + L"\\small.bin";
+    CHECK(WriteFileBytes(path, "hello world", 11));
+    std::array<uint8_t, 32> digest{};
+    std::atomic_bool cancel{true};
+    const hashing::HashStatus st = hashing::Sha256File(path, digest, nullptr, &cancel);
+    CHECK(st == hashing::HashStatus::Cancelled);
+});
+
 TEST("empty directories are reported in both directions", [] {
     const auto dir = MakeTempDir();
     fs::create_directories(dir + L"\\src\\only_src");

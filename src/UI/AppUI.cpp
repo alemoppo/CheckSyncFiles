@@ -47,7 +47,7 @@ struct Layout {
     SDL_FRect sourceField, destField;
     SDL_FRect sourceBrowse, destBrowse;
 
-    SDL_FRect startBtn, stopBtn, snapBtn, exportBtn, caricaBtn;
+    SDL_FRect startBtn, snapBtn, exportBtn, caricaBtn;
 };
 
 Layout ComputeLayout(int W, int H) {
@@ -84,10 +84,9 @@ Layout ComputeLayout(int W, int H) {
                     static_cast<float>(kBrowseW), static_cast<float>(kFieldH)};
 
     L.startBtn = {static_cast<float>(kMargin), static_cast<float>(L.y5), 120.0f, 30.0f};
-    L.stopBtn = {static_cast<float>(kMargin + 130), static_cast<float>(L.y5), 120.0f, 30.0f};
-    L.snapBtn = {static_cast<float>(kMargin + 260), static_cast<float>(L.y5), 120.0f, 30.0f};
-    L.exportBtn = {static_cast<float>(kMargin + 390), static_cast<float>(L.y5), 120.0f, 30.0f};
-    L.caricaBtn = {static_cast<float>(kMargin + 520), static_cast<float>(L.y5), 150.0f, 30.0f};
+    L.snapBtn = {static_cast<float>(kMargin + 130), static_cast<float>(L.y5), 120.0f, 30.0f};
+    L.exportBtn = {static_cast<float>(kMargin + 260), static_cast<float>(L.y5), 120.0f, 30.0f};
+    L.caricaBtn = {static_cast<float>(kMargin + 390), static_cast<float>(L.y5), 150.0f, 30.0f};
     return L;
 }
 
@@ -105,6 +104,7 @@ constexpr RGBA kAccent{70, 120, 220, 255};
 constexpr RGBA kAccentHover{90, 140, 235, 255};
 constexpr RGBA kOk{110, 200, 120, 255};
 constexpr RGBA kBad{230, 90, 90, 255};
+constexpr RGBA kBadHover{250, 120, 120, 255};
 constexpr RGBA kWarn{240, 170, 60, 255};
 
 void FillRect(SDL_Renderer* ren, int x, int y, int w, int h, RGBA c) {
@@ -751,12 +751,12 @@ void AppUI::OnMouseDown(int mx, int my) {
         }
     }
 
-    if (hit(mx, my, L.startBtn) && !running) {
-        startScanFromUi();
+    if (hit(mx, my, L.startBtn) && running) {
+        orch_.stop();
         dirty_.store(true);
     }
-    if (hit(mx, my, L.stopBtn) && running) {
-        orch_.stop();
+    if (hit(mx, my, L.startBtn) && !running) {
+        startScanFromUi();
         dirty_.store(true);
     }
     if (hit(mx, my, L.snapBtn) && !running) {
@@ -1099,27 +1099,17 @@ void AppUI::render(const bv::ScanOrchestrator::UiSnapshot& st) {
                  kTextLo);
     }
 
-    // ---- Buttons AVVIA / INTERROMPI ----
-    const bool overStart = !running && hit(static_cast<int>(mx), static_cast<int>(my), L.startBtn);
-    const bool overStop = running && hit(static_cast<int>(mx), static_cast<int>(my), L.stopBtn);
+    // ---- Button AVVIA / INTERROMPI (single toggle) ----
+    const bool overStart = hit(static_cast<int>(mx), static_cast<int>(my), L.startBtn);
+    const RGBA startFill = running ? (overStart ? kBadHover : kBad)
+                                   : (overStart ? kAccentHover : kAccent);
     FillRect(renderer_, static_cast<int>(L.startBtn.x), static_cast<int>(L.startBtn.y),
-             static_cast<int>(L.startBtn.w), static_cast<int>(L.startBtn.h),
-             overStart ? kAccentHover : kAccent);
+             static_cast<int>(L.startBtn.w), static_cast<int>(L.startBtn.h), startFill);
     DrawRect(renderer_, static_cast<int>(L.startBtn.x), static_cast<int>(L.startBtn.y),
              static_cast<int>(L.startBtn.w), static_cast<int>(L.startBtn.h), kBorder);
-    DrawTextCenterIn(renderer_, fontBold_, running ? "In corso..." : "AVVIA",
+    DrawTextCenterIn(renderer_, fontBold_, running ? "INTERROMPI" : "AVVIA",
                      static_cast<int>(L.startBtn.x), static_cast<int>(L.startBtn.y),
                      static_cast<int>(L.startBtn.w), static_cast<int>(L.startBtn.h), kTextHi);
-    FillRect(renderer_, static_cast<int>(L.stopBtn.x), static_cast<int>(L.stopBtn.y),
-             static_cast<int>(L.stopBtn.w), static_cast<int>(L.stopBtn.h),
-             overStop ? kAccentHover : kPanel);
-    DrawRect(renderer_, static_cast<int>(L.stopBtn.x), static_cast<int>(L.stopBtn.y),
-             static_cast<int>(L.stopBtn.w), static_cast<int>(L.stopBtn.h), kBorder);
-    DrawTextCenterIn(renderer_, fontBold_, "INTERROMPI",
-                     static_cast<int>(L.stopBtn.x), static_cast<int>(L.stopBtn.y),
-                     static_cast<int>(L.stopBtn.w), static_cast<int>(L.stopBtn.h), kTextHi);
-
-    // ---- Buttons SNAPSHOT / ESPORTA ----
     const bool overSnap = !running && hit(static_cast<int>(mx), static_cast<int>(my), L.snapBtn);
     const bool overExport =
         !running && hit(static_cast<int>(mx), static_cast<int>(my), L.exportBtn);
