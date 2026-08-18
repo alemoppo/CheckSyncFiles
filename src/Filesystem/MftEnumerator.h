@@ -78,6 +78,36 @@ public:
         int64_t low, int64_t high);
     static MftParseResult ParseRecordForTest(const std::vector<uint8_t>& recordBytes);
 
+    // One $FILE_NAME as carried by a record AFTER the Pass A + Pass B merge.
+    struct MergedNameInfo {
+        uint64_t parentRec = 0;
+        uint16_t parentSeq = 0;
+        uint8_t ns = 0;
+        std::wstring name;
+    };
+
+    // Outcome of MergeRecordForTest: what a record carries after the same
+    // Pass A + Pass B reconstruction a scan performs (see ResolveDirectoryForTest
+    // for the chain). Exposes the merged $FILE_NAME list and $STANDARD_INFORMATION
+    // timestamp so the order-independent recovery of those attributes (and the
+    // Pass A + Pass B dedup) can be asserted deterministically in-memory.
+    struct MergedRecordInfo {
+        bool parsed = false;
+        bool inUse = false;
+        uint64_t mtime = 0;         // best-known $FILE_NAME mtime (last wins)
+        uint64_t standardMtime = 0; // $STANDARD_INFORMATION modified time
+        std::vector<MergedNameInfo> names;
+    };
+
+    // Test-only seam that runs the SAME Pass A + Pass B merge chain a scan uses
+    // over `records` (ascending record number, $ATTRIBUTE_LIST follow) and
+    // returns what record `recNo` carries afterwards. This is the observable
+    // guarantee of the Pass B extension: even when an extension record has a
+    // LOWER record number than its base -- so Pass A's streaming merge cannot
+    // fire -- Pass B still recovers the relocated $FILE_NAME / $STANDARD_INFORMATION.
+    static MergedRecordInfo MergeRecordForTest(
+        const std::map<uint64_t, std::vector<uint8_t>>& records, uint64_t recNo);
+
     // Test-only seam that reconstructs a directory's children from raw on-disk
     // MFT record bytes, running the SAME production chain a real scan uses:
     // multi-sector fixup + ParseRecord -> Pass A base-record-reference merge ->

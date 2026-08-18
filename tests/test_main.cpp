@@ -2014,6 +2014,105 @@ ExternalIaFixture BuildExternalIaFixture() {
     return fx;
 }
 
+// ---- Pass B $FILE_NAME / $STANDARD_INFORMATION extension fixtures ----------
+
+// $STANDARD_INFORMATION modified time relocated into the extension record of the
+// inverted-order fixture (distinct from the $FILE_NAME mtime, so the test can
+// prove the SI value, not the FN value, reaches the base).
+const uint64_t kInvertedSiModified = 0x1122334455667788ull;
+
+// Fixture for the inverted-order Pass B regression: the BASE record has a HIGHER
+// record number than its EXTENSION, so Pass A's ascending streaming merge (the
+// base must already be parsed when its extension is seen) cannot fire. Only
+// Pass B's $ATTRIBUTE_LIST follow can recover the relocated attributes.
+//
+//   dir  5000 (dir, seq 1): $I30 keys the base 5002 as "index_key_name"
+//   ext  5001 (seq 1, base-ref 5002): $FILE_NAME(parent 5000, "real_name.bin",
+//                                   ns 1, distinct mtime) + $STANDARD_INFORMATION
+//   base 5002 (file, seq 1): $DATA 128 resident, NO inline $FILE_NAME / SI,
+//                            $ATTRIBUTE_LIST: 0x30+0x10 -> ext 5001
+//
+// The index key "index_key_name" deliberately differs from the $FILE_NAME
+// ("real_name.bin") so the name the directory resolves is observable: only a
+// successful Pass B merge makes ChildNameOf prefer the record's own WIN32
+// $FILE_NAME over the index key.
+std::map<uint64_t, std::vector<uint8_t>> BuildInvertedOrderFixture() {
+    const uint64_t dir = 5000;
+    const uint64_t ext = 5001;
+    const uint64_t base = 5002;
+    const uint64_t baseRef = base | (1ull << 48);
+    std::map<uint64_t, std::vector<uint8_t>> records;
+
+    auto d = BuildFileRecord(dir, 1, 0x0003, 0); // in use + directory
+    AppendResidentAttr(d, 0x30, L"", BuildFileNameValue(4999, 1, L"dir5000", 1));
+    AppendResidentAttr(d, 0x90, L"$I30",
+                       BuildIndexRootValueWith({{baseRef, L"index_key_name"}}));
+    FinishRecord(d);
+    records[dir] = std::move(d);
+
+    auto e = BuildFileRecord(ext, 1, 0x0001, baseRef); // extension of 5002
+    AppendResidentAttr(e, 0x30, L"",
+                       BuildFileNameValueWithMtime(dir, 1, L"real_name.bin", 1, 0xABCDEF));
+    AppendResidentAttr(e, 0x10, L"",
+                       BuildStandardInfoValue(0x1111, kInvertedSiModified, 0x2222, 0x3333));
+    FinishRecord(e);
+    records[ext] = std::move(e);
+
+    auto b = BuildFileRecord(base, 1, 0x0001, 0); // in use + file
+    AppendResidentAttr(b, 0x80, L"", std::vector<uint8_t>(128, 0xAB));
+    std::vector<uint8_t> list;
+    PushAttrListEntry(list, 0x30, L"", ext, 1, 0); // $FILE_NAME -> extension 5001
+    PushAttrListEntry(list, 0x10, L"", ext, 1, 0); // $STANDARD_INFORMATION -> 5001
+    PushAttrListEntry(list, 0x80, L"", base, 1, 0); // $DATA -> itself (skipped)
+    list.push_back(0);
+    AppendResidentAttr(b, 0x20, L"", list);
+    FinishRecord(b);
+    records[base] = std::move(b);
+    return records;
+}
+
+// Fixture where BOTH merge passes reach the same extension record: base 5002
+// (LOWER number, parsed first) initially carries NO $FILE_NAME, so when the
+// extension 5003 (HIGHER number) is parsed Pass A DOES append "name.bin" to it
+// (the base is already parsed). The base's $ATTRIBUTE_LIST then points Pass B
+// at the same extension, so Pass B re-encounters the SAME name already present
+// and must reject it. After Pass A + Pass B the base holds exactly ONE copy --
+// only a name that Pass A added and Pass B re-sees can prove both passes ran.
+//
+//   dir  5000 (dir): $I30 -> base 5002 "name.bin"
+//   base 5002 (file): NO inline $FILE_NAME; $DATA 128 resident
+//                     + $ATTRIBUTE_LIST: 0x30 -> ext 5003
+//   ext  5003 (base-ref 5002): $FILE_NAME(parent 5000, "name.bin", ns 1)
+std::map<uint64_t, std::vector<uint8_t>> BuildPassAThenBFixture() {
+    const uint64_t dir = 5000;
+    const uint64_t base = 5002;
+    const uint64_t ext = 5003;
+    const uint64_t baseRef = base | (1ull << 48);
+    std::map<uint64_t, std::vector<uint8_t>> records;
+
+    auto d = BuildFileRecord(dir, 1, 0x0003, 0); // in use + directory
+    AppendResidentAttr(d, 0x30, L"", BuildFileNameValue(4999, 1, L"dir5000", 1));
+    AppendResidentAttr(d, 0x90, L"$I30", BuildIndexRootValueWith({{baseRef, L"name.bin"}}));
+    FinishRecord(d);
+    records[dir] = std::move(d);
+
+    auto e = BuildFileRecord(ext, 1, 0x0001, baseRef); // extension of 5002
+    AppendResidentAttr(e, 0x30, L"", BuildFileNameValue(dir, 1, L"name.bin", 1));
+    FinishRecord(e);
+    records[ext] = std::move(e);
+
+    auto b = BuildFileRecord(base, 1, 0x0001, 0); // in use + file, NO $FILE_NAME yet
+    AppendResidentAttr(b, 0x80, L"", std::vector<uint8_t>(128, 0xAB));
+    std::vector<uint8_t> list;
+    PushAttrListEntry(list, 0x30, L"", ext, 1, 0); // $FILE_NAME -> extension 5003
+    PushAttrListEntry(list, 0x80, L"", base, 1, 0); // $DATA -> itself (skipped)
+    list.push_back(0);
+    AppendResidentAttr(b, 0x20, L"", list);
+    FinishRecord(b);
+    records[base] = std::move(b);
+    return records;
+}
+
 } // namespace
 
 TEST("mft: external $I30 via $ATTRIBUTE_LIST resolves children (in-memory fixture)", [] {
@@ -2708,6 +2807,152 @@ TEST("mft: cancellation propagates through WalkDirectoryStep -> caller (clean st
         // Stop on the first emitted entry (the one that returned false).
         CHECK_EQ(emitted2, 1u);
         CHECK_EQ(seen2.size(), 1u);
+    }
+});
+
+TEST("mft: Pass B recovers $FILE_NAME from an extension BELOW its base (inverted order)", [] {
+    // Regression for the Pass B extension: NTFS is not guaranteed to number an
+    // extension record HIGHER than its base. When the extension is BELOW (5001
+    // vs base 5002), Pass A's streaming merge -- which requires the base to be
+    // already parsed -- cannot fire, and only Pass B's $ATTRIBUTE_LIST follow can
+    // put the relocated $FILE_NAME back on the base. Observable: the directory
+    // keys the base as "index_key_name", but the record's OWN WIN32 $FILE_NAME
+    // ("real_name.bin") must win (ChildNameOf prefers the record's $FILE_NAME
+    // over the index key) -- reachable only if Pass B merged the extension's name.
+    const auto records = BuildInvertedOrderFixture();
+    std::vector<std::pair<std::wstring, uint64_t>> entries;
+    bool incomplete = false;
+    const bool resolved =
+        MftEnumerator::ResolveDirectoryForTest(records, 5000, entries, incomplete);
+    CHECK(resolved);
+    CHECK(!incomplete);
+    if (!resolved || incomplete) return; // nothing meaningful to assert past here
+    CHECK_EQ(entries.size(), 1u);
+    if (entries.size() != 1) return;
+    CHECK(entries[0].first == L"real_name.bin");
+    CHECK_EQ(entries[0].second, 5002u); // the BASE record, never the extension
+});
+
+TEST("mft: Pass B recovers $STANDARD_INFORMATION from an extension BELOW its base", [] {
+    // Same inverted-order fixture: Pass A cannot propagate the extension's
+    // $STANDARD_INFORMATION either (the base 5002 is not parsed yet when the
+    // extension 5001 is seen). Pass B must apply the exact Pass A rule (only
+    // when the base has none) so the base's standardMtime -- what
+    // FileEntry.lastWriteTime prefers -- is the SI value, not 0. Exposed through
+    // the post-merge seam, since no directory-resolution seam returns timestamps.
+    const auto records = BuildInvertedOrderFixture();
+    const auto m = MftEnumerator::MergeRecordForTest(records, 5002);
+    CHECK(m.parsed && m.inUse);
+    CHECK_EQ(m.standardMtime, kInvertedSiModified);
+    // The $FILE_NAME was recovered on the same pass, and the two timestamps
+    // stay distinct (the SI value, not the FN mtime, is what must reach the base).
+    CHECK_EQ(m.names.size(), 1u);
+    if (m.names.size() == 1) {
+        CHECK_EQ(m.names[0].parentRec, 5000u);
+        CHECK_EQ(m.names[0].parentSeq, 1u);
+        CHECK_EQ(m.names[0].ns, 1u);
+        CHECK(m.names[0].name == L"real_name.bin");
+    }
+    CHECK(m.standardMtime != m.mtime);
+});
+
+TEST("mft: Pass A + Pass B seeing the same extension leaves one $FILE_NAME copy (dedup)", [] {
+    // Pass B now follows $FILE_NAME entries too, so it may re-encounter an
+    // extension that Pass A already merged. The fixture makes the sequence
+    // explicit: the base 5002 is initially NAMELESS, so Pass A (extension 5003
+    // parsed after it) is the one that APPENDS "name.bin"; Pass B then follows
+    // the base's $ATTRIBUTE_LIST to the SAME extension and must reject the now
+    // already-present name via the field-for-field dedup (parent.rec,
+    // parent.seq, namespace, name -- the exact Pass A comparison). The base
+    // ends up with exactly ONE copy; a broken dedup on either pass would make
+    // it two.
+    const auto records = BuildPassAThenBFixture();
+    const auto m = MftEnumerator::MergeRecordForTest(records, 5002);
+    CHECK(m.parsed && m.inUse);
+    CHECK_EQ(m.names.size(), 1u);
+    if (m.names.size() == 1) {
+        CHECK(m.names[0].name == L"name.bin");
+        CHECK_EQ(m.names[0].parentRec, 5000u);
+        CHECK_EQ(m.names[0].parentSeq, 1u);
+        CHECK_EQ(m.names[0].ns, 1u);
+    }
+    // The directory still resolves the base as exactly one child.
+    std::vector<std::pair<std::wstring, uint64_t>> entries;
+    bool incomplete = false;
+    CHECK(MftEnumerator::ResolveDirectoryForTest(records, 5000, entries, incomplete));
+    CHECK(!incomplete);
+    CHECK_EQ(entries.size(), 1u);
+    if (entries.size() == 1) {
+        CHECK(entries[0].first == L"name.bin");
+        CHECK_EQ(entries[0].second, 5002u);
+    }
+});
+
+TEST("mft: cancelled scan does not start the Win32 fallback", [] {
+    // Fix 2: ReadIndexAllocationStream (or the $I30 child resolution) may fail
+    // because the user CANCELLED the scan, not because the volume is broken.
+    // Starting the per-directory Win32 fallback then would be pointless. With
+    // cancel already set, the walk must NOT invoke EnumerateWin32Subtree: the
+    // direct observable is `outDiagFallbackDirs` -- incremented immediately
+    // BEFORE the call -- staying 0, plus zero Win32-sourced entries and no
+    // incomplete flag, while the identical fixture WITHOUT cancel still runs the
+    // fallback exactly once and emits the real subtree.
+    const std::wstring dir = MakeTempDir();
+    CHECK(WriteFileBytes(dir + L"\\a.txt", "a", 1));
+    CHECK(WriteFileBytes(dir + L"\\b.bin", "bb", 2));
+
+    // Directory 4609 lists child 4610 (out of range -> nRecords=4610), so the
+    // MFT cannot reconstruct it and needWin32Fallback becomes true.
+    const auto fixture = []() {
+        std::map<uint64_t, std::vector<uint8_t>> records;
+        auto d = BuildFileRecord(4609, 1, 0x0003, 0); // in-use + directory
+        AppendResidentAttr(d, 0x30, L"", BuildFileNameValue(4608, 1, L"dir4609", 1));
+        AppendResidentAttr(d, 0x90, L"$I30",
+                           BuildIndexRootValueWith({{4610ull | (1ull << 48), L"MISSING"}}));
+        FinishRecord(d);
+        records[4609] = std::move(d);
+        return records;
+    };
+
+    // Cancelled BEFORE the walk step: the fallback must not even start.
+    {
+        std::atomic_bool cancel{true};
+        std::vector<std::pair<std::wstring, uint64_t>> mftEntries;
+        std::vector<FileEntry> fbEntries;
+        size_t fallbackDirs = 999;
+        bool incomplete = false;
+        const auto out = MftEnumerator::WalkDirectoryStepForTest(
+            fixture(), 4609, L"", dir, mftEntries,
+            [&](FileEntry&& e) { fbEntries.push_back(std::move(e)); return true; },
+            [](const ScanError&) {}, [](uint64_t, uint64_t, uint64_t, const std::wstring&) {},
+            &cancel, &fallbackDirs, 4096, 512, &incomplete);
+        // Clean stop -- the caller's cancelledNow() check ends the walk right
+        // after this step -- never a failure (the cancellation convention).
+        CHECK(out == MftEnumerator::DirWalkOutcome::FallbackOk);
+        // The fallback was NOT entered: the counter incremented immediately
+        // before EnumerateWin32Subtree stayed 0, and no Win32 entry was emitted.
+        CHECK_EQ(fallbackDirs, 0u);
+        CHECK(fbEntries.empty());
+        CHECK(mftEntries.empty());
+        CHECK(!incomplete);
+    }
+
+    // Control: identical fixture, cancel == false -> the fallback runs exactly
+    // once and emits the real subtree (the normal behaviour must be unchanged).
+    {
+        std::atomic_bool cancel{false};
+        std::vector<std::pair<std::wstring, uint64_t>> mftEntries;
+        std::vector<FileEntry> fbEntries;
+        size_t fallbackDirs = 0;
+        const auto out = MftEnumerator::WalkDirectoryStepForTest(
+            fixture(), 4609, L"", dir, mftEntries,
+            [&](FileEntry&& e) { fbEntries.push_back(std::move(e)); return true; },
+            [](const ScanError&) {}, [](uint64_t, uint64_t, uint64_t, const std::wstring&) {},
+            &cancel, &fallbackDirs);
+        CHECK(out == MftEnumerator::DirWalkOutcome::FallbackOk);
+        CHECK_EQ(fallbackDirs, 1u);
+        CHECK_EQ(fbEntries.size(), 2u); // a.txt + b.bin
+        CHECK(mftEntries.empty());
     }
 });
 

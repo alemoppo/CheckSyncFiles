@@ -901,31 +901,91 @@ void MergePassAFromRecord(std::vector<RecInfo>& recs, uint64_t recIndex,
 }
 
 // Pass B merge for one record: parse its $ATTRIBUTE_LIST value (`listData`)
-// and merge the $I30 pieces it points to into `r`. Non-$I30 attributes (SI,
-// FN, SD, $DATA, ...) are deliberately ignored. Shared verbatim between
-// enumerate() and the in-memory test seam.
+// and merge the attributes it points to into `r` (the base record).
+//
+// Pass B runs AFTER every record has been parsed, so it is intrinsically
+// order-independent: it does not rely on the base record having a lower
+// record number than the extension (the assumption Pass A makes). This makes
+// it the safety net for the case where Pass A's streaming merge could not
+// fire because the extension record was encountered before the (higher-numbered)
+// base record.
+//
+// Handled attribute types:
+//   * $I30  -- $INDEX_ROOT / $INDEX_ALLOCATION (as before).
+//   * $FILE_NAME -- annexed into the base with the SAME dedup as Pass A
+//     (parent.rec, parent.seq, namespace, name).
+//   * $STANDARD_INFORMATION -- standardMtime propagated with the SAME
+//     rule as Pass A (only when the base has none yet).
+//
+// Pass A + Pass B dedup: when Pass A already merged a name from an extension,
+// Pass B re-encounters the same extension via the $ATTRIBUTE_LIST and the
+// field-for-field dedup rejects the duplicate. For standardMtime, Pass A's
+// propagation sets the base value so Pass B's `== 0` guard is false and the
+// extension's value is not re-applied. Either way, no duplicate can result.
+// Shared verbatim between enumerate() and the in-memory test seam.
 void MergePassBFromList(std::vector<RecInfo>& recs, uint64_t recIndex, RecInfo& r,
-                        const std::vector<uint8_t>& listData, size_t& diag) {
+                         const std::vector<uint8_t>& listData, size_t& diag) {
     std::vector<MftAttrListEntry> entries;
     ParseAttrListData(listData.data(), listData.size(), entries);
     for (const auto& e : entries) {
+        // Validate the referenced extension record exactly as the $I30 branch
+        // did: must point to a *different*, parsed, in-use record whose live
+        // sequence matches the list entry. A stale reference (record reused)
+        // is never trusted.
+        if (e.record == recIndex || e.record >= recs.size() ||
+            !recs[e.record].parsed || !recs[e.record].inUse ||
+            recs[e.record].seq != e.sequence) {
+            continue;
+        }
+        const RecInfo& src = recs[e.record];
         const bool isI30 = e.name.empty() || e.name == L"$I30";
-        if ((e.type == kAttrIndexRoot || e.type == kAttrIndexAlloc) && isI30 &&
-            e.record != recIndex && e.record < recs.size() && recs[e.record].parsed &&
-            recs[e.record].inUse && recs[e.record].seq == e.sequence) {
-            const RecInfo& src = recs[e.record];
+        if ((e.type == kAttrIndexRoot || e.type == kAttrIndexAlloc) && isI30) {
             if (e.type == kAttrIndexRoot) {
                 if (r.idxRoot.empty() && !src.idxRoot.empty()) {
                     r.idxRoot = src.idxRoot;
                     r.idxBlockSize = src.idxBlockSize;
                     ++diag;
                 }
-            } else if (!src.idxAllocHdrs.empty()) {
+            } else {
                 for (const auto& h : src.idxAllocHdrs) {
                     if (VcnRangeKnown(r.idxAllocHdrs, h)) continue;
                     r.idxAllocHdrs.push_back(h);
                     ++diag;
                 }
+            }
+        } else if (e.type == kAttrFileName) {
+            // $FILE_NAME: annex every name the extension carries, using the
+            // exact same dedup as MergePassAFromRecord (parent.rec,
+            // parent.seq, namespace, name). A name already present from Pass A
+            // is rejected field-for-field -- no duplicate can survive.
+            for (const auto& nm : src.names) {
+                bool dup = false;
+                for (const auto& bn : r.names) {
+                    if (bn.parent.rec == nm.parent.rec && bn.parent.seq == nm.parent.seq &&
+                        bn.ns == nm.ns && bn.name == nm.name) {
+                        dup = true;
+                        break;
+                    }
+                }
+                if (!dup) {
+                    r.names.push_back(nm);
+                    ++diag;
+                    if (r.mtime == 0) r.mtime = nm.mtime;
+                }
+            }
+            // The same extension record that carries $FILE_NAME may also carry
+            // $STANDARD_INFORMATION; propagate it with the Pass A rule. When
+            // the list separates SI and FN into different extensions, the
+            // $STANDARD_INFORMATION entry below handles SI propagation on its
+            // own.
+            if (r.standardMtime == 0 && src.standardMtime != 0) {
+                r.standardMtime = src.standardMtime;
+            }
+        } else if (e.type == kAttrStdInfo) {
+            // $STANDARD_INFORMATION: propagate exactly as Pass A does -- only
+            // when the base has none yet (r.standardMtime == 0).
+            if (r.standardMtime == 0 && src.standardMtime != 0) {
+                r.standardMtime = src.standardMtime;
             }
         }
     }
@@ -1140,6 +1200,14 @@ DirStepOutcome WalkDirectoryStep(
     }
 
     if (needWin32Fallback) {
+        // If the scan was cancelled -- typically because ReadIndexAllocationStream
+        // returned false on the cancel path -- do NOT start a Win32 fallback.
+        // The caller's cancelledNow() check at the top of the walk loop will stop
+        // the walk cleanly. Returning FallbackOk mirrors the behaviour when
+        // cancellation is observed *during* an already-running fallback.
+        if (cancel && cancel->load(std::memory_order_relaxed)) {
+            return DirStepOutcome::FallbackOk;
+        }
         // Per-directory Win32 fallback: enumerate ONLY this directory's
         // subtree via FindFirstFileW and feed it into the same tree/flow the
         // MFT walk uses. The rest of the scan stays MFT-backed, and this
@@ -1358,7 +1426,7 @@ const uint64_t segSize = vd.BytesPerFileRecordSegment;
     // Opt-in ground-truth counter: directories whose $I30 was reassembled from
     // extension records (via base-record reference or $ATTRIBUTE_LIST). Reported
     // through BV_MFT_DEBUG_FILE; see the regression test.
-    size_t diagExtI30Merged = 0;
+    size_t diagExtAttrsMerged = 0;
     const uint64_t passAT0 = prof ? MftNow() : 0;
     foreachRecord([&](uint64_t recIndex, uint8_t* rec, size_t n) {
         if (prof) ++profile.passA.ops; // records examined (ParseRecord entries)
@@ -1370,7 +1438,7 @@ const uint64_t segSize = vd.BytesPerFileRecordSegment;
         // (shared with the in-memory test seam): the base record always has a
         // lower record number, so it was already parsed, and the sequence check
         // rejects references to a reused record.
-        MergePassAFromRecord(recs, recIndex, rec, diagExtI30Merged);
+        MergePassAFromRecord(recs, recIndex, rec, diagExtAttrsMerged);
     });
     if (prof) MftAdd(profile.passA, MftNow() - passAT0);
     if (cancelledNow()) {
@@ -1388,8 +1456,10 @@ const uint64_t segSize = vd.BytesPerFileRecordSegment;
     // $I30 index" on a perfectly valid volume. Reassemble the $I30 pieces into
     // the base record's RecInfo here (the Pass A base-record-reference merge is
     // the order-independent fallback when the list itself is unreadable).
-    // Non-$I30 attributes (SI, FN, SD, $DATA, ...) are deliberately ignored:
-    // they are either parsed inline already or irrelevant to tree reconstruction.
+    // Pass B also recovers $FILE_NAME and $STANDARD_INFORMATION from extension
+    // records when Pass A's streaming merge could not fire (extension record
+    // number < base record number). This makes Pass B a true order-independent
+    // safety net for all merged attributes, not just $I30.
     const uint64_t passBT0 = prof ? MftNow() : 0;
     for (uint64_t i = 0; i < nRecords; ++i) {
         if (cancelledNow()) {
@@ -1406,7 +1476,7 @@ const uint64_t segSize = vd.BytesPerFileRecordSegment;
         } else if (!ReadNonResidentAttr(rawReader, cluster, r.attrListHdr, listData, cancel)) {
             continue; // cannot follow: the $I30 checks in the walk stay honest
         }
-        MergePassBFromList(recs, i, r, listData, diagExtI30Merged);
+        MergePassBFromList(recs, i, r, listData, diagExtAttrsMerged);
         if (prof) ++profile.passB.ops;
     }
     if (prof) {
@@ -1594,10 +1664,10 @@ const uint64_t segSize = vd.BytesPerFileRecordSegment;
     // silent when the variable is not set.
     if (const std::wstring diagPath = MftDiagFilePath(); !diagPath.empty()) {
         if (FILE* f = _wfopen(diagPath.c_str(), L"a")) {
-            std::fprintf(f, "indxBlocks=%llu indxChildren=%llu extI30=%llu fbDirs=%llu\n",
+            std::fprintf(f, "indxBlocks=%llu indxChildren=%llu extAttrs=%llu fbDirs=%llu\n",
                          (unsigned long long)diagIndexBlocks,
                          (unsigned long long)diagIndexChildren,
-                         (unsigned long long)diagExtI30Merged,
+                         (unsigned long long)diagExtAttrsMerged,
                          (unsigned long long)diagWin32FallbackDirs);
             std::fclose(f);
         }
@@ -1700,6 +1770,51 @@ MftEnumerator::MftParseResult MftEnumerator::ParseRecordForTest(
     r.standardMtime = info.standardMtime;
     r.lastWriteTime = info.standardMtime ? info.standardMtime : info.mtime;
     return r;
+}
+
+MftEnumerator::MergedRecordInfo MftEnumerator::MergeRecordForTest(
+    const std::map<uint64_t, std::vector<uint8_t>>& records, uint64_t recNo) {
+    MergedRecordInfo result;
+    if (records.empty()) return result;
+    const uint64_t nRecords = records.rbegin()->first + 1;
+    if (recNo >= nRecords) return result;
+    std::vector<RecInfo> recs((size_t)nRecords);
+    size_t diag = 0; // merge counter (not reported by this seam)
+
+    // Same reconstruction a scan performs (and ResolveDirectoryForTest /
+    // WalkDirectoryStepForTest mirror): records processed in ascending record
+    // number. An extension BELOW its base is therefore seen before the base is
+    // parsed, and Pass A cannot merge it -- exactly the inverted-order case
+    // Pass B must recover.
+    for (const auto& [r, bytes] : records) {
+        if (r >= nRecords) continue;
+        std::vector<uint8_t> work = bytes;
+        if (!ApplyFixup(work.data(), work.size())) continue;
+        ParseRecord(work.data(), work.size(), recs[r]);
+        MergePassAFromRecord(recs, r, work.data(), diag);
+    }
+    // Pass B: follow every record's resident $ATTRIBUTE_LIST (order-independent).
+    for (uint64_t i = 0; i < nRecords; ++i) {
+        RecInfo& r = recs[i];
+        if (!r.parsed || !r.inUse || r.attrList.empty()) continue;
+        MergePassBFromList(recs, i, r, r.attrList, diag);
+    }
+
+    const RecInfo& m = recs[recNo];
+    result.parsed = m.parsed;
+    result.inUse = m.inUse;
+    result.mtime = m.mtime;
+    result.standardMtime = m.standardMtime;
+    result.names.reserve(m.names.size());
+    for (const auto& n : m.names) {
+        MergedNameInfo mn;
+        mn.parentRec = n.parent.rec;
+        mn.parentSeq = n.parent.seq;
+        mn.ns = n.ns;
+        mn.name = n.name;
+        result.names.push_back(std::move(mn));
+    }
+    return result;
 }
 
 bool MftEnumerator::ResolveDirectoryForTest(
