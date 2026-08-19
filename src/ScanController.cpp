@@ -328,7 +328,9 @@ ScanReport ScanController::run(const ScanOptions& options) {
                 if (hashProf) {
                     const ThreadPool::ThreadPoolMetrics m = sourcePool.metrics();
                     hashProf->MergePool(m.maxOutstanding, m.maxQueueDepth, m.backpressureWaits,
-                                        m.backpressureWaitTicks, m.waitAllCount, m.waitAllTicks);
+                                        m.backpressureWaitTicks, m.waitAllCount, m.waitAllTicks,
+                                        m.busyTicks, m.maxActiveWorkers, m.poolWallTicks,
+                                        m.submittedTasks, m.completedTasks);
                 }
             }
 
@@ -416,7 +418,9 @@ ScanReport ScanController::run(const ScanOptions& options) {
         if (hashProf) {
             const ThreadPool::ThreadPoolMetrics m = hashPool.metrics();
             hashProf->MergePool(m.maxOutstanding, m.maxQueueDepth, m.backpressureWaits,
-                                m.backpressureWaitTicks, m.waitAllCount, m.waitAllTicks);
+                                m.backpressureWaitTicks, m.waitAllCount, m.waitAllTicks,
+                                m.busyTicks, m.maxActiveWorkers, m.poolWallTicks,
+                                m.submittedTasks, m.completedTasks);
         }
 
         if (cache) {

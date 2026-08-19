@@ -1,10 +1,105 @@
 #include "ScanOrchestrator.h"
 
+#include <cstdio>
 #include <utility>
+
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
 
 #include "Export/CsvExporter.h"
 
 namespace bv {
+
+namespace {
+
+// Whether the profiling .bat is in use: the GUI enables its content-hash
+// profiler (and writes the hash/emit report) only when BV_MFT_PROFILE is set --
+// i.e. when launched through profilo_mft_on.bat. A normal GUI launch keeps the
+// profiler off, adding no overhead.
+bool ProfileEnvEnabled() {
+    WCHAR buf[1024];
+    return GetEnvironmentVariableW(L"BV_MFT_PROFILE", buf, 1024) > 0;
+}
+
+// Where the GUI hash/emit report is appended: same base as the per-drive MFT
+// report, suffixed with ".hash.txt" (e.g. bin\mft_profile.hash.txt). Empty when
+// the env var is not set.
+std::wstring ProfileHashReportPath() {
+    WCHAR buf[1024];
+    const DWORD n = GetEnvironmentVariableW(L"BV_MFT_PROFILE", buf, 1024);
+    if (n == 0 || n >= 1024) return std::wstring();
+    return std::wstring(buf) + L".hash.txt";
+}
+
+// Compact hash/emit report with the metrics needed to test the hypothesis: pool
+// backpressure/waitAll (already aggregated) and, per side, emit_consumer broken
+// into backpressure-wait and non-wait. Appended after each GUI run.
+void WriteHashProfileReport(FILE* f, const profiling::HashProfileReport& p) {
+    std::fprintf(f, "=== HASH / EMIT PROFILING ===\n");
+    std::fprintf(f, "backpressure waits = %llu\n", (unsigned long long)p.backpressureWaits);
+    std::fprintf(f, "backpressure wait time = %.3f s\n", p.backpressureWaitSeconds);
+    std::fprintf(f, "waitAll count = %llu\n", (unsigned long long)p.waitAllCount);
+    std::fprintf(f, "waitAll time = %.3f s\n", p.waitAllSeconds);
+    std::fprintf(f, "max outstanding tasks = %llu\n",
+                 (unsigned long long)p.maxOutstandingTasks);
+    std::fprintf(f, "max queue depth = %llu\n", (unsigned long long)p.maxQueueDepth);
+    std::fprintf(f, "pool wall = %.3f s\n", profiling::QpcToSeconds(p.poolWallTicks));
+    std::fprintf(f, "worker busy (tot) = %.3f s\n", profiling::QpcToSeconds(p.poolBusyTicks));
+    std::fprintf(f, "max active workers = %llu\n", (unsigned long long)p.poolMaxActive);
+    std::fprintf(f, "avg active workers = %.3f (derived: busy / wall)\n",
+                 p.poolWallTicks > 0 ? static_cast<double>(p.poolBusyTicks) /
+                                           static_cast<double>(p.poolWallTicks)
+                                     : 0.0);
+    std::fprintf(f, "tasks submitted = %llu, completed = %llu\n",
+                 (unsigned long long)p.poolSubmitted, (unsigned long long)p.poolCompleted);
+    const char* sideName[2] = {"A (source)", "B (dest)"};
+    for (int side = 0; side < 2; ++side) {
+        const double total = profiling::QpcToSeconds(p.emitTicks[side]);
+        const double bpw = profiling::QpcToSeconds(p.emitBackpressureTicks[side]);
+        const double non = total > bpw ? total - bpw : 0.0;
+        std::fprintf(f, "side %s: emit_consumer = %.3f s | emit_backpressure_wait = %.3f s | "
+                        "emit_non_wait = %.3f s\n",
+                     sideName[side], total, bpw, non);
+    }
+    for (int side = 0; side < 2; ++side) {
+        const profiling::JobAggregate& j = p.jobs[side];
+        std::fprintf(f,
+                     "side %s jobs: n=%llu bytes=%llu qw_tot=%.3f qw_max=%.3f exec_tot=%.3f "
+                     "exec_max=%.3f read=%.3f sha=%.3f stat=%.3f cache=%.3f "
+                     "verdicts(ok=%llu err=%llu canc=%llu)\n",
+                     sideName[side], (unsigned long long)j.jobs, (unsigned long long)j.bytes,
+                     profiling::QpcToSeconds(j.queueWaitTicks),
+                     profiling::QpcToSeconds(j.queueWaitMax),
+                     profiling::QpcToSeconds(j.execTicks), profiling::QpcToSeconds(j.execMax),
+                     profiling::QpcToSeconds(j.readTicks), profiling::QpcToSeconds(j.hashTicks),
+                     profiling::QpcToSeconds(j.statTicks), profiling::QpcToSeconds(j.cacheTicks),
+                     (unsigned long long)(j.verdictIdentical + j.verdictMismatch),
+                     (unsigned long long)(j.verdictReadError + j.verdictAccessDenied +
+                                          j.verdictChanged),
+                     (unsigned long long)j.verdictCancelled);
+    }
+    const char* verdictName[] = {"identical", "mismatch", "changed", "readErr", "denied", "canc"};
+    for (int side = 0; side < 2; ++side) {
+        const auto& top = p.topJobs[side].top;
+        std::fprintf(f, "top jobs side %s (%zu entries):\n", sideName[side], top.size());
+        for (const auto& t : top) {
+            std::fprintf(f,
+                         "  # exec=%.3f qw=%.3f read=%.3f sha=%.3f stat=%.3f cache=%.3f "
+                         "size=%llu/%llu %s %ls\n",
+                         profiling::QpcToSeconds(t.execTicks),
+                         profiling::QpcToSeconds(t.queueWaitTicks),
+                         profiling::QpcToSeconds(t.readTicks),
+                         profiling::QpcToSeconds(t.hashTicks),
+                         profiling::QpcToSeconds(t.statTicks),
+                         profiling::QpcToSeconds(t.cacheTicks),
+                         (unsigned long long)t.sizeSource, (unsigned long long)t.sizeDest,
+                         verdictName[static_cast<int>(t.verdict)], t.path.c_str());
+        }
+    }
+    std::fprintf(f, "---\n");
+}
+
+} // namespace
 
 ScanOrchestrator::~ScanOrchestrator() {
     shutdown();
@@ -134,6 +229,16 @@ bool ScanOrchestrator::startLiveScan() {
         options.compareFrom = snapshotFile_;
         progress_.phase = ScanPhase::CompareDestination; // no source pass
     }
+    // Content-hash profiler (GUI): on only when launched through the profiling
+    // .bat (BV_MFT_PROFILE set); recreated per run so counters start from zero.
+    profileEnabled_ = ProfileEnvEnabled();
+    if (profileEnabled_) {
+        hashProfiler_ = std::make_unique<profiling::HashProfiler>();
+        hashProfiler_->setEnabled(true);
+        options.hashProfiler = hashProfiler_.get();
+    } else {
+        options.hashProfiler = nullptr;
+    }
     worker_ = std::thread(&ScanOrchestrator::workerThread, this, std::move(options));
     return true;
 }
@@ -176,6 +281,14 @@ bool ScanOrchestrator::startSnapshotScan(const std::wstring& outFile) {
         }
         notify();
     };
+    profileEnabled_ = ProfileEnvEnabled();
+    if (profileEnabled_) {
+        hashProfiler_ = std::make_unique<profiling::HashProfiler>();
+        hashProfiler_->setEnabled(true);
+        options.hashProfiler = hashProfiler_.get();
+    } else {
+        options.hashProfiler = nullptr;
+    }
     worker_ = std::thread(&ScanOrchestrator::workerThread, this, std::move(options));
     return true;
 }
@@ -269,6 +382,18 @@ void ScanOrchestrator::resetForRunLocked() {
 void ScanOrchestrator::workerThread(ScanOptions options) {
     ScanController controller(options.caseSensitive);
     ScanReport report = controller.run(options);
+
+    // GUI profiling report (only when the profiling .bat launched us): append
+    // the hash/emit breakdown to <BV_MFT_PROFILE>.hash.txt alongside the
+    // per-drive MFT report written by the enumerator.
+    if (profileEnabled_) {
+        if (const std::wstring path = ProfileHashReportPath(); !path.empty()) {
+            if (FILE* f = _wfopen(path.c_str(), L"a")) {
+                WriteHashProfileReport(f, report.hashProfile);
+                std::fclose(f);
+            }
+        }
+    }
 
     {
         std::lock_guard<std::mutex> lk(mtx_);

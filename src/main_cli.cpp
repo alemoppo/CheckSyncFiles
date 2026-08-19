@@ -277,6 +277,10 @@ void PrintHashProfile(const bv::profiling::HashProfileReport& p) {
         std::wcout << L"  MB/s read:             " << FmtMBS(s.bytes, readSec) << L"\n";
         std::wcout << L"  MB/s sha:              " << FmtMBS(s.bytes, hashSec) << L"\n";
         std::wcout << L"  MB/s total:            " << FmtMBS(s.bytes, totalSec) << L"\n";
+        if (s.cacheLookups > 0) {
+            std::wcout << L"  cache lookups:         " << Group(s.cacheLookups) << L"  "
+                       << FmtSec(QpcToSeconds(s.cacheTicks)) << L"\n";
+        }
     };
     printSide(L"A (sorgente)", a);
     printSide(L"B (destinazione)", b);
@@ -324,6 +328,116 @@ void PrintHashProfile(const bv::profiling::HashProfileReport& p) {
     std::wcout << L"  total waitAll:         " << FmtSec(p.waitAllSeconds) << L"\n";
     std::wcout << L"  max outstanding:       " << p.maxOutstandingTasks << L"\n";
     std::wcout << L"  max queue depth:       " << p.maxQueueDepth << L"\n";
+
+    std::wcout << L"\nEmit callback (per side; confrontare con emit_consumer dell'MFT):\n";
+    auto printEmit = [&](const wchar_t* name, int i) {
+        const double total = QpcToSeconds(p.emitTicks[i]);
+        const double bp = QpcToSeconds(p.emitBackpressureTicks[i]);
+        const double nonWait = total > bp ? total - bp : 0.0;
+        std::wcout << L"  " << name << L":\n";
+        std::wcout << L"    emit_consumer:           " << FmtSec(total) << L"\n";
+        std::wcout << L"    emit_backpressure_wait:  " << FmtSec(bp) << L"\n";
+        std::wcout << L"    emit_non_wait:           " << FmtSec(nonWait) << L"\n";
+    };
+    printEmit(L"A (sorgente)", 0);
+    printEmit(L"B (destinazione)", 1);
+
+    // -----------------------------------------------------------------
+    // Per-submitter-side job aggregates. "A/B" here is the side whose
+    // enumerator worker submitted the batch (SubmitHashCandidates is called
+    // separately from each walk); a job hashes BOTH file sides, so read/hash/
+    // stat/cache are the sum of the source and destination file work.
+    // -----------------------------------------------------------------
+    const wchar_t* kJobSideName[2] = {L"A (sorgente)", L"B (destinazione)"};
+    const auto printJobs = [&](const wchar_t* name, const bv::profiling::JobAggregate& j) {
+        const double qwSec = QpcToSeconds(j.queueWaitTicks);
+        const double exSec = QpcToSeconds(j.execTicks);
+        const double qwAvg = j.jobs > 0 ? QpcToSeconds(j.queueWaitTicks) / j.jobs : 0.0;
+        const double exAvg = j.jobs > 0 ? QpcToSeconds(j.execTicks) / j.jobs : 0.0;
+        std::wcout << L"\n" << name << L":\n";
+        std::wcout << L"  job:                    " << Group(j.jobs) << L"\n";
+        std::wcout << L"  bytes attesi (A+B):     " << HumanBytes(j.bytes) << L"\n";
+        std::wcout << L"  queue wait   tot:       " << FmtSec(qwSec) << L"  max: " << FmtSec(QpcToSeconds(j.queueWaitMax))
+                   << L"  media: " << FormatFixed(qwAvg, 3) << L" s\n";
+        std::wcout << L"  job exec     tot:       " << FmtSec(exSec) << L"  max: " << FmtSec(QpcToSeconds(j.execMax))
+                   << L"  media: " << FormatFixed(exAvg, 3) << L" s\n";
+        std::wcout << L"  read:                   " << FmtSec(QpcToSeconds(j.readTicks)) << L"  (media/job "
+                   << FormatFixed(j.jobs > 0 ? QpcToSeconds(j.readTicks) / j.jobs : 0.0, 3) << L" s)\n";
+        std::wcout << L"  sha:                    " << FmtSec(QpcToSeconds(j.hashTicks)) << L"  (media/job "
+                   << FormatFixed(j.jobs > 0 ? QpcToSeconds(j.hashTicks) / j.jobs : 0.0, 3) << L" s)\n";
+        std::wcout << L"  stat (T1+T2):           " << FmtSec(QpcToSeconds(j.statTicks)) << L"\n";
+        std::wcout << L"  cache lookup:           " << FmtSec(QpcToSeconds(j.cacheTicks)) << L"\n";
+        std::wcout << L"  verdict: identici=" << Group(j.verdictIdentical)
+                   << L" mismatch=" << Group(j.verdictMismatch)
+                   << L" changed=" << Group(j.verdictChanged)
+                   << L" readErr=" << Group(j.verdictReadError)
+                   << L" denied=" << Group(j.verdictAccessDenied)
+                   << L" canc=" << Group(j.verdictCancelled) << L"\n";
+    };
+    std::wcout << L"\n=== JOB PER LATO (chi ha sottomesso il job) ===";
+    printJobs(kJobSideName[0], p.jobs[0]);
+    printJobs(kJobSideName[1], p.jobs[1]);
+    {
+        bv::profiling::JobAggregate tot = p.jobs[0];
+        tot.jobs += p.jobs[1].jobs;
+        tot.bytes += p.jobs[1].bytes;
+        tot.queueWaitTicks += p.jobs[1].queueWaitTicks;
+        tot.execTicks += p.jobs[1].execTicks;
+        tot.readTicks += p.jobs[1].readTicks;
+        tot.hashTicks += p.jobs[1].hashTicks;
+        tot.statTicks += p.jobs[1].statTicks;
+        tot.cacheTicks += p.jobs[1].cacheTicks;
+        tot.queueWaitMax = std::max(tot.queueWaitMax, p.jobs[1].queueWaitMax);
+        tot.execMax = std::max(tot.execMax, p.jobs[1].execMax);
+        printJobs(L"Totale (A+B)", tot);
+    }
+
+    // -----------------------------------------------------------------
+    // ThreadPool utilization. average active workers is DERIVED:
+    // total worker busy wall / pool lifetime wall. busyTicks only grows while
+    // workers run tasks; walTicks spans the pool's whole lifetime (enumeration
+    // overlap included), so the ratio is <= the worker count and answers "is
+    // the pool genuinely saturated, or long queue + idle workers?".
+    // -----------------------------------------------------------------
+    std::wcout << L"\nWorker utilization (ThreadPool):\n";
+    std::wcout << L"  pool wall:             " << FmtSec(QpcToSeconds(p.poolWallTicks)) << L"\n";
+    std::wcout << L"  worker busy (tot):     " << FmtSec(QpcToSeconds(p.poolBusyTicks)) << L"\n";
+    std::wcout << L"  max active workers:    " << p.poolMaxActive << L"\n";
+    std::wcout << L"  avg active workers:    "
+               << FormatFixed(p.poolWallTicks > 0 ? static_cast<double>(p.poolBusyTicks) /
+                                                       static_cast<double>(p.poolWallTicks)
+                                                  : 0.0,
+                              3)
+               << L"   (= worker busy / pool wall, derivata)\n";
+    std::wcout << L"  tasks submitted:       " << Group(p.poolSubmitted) << L"\n";
+    std::wcout << L"  tasks completed:       " << Group(p.poolCompleted) << L"\n";
+
+    // -----------------------------------------------------------------
+    // Top 10 most expensive jobs per side (kept in O(10) memory per side).
+    // -----------------------------------------------------------------
+    const wchar_t* kVerdictName[] = {L"identici", L"mismatch", L"changed",
+                                     L"readErr",  L"denied",   L"canc" };
+    for (int side = 0; side < 2; ++side) {
+        const auto& top = p.topJobs[side].top;
+        std::wcout << L"\nTop 10 job piu' costosi (lato " << kJobSideName[side] << L"):\n";
+        if (top.empty()) {
+            std::wcout << L"  (nessun job registrato)\n";
+            continue;
+        }
+        for (size_t k = 0; k < top.size(); ++k) {
+            const auto& t = top[k];
+            std::wcout << L"  #" << (k + 1) << L" exec=" << FmtSec(QpcToSeconds(t.execTicks))
+                       << L" qw=" << FmtSec(QpcToSeconds(t.queueWaitTicks))
+                       << L" read=" << FmtSec(QpcToSeconds(t.readTicks))
+                       << L" sha=" << FmtSec(QpcToSeconds(t.hashTicks))
+                       << L" stat=" << FmtSec(QpcToSeconds(t.statTicks))
+                       << L" cache=" << FmtSec(QpcToSeconds(t.cacheTicks))
+                       << L" size=" << HumanBytes(t.sizeSource) << L"/"
+                       << HumanBytes(t.sizeDest)
+                       << L" " << kVerdictName[static_cast<int>(t.verdict)]
+                       << L" " << t.path << L"\n";
+        }
+    }
 }
 
 void PrintResults(const bv::ResultSet& r) {

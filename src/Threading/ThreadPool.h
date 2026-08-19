@@ -96,6 +96,11 @@ public:
         uint64_t backpressureWaitTicks = 0; // QPC ticks spent inside that wait
         uint64_t waitAllCount = 0;          // times waitAll() blocked
         uint64_t waitAllTicks = 0;          // QPC ticks spent inside waitAll()
+        uint64_t busyTicks = 0;             // total wall time workers spent running tasks
+        uint64_t maxActiveWorkers = 0;      // max workers simultaneously running a task
+        uint64_t poolWallTicks = 0;         // pool lifetime (ctor -> metrics() snapshot)
+        uint64_t submittedTasks = 0;        // tasks submitted so far
+        uint64_t completedTasks = 0;        // tasks completed so far
     };
     ThreadPoolMetrics metrics() const;
 
@@ -115,12 +120,15 @@ private:
 
     // Profiling counters (passive, relaxed atomics; never gate or block).
     std::atomic<uint64_t> runningTasks_{0};       // workers currently executing
+    std::atomic<uint64_t> maxActiveWorkers_{0};   // max concurrent executors observed
+    std::atomic<uint64_t> busyTicks_{0};          // total worker wall time in task()
     std::atomic<uint64_t> maxOutstanding_{0};     // max submitted-but-not-finished
     std::atomic<uint64_t> maxQueueDepth_{0};      // max queued-but-not-started
     std::atomic<uint64_t> backpressureWaits_{0};
     std::atomic<uint64_t> backpressureWaitTicks_{0};
     std::atomic<uint64_t> waitAllCount_{0};
     std::atomic<uint64_t> waitAllTicks_{0};
+    uint64_t startedWall_ = 0;  // QPC at construction; used for poolWallTicks
 };
 
 // Picks a sensible default worker count for an IO class. Never exceeds a small

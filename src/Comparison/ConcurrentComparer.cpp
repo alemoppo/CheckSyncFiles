@@ -101,6 +101,10 @@ ConcurrentComparer::Result ConcurrentComparer::runImpl(
     totalDirs_.store(0, std::memory_order_relaxed);
     totalBytes_.store(0, std::memory_order_relaxed);
 
+    // Profiling-only: remember whether the hash profiler is active so the emit
+    // timing below costs a single branch (never a QPC read) when it is off.
+    profileEnabled_ = (profile_ != nullptr) && profile_->enabled();
+
     // Content-hash overlap context for the workers (set before they start, then
     // only read, except for the two atomic counters).
     hashPool_ = &hashPool;
@@ -153,8 +157,8 @@ ConcurrentComparer::Result ConcurrentComparer::runImpl(
             // flush whatever is left. The submitted tasks run asynchronously; the
             // final waitAll below guarantees that none can still touch the sink
             // when it is taken.
-            FlushHashCandidates(candidatesA, sink);
-            FlushHashCandidates(candidatesB, sink);
+            FlushHashCandidates(candidatesA, 0, sink);
+            FlushHashCandidates(candidatesB, 1, sink);
         }
         finalizeMissingExtra(table, post);
     }
@@ -180,6 +184,11 @@ ConcurrentComparer::Result ConcurrentComparer::runImpl(
 
 void ConcurrentComparer::onEntry(int side, FileEntry e, MatchTable& table, ConcurrentSink& sink,
                                  std::vector<ContentCandidate>& candidates) {
+    // Profiling-only window over this callback (goes to HashProfiler::NoteEmit).
+    // Active only when profileEnabled_; otherwise a single always-false branch.
+    const bool prof = profileEnabled_;
+    uint64_t emitT0 = 0, bpTicks = 0;
+    if (prof) emitT0 = profiling::QpcNow();
     auto& stats = sink.stats();
     const auto inc = [&stats](std::atomic<uint64_t>& c) {
         c.fetch_add(1, std::memory_order_relaxed);
@@ -195,7 +204,13 @@ void ConcurrentComparer::onEntry(int side, FileEntry e, MatchTable& table, Concu
     const std::wstring key = CanonicalKey(e.relativePath, caseSensitive_);
     FileEntry peer;
     const MatchTable::Outcome outcome = table.insert(key, side, std::move(e), peer);
-    if (outcome != MatchTable::Outcome::Matched) return;
+    if (outcome != MatchTable::Outcome::Matched) {
+        if (prof) {
+            profile_->NoteEmit(static_cast<profiling::Side>(side),
+                               profiling::QpcNow() - emitT0, 0);
+        }
+        return;
+    }
 
     // The shard lock is released: classify outside any table lock.
     FileEntry src;
@@ -217,12 +232,21 @@ void ConcurrentComparer::onEntry(int side, FileEntry e, MatchTable& table, Concu
         // and the submitted tasks count themselves done. Called from the worker
         // thread, never under a table shard lock.
         if (candidates.size() >= kHashBatchSize) {
-            FlushHashCandidates(candidates, sink);
+            // The time this worker spends blocked in waitOutstandingBelow() (via
+            // FlushHashCandidates) is hash-pool backpressure -- measured here so
+            // it can be separated from the rest of the emit callback. Profiling-only.
+            const uint64_t bpT0 = prof ? profiling::QpcNow() : 0;
+            FlushHashCandidates(candidates, side, sink);
+            if (prof) bpTicks = profiling::QpcNow() - bpT0;
         }
+    }
+    if (prof) {
+        profile_->NoteEmit(static_cast<profiling::Side>(side),
+                           profiling::QpcNow() - emitT0, bpTicks);
     }
 }
 
-void ConcurrentComparer::FlushHashCandidates(std::vector<ContentCandidate>& pending,
+void ConcurrentComparer::FlushHashCandidates(std::vector<ContentCandidate>& pending, int side,
                                              ConcurrentSink& sink) {
     while (!pending.empty()) {
         // Backpressure without stalling enumeration for a whole batch: block
@@ -237,7 +261,8 @@ void ConcurrentComparer::FlushHashCandidates(std::vector<ContentCandidate>& pend
         pending.resize(start);
         SubmitHashCandidates(batch, *hashPool_, offlineSource_,
                              offlineSource_ ? fromIndex_ : nullptr, sourceRoot_, destRoot_, sink,
-                             cancel_, cache_, cacheHits_, &hashDone_, profile_);
+                             cancel_, cache_, cacheHits_, &hashDone_, profile_,
+                             static_cast<profiling::Side>(side));
         // The submitted tasks count themselves done as they finish; report
         // completion so far so progress keeps moving while the workers are still
         // enumerating.

@@ -42,7 +42,8 @@ void HashOneCandidateInto(const ContentCandidate& c, bool offlineSource, FileInd
                           const std::wstring& sourceRoot, const std::wstring& destRoot,
                           ConcurrentSink& sink, const std::atomic_bool* cancel,
                           hashing::HashCache* cache, std::atomic<size_t>& cacheHits,
-                          profiling::HashSession* session) {
+                          profiling::HashSession* session,
+                          profiling::JobVerdict* verdict = nullptr) {
     auto& stats = sink.stats();
     const auto inc = [&stats](std::atomic<uint64_t>& x) {
         x.fetch_add(1, std::memory_order_relaxed);
@@ -73,6 +74,7 @@ void HashOneCandidateInto(const ContentCandidate& c, bool offlineSource, FileInd
         // Cancelled before any work: drop the candidate silently. Reporting a
         // read error here would fabricate a verdict for a file that was never
         // opened.
+        if (verdict) *verdict = profiling::JobVerdict::Cancelled;
         return;
     }
 
@@ -93,20 +95,30 @@ void HashOneCandidateInto(const ContentCandidate& c, bool offlineSource, FileInd
                              session, profiling::Side::Source, cancel);
         hasSrc = (srcStatus == hashing::HashStatus::Ok);
         if (srcStatus == hashing::HashStatus::Cancelled ||
-            (cancel && cancel->load(std::memory_order_relaxed))) return; // no verdict (cancelled)
+            (cancel && cancel->load(std::memory_order_relaxed))) {
+            if (verdict) *verdict = profiling::JobVerdict::Cancelled;
+            return; // no verdict (cancelled)
+        }
     }
     bool dstChanged = false;
     // Don't start hashing the destination if cancellation landed on the source side.
-    if (cancel && cancel->load(std::memory_order_relaxed)) return;
+    if (cancel && cancel->load(std::memory_order_relaxed)) {
+        if (verdict) *verdict = profiling::JobVerdict::Cancelled;
+        return;
+    }
     hashing::HashOneSide(pathutil::MakeAbsolute(destRoot, c.relativePath), c.sizeDest, c.dstMtime,
                          dstChanged, dstStatus, dstDigest, true, cache, cacheHits, session,
                          profiling::Side::Dest, cancel);
     hasDst = (dstStatus == hashing::HashStatus::Ok);
     if (dstStatus == hashing::HashStatus::Cancelled ||
-        (cancel && cancel->load(std::memory_order_relaxed))) return; // no verdict (cancelled)
+        (cancel && cancel->load(std::memory_order_relaxed))) {
+        if (verdict) *verdict = profiling::JobVerdict::Cancelled;
+        return; // no verdict (cancelled)
+    }
     changed = changed || dstChanged;
 
     if (changed) {
+        if (verdict) *verdict = profiling::JobVerdict::ChangedDuringScan;
         inc(stats.changedDuringScan);
         FileResult r;
         r.status = Status::ChangedDuringScan;
@@ -121,8 +133,10 @@ void HashOneCandidateInto(const ContentCandidate& c, bool offlineSource, FileInd
 
     if (srcStatus == hashing::HashStatus::Ok && dstStatus == hashing::HashStatus::Ok) {
         if (srcDigest == dstDigest) {
+            if (verdict) *verdict = profiling::JobVerdict::Identical;
             inc(stats.identicalFiles);
         } else {
+            if (verdict) *verdict = profiling::JobVerdict::ContentMismatch;
             inc(stats.contentMismatch);
             FileResult r;
             r.status = Status::ContentMismatch;
@@ -141,6 +155,8 @@ void HashOneCandidateInto(const ContentCandidate& c, bool offlineSource, FileInd
 
     const bool denied = srcStatus == hashing::HashStatus::NoAccess ||
                         dstStatus == hashing::HashStatus::NoAccess;
+    if (verdict) *verdict = denied ? profiling::JobVerdict::AccessDenied
+                                   : profiling::JobVerdict::ReadError;
     reportReadError(denied, hasSrc, hasDst, srcDigest, dstDigest);
 }
 
@@ -151,26 +167,52 @@ void SubmitHashCandidates(const std::vector<ContentCandidate>& candidates, Threa
                           const std::wstring& sourceRoot, const std::wstring& destRoot,
                           ConcurrentSink& sink, const std::atomic_bool* cancel,
                           hashing::HashCache* cache, std::atomic<size_t>& cacheHits,
-                          std::atomic<uint64_t>* hashDone, profiling::HashProfiler* prof) {
+                          std::atomic<uint64_t>* hashDone, profiling::HashProfiler* prof,
+                          profiling::Side side) {
+    // Per-job profiling is armed exactly when the profiler is enabled. The
+    // enqueue timestamp is captured at the call site for each candidate (the
+    // moment this producer hands the task to the pool); the executing worker
+    // records its own start/finish. No ThreadPool API is touched for A/B: the
+    // side comes from the call site (A walk vs B walk), captured by value in
+    // the closure.
+    const bool profOn = prof && prof->enabled();
     for (const ContentCandidate& c : candidates) {
+        const uint64_t enq = profOn ? profiling::QpcNow() : 0;
         // The candidate is captured BY VALUE: the batch vector may be reused or
         // destroyed as soon as this call returns, and a task can never confuse
         // one candidate with a neighbouring element.
         pool.submit([c, offlineSource, index, &sourceRoot, &destRoot, &sink, cancel, cache,
-                     &cacheHits, hashDone, prof] {
+                     &cacheHits, hashDone, prof, profOn, side, enq] {
             // HashSession owns the profiler task slot: it bumps/decrements the
             // active-job counters and issues this task's unique job id, and it
             // is destroyed on every exit path (including a thrown exception).
             profiling::HashSession session(prof);
+            profiling::JobVerdict verdict = profiling::JobVerdict::Identical;
+            if (profOn) {
+                session.fullJob = true;
+                session.side = side;
+                session.enqueueTick = enq;
+                session.startTick = profiling::QpcNow();
+                session.sizeSource = c.sizeSource;
+                session.sizeDest = c.sizeDest;
+                session.relPath = c.relativePath;
+            }
             // HashOneCandidateInto never throws in practice (every failure is
             // folded into the sink), but if it did the candidate would still be
             // counted as done so progress can reach 100%; the pool also records
             // the throw as a task error for the caller.
             try {
                 HashOneCandidateInto(c, offlineSource, index, sourceRoot, destRoot, sink, cancel,
-                                     cache, cacheHits, &session);
+                                     cache, cacheHits, &session, &verdict);
+                if (profOn) {
+                    session.verdict = verdict;
+                    session.endTick = profiling::QpcNow(); // job execution finish
+                }
             } catch (...) {
-                if (prof) prof->TaskFailed();
+                if (prof) {
+                    prof->TaskFailed();
+                    if (profOn) session.verdict = profiling::JobVerdict::Cancelled;
+                }
                 if (hashDone) hashDone->fetch_add(1, std::memory_order_relaxed);
                 throw;
             }

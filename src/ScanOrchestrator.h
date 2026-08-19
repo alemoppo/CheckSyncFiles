@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -163,6 +164,15 @@ private:
 
     std::function<void()> beforeNotifyHook_;
     std::function<void()> startLockedHook_;
+
+    // Content-hash profiler for the GUI. Owned here (recreated per run in the
+    // start entry points so each run starts from zero) and handed to
+    // ScanOptions::hashProfiler so ScanController feeds it; the worker writes
+    // the aggregated report (backpressure + per-side emit) to a file at the end.
+    // Only active when BV_MFT_PROFILE is set (i.e. when launched through the
+    // profiling .bat), so a normal GUI scan adds no overhead.
+    std::unique_ptr<profiling::HashProfiler> hashProfiler_;
+    bool profileEnabled_ = false;
 };
 
 } // namespace bv

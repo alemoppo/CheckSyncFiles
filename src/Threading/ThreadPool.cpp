@@ -7,6 +7,7 @@
 namespace bv {
 
 ThreadPool::ThreadPool(unsigned int nThreads) : nThreads_(nThreads) {
+    startedWall_ = profiling::QpcNow();
     workers_.reserve(nThreads_);
     for (unsigned int i = 0; i < nThreads_; ++i) {
         workers_.emplace_back(std::thread(&ThreadPool::workerLoop, this));
@@ -73,8 +74,16 @@ void ThreadPool::workerLoop() {
             task = std::move(tasks_.front());
             tasks_.pop();
         }
+        // Passive utilization counters around task(): worker wall busy time (the
+        // wall span includes synchronous I/O inside the task) and the maximum
+        // number of workers running concurrently. They never gate or block.
+        const uint64_t busy0 = profiling::QpcNow();
+        const uint64_t running = runningTasks_.fetch_add(1, std::memory_order_relaxed) + 1;
+        uint64_t cur = maxActiveWorkers_.load(std::memory_order_relaxed);
+        while (cur < running &&
+               !maxActiveWorkers_.compare_exchange_weak(cur, running, std::memory_order_relaxed)) {
+        }
         try {
-            runningTasks_.fetch_add(1, std::memory_order_relaxed);
             task();
         } catch (...) {
             // Never let an exception escape a worker; record it so the caller
@@ -82,6 +91,7 @@ void ThreadPool::workerLoop() {
             taskErrors_.fetch_add(1, std::memory_order_relaxed);
         }
         runningTasks_.fetch_sub(1, std::memory_order_relaxed);
+        busyTicks_.fetch_add(profiling::QpcNow() - busy0, std::memory_order_relaxed);
         {
             std::lock_guard<std::mutex> lk(mutex_);
             ++completed_;
@@ -98,6 +108,16 @@ ThreadPool::ThreadPoolMetrics ThreadPool::metrics() const {
     m.backpressureWaitTicks = backpressureWaitTicks_.load(std::memory_order_relaxed);
     m.waitAllCount = waitAllCount_.load(std::memory_order_relaxed);
     m.waitAllTicks = waitAllTicks_.load(std::memory_order_relaxed);
+    m.busyTicks = busyTicks_.load(std::memory_order_relaxed);
+    m.maxActiveWorkers = maxActiveWorkers_.load(std::memory_order_relaxed);
+    // Pool lifetime wall measured at snapshot time (metrics() is read once at
+    // the end of the phase, after waitAll drained the pool).
+    m.poolWallTicks = profiling::QpcNow() - startedWall_;
+    {
+        std::lock_guard<std::mutex> lk(mutex_);
+        m.submittedTasks = issued_;
+        m.completedTasks = completed_;
+    }
     return m;
 }
 

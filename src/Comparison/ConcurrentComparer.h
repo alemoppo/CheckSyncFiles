@@ -172,7 +172,8 @@ private:
     // kHashMaxOutstanding; the workers only block when the queue is genuinely
     // backed up, so overlap is kept without ever stalling enumeration for a whole
     // batch. The submitted tasks update hashDone_ as they finish.
-    void FlushHashCandidates(std::vector<ContentCandidate>& pending, ConcurrentSink& sink);
+    void FlushHashCandidates(std::vector<ContentCandidate>& pending, int side,
+                             ConcurrentSink& sink);
 
     bool caseSensitive_;
     ScanMode mode_;
@@ -206,6 +207,10 @@ private:
     // can emit hash progress from different threads.
     std::mutex hashProgressMutex_;
     profiling::HashProfiler* profile_ = nullptr; // optional content-hash profiler
+    // Cached copy of (profile_ != null && profile_->enabled()) taken once in
+    // runImpl, so the per-entry emit timing adds a single branch when profiling
+    // is off and never calls QpcNow in a normal scan.
+    bool profileEnabled_ = false;
 };
 
 } // namespace bv

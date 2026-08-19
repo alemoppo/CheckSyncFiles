@@ -48,17 +48,25 @@ void HashOneSide(const std::wstring& absPath, uint64_t expectedSize, uint64_t ex
     uint64_t mt = 0;
     const uint64_t t1Start = prof ? profiling::QpcNow() : 0;
     if (!StatHandle(h, sz, mt)) {
-        if (prof) session->prof->NoteStatBefore(side, profiling::QpcNow() - t1Start);
+        if (prof) session->prof->NoteStatBefore(*session, side, profiling::QpcNow() - t1Start);
         CloseHandle(h);
         status = HashStatus::NoAccess;
         return;
     }
-    if (prof) session->prof->NoteStatBefore(side, profiling::QpcNow() - t1Start);
+    if (prof) session->prof->NoteStatBefore(*session, side, profiling::QpcNow() - t1Start);
     changed = (sz != expectedSize) || (mt != expectedMtime);
 
     // Cache hit under the CURRENT (size, mtime) key: reuse the digest and
     // return without hashing and without T2 (identical to the previous flow).
-    if (cache && cache->Lookup(absPath, sz, mt, digest)) {
+    // The Lookup() wall time is profiled (mutex-protected map) only when a
+    // cache exists and profiling is on; otherwise one false branch.
+    const bool wantCacheTiming = prof && cache;
+    const uint64_t c0 = wantCacheTiming ? profiling::QpcNow() : 0;
+    const bool cacheHit = cache && cache->Lookup(absPath, sz, mt, digest);
+    if (wantCacheTiming) {
+        session->prof->NoteCacheLookup(*session, side, profiling::QpcNow() - c0);
+    }
+    if (cacheHit) {
         CloseHandle(h);
         status = HashStatus::Ok;
         cacheHits.fetch_add(1, std::memory_order_relaxed);
@@ -84,10 +92,10 @@ void HashOneSide(const std::wstring& absPath, uint64_t expectedSize, uint64_t ex
     uint64_t mtAfter = 0;
     const uint64_t t2Start = prof ? profiling::QpcNow() : 0;
     if (StatHandle(h, szAfter, mtAfter)) {
-        if (prof) session->prof->NoteStatAfter(side, profiling::QpcNow() - t2Start);
+        if (prof) session->prof->NoteStatAfter(*session, side, profiling::QpcNow() - t2Start);
         if (HashMetadataChanged(sz, mt, szAfter, mtAfter)) changed = true;
     } else if (prof) {
-        session->prof->NoteStatAfter(side, profiling::QpcNow() - t2Start);
+        session->prof->NoteStatAfter(*session, side, profiling::QpcNow() - t2Start);
     }
     CloseHandle(h);
     if (cache) cache->Store(absPath, sz, mt, digest);

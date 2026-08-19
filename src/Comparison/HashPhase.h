@@ -56,7 +56,8 @@ void SubmitHashCandidates(const std::vector<ContentCandidate>& candidates, Threa
                           ConcurrentSink& sink, const std::atomic_bool* cancel,
                           hashing::HashCache* cache, std::atomic<size_t>& cacheHits,
                           std::atomic<uint64_t>* hashDone = nullptr,
-                          profiling::HashProfiler* prof = nullptr);
+                          profiling::HashProfiler* prof = nullptr,
+                          profiling::Side side = profiling::Side::Source);
 
 // Legacy whole-phase entry point (serial comparator): hashes `candidates` in
 // bounded batches of kHashBatchSize and folds the outcomes into `out`.
