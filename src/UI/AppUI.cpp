@@ -563,6 +563,15 @@ std::wstring BaseName(const std::wstring& p) {
     return (pos == std::wstring::npos) ? p : p.substr(pos + 1);
 }
 
+// A target usable as `explorer.exe /select,"<path>"`. An embedded `"` would
+// break out of the argument quoting, and such a path can arrive from a
+// hand-edited snapshot (`relativePath` is deserialized without character
+// validation; live filesystems never contain `"` in names). Refuse it here:
+// never offer the action and never execute it, without transforming the path.
+bool IsExplorerSafePath(const std::wstring& path) {
+    return !path.empty() && path.find(L'"') == std::wstring::npos;
+}
+
 } // namespace
 
 int AppUI::run() {
@@ -933,7 +942,8 @@ void AppUI::OnRightClick(int mx, int my) {
     }
 
     // One item per side whose path exists right now; a missing side simply
-    // contributes no item (e.g. Missing shows only A, Extra only B).
+    // contributes no item (e.g. Missing shows only A, Extra only B). The A
+    // side is never offered for offline/snapshot results (see resultsOffline_).
     const auto existsSide = [](const std::wstring& root, const std::wstring& rel,
                                std::wstring& out) {
         if (root.empty()) return false;
@@ -942,10 +952,11 @@ void AppUI::OnRightClick(int mx, int my) {
         return std::filesystem::exists(out, ec) && !ec;
     };
     std::wstring cand;
-    if (existsSide(resultsSourceRoot_, p.relativePath, cand)) {
+    if (!resultsOffline_ && existsSide(resultsSourceRoot_, p.relativePath, cand) &&
+        IsExplorerSafePath(cand)) {
         ctxItems_.push_back({"Apri A in Esplora risorse", cand});
     }
-    if (existsSide(resultsDestRoot_, p.relativePath, cand)) {
+    if (existsSide(resultsDestRoot_, p.relativePath, cand) && IsExplorerSafePath(cand)) {
         ctxItems_.push_back({"Apri B in Esplora risorse", cand});
     }
     if (ctxItems_.empty()) {
@@ -1008,7 +1019,10 @@ void AppUI::DrawContextMenu() {
 
 void AppUI::OpenInExplorer(const std::wstring& path) {
     // /select opens the containing folder with the item highlighted; for a
-    // directory row this selects the directory inside its parent.
+    // directory row this selects the directory inside its parent. The guard
+    // stays here (not only at menu-build time) so no future caller can pass
+    // an unvalidated argument to ShellExecuteW.
+    if (!IsExplorerSafePath(path)) return;
     const std::wstring params = L"/select,\"" + path + L"\"";
     ShellExecuteW(nullptr, L"open", L"explorer.exe", params.c_str(), nullptr, SW_SHOWNORMAL);
 }
@@ -1172,6 +1186,7 @@ void AppUI::syncResultsCache(const bv::ScanOrchestrator::UiSnapshot& st) {
         uiResults_ = orch_.results();
         resultsSourceRoot_ = st.source;
         resultsDestRoot_ = st.dest;
+        resultsOffline_ = st.lastUsedSnapshot;
         resultsReadySeen_ = true;
         scroll_ = 0;
         CloseContextMenu();

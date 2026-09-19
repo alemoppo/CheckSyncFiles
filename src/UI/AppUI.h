@@ -130,6 +130,11 @@ private:
     // edits. A = source field, B = destination field.
     std::wstring resultsSourceRoot_;
     std::wstring resultsDestRoot_;
+    // Whether the displayed results come from an offline/snapshot comparison
+    // (captured from UiSnapshot::lastUsedSnapshot, which describes the run
+    // that produced the results). The A side is then an index, not a live
+    // filesystem, so "Apri A" is never offered.
+    bool resultsOffline_ = false;
 
     // Right-click context menu over a result row ("Apri A/B in Esplora
     // risorse"). Only the items whose side path exists are shown, so the
