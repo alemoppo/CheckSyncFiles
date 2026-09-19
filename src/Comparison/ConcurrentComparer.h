@@ -154,10 +154,12 @@ private:
                            std::vector<ContentCandidate>& candidates, WorkerState& state);
     void onEntry(int side, FileEntry e, MatchTable& table, ConcurrentSink& sink,
                  std::vector<ContentCandidate>& candidates);
-    void onError(const ScanError& err, ConcurrentSink& sink);
+    void onError(const ScanError& err, ConcurrentSink& sink, const std::wstring& root);
     // Writes a retained attempt's staged errors into the sink (a real outcome:
-    // success, incomplete scan, cancellation, or terminal failure).
-    void flushErrors(const std::vector<ScanError>& errors, ConcurrentSink& sink);
+    // success, incomplete scan, cancellation, or terminal failure). `root` is
+    // the side's root the errors were reported on (source or destination).
+    void flushErrors(const std::vector<ScanError>& errors, ConcurrentSink& sink,
+                     const std::wstring& root);
     // Turns an ABANDONED attempt's errors into user-facing notes: the attempt
     // was fully discarded in favour of a later back-end, so its errors must not
     // survive as permanent results, but the reason is still worth reporting.

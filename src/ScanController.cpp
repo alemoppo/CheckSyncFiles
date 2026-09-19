@@ -217,9 +217,12 @@ ScanReport ScanController::run(const ScanOptions& options) {
     //    source is enumerated concurrently with the destination below.
     // ---------------------------------------------------------------------
     const double t1 = NowSeconds();
+    // Source root recorded in the snapshot (offline mode only): hoisted here so
+    // the destination pass can reuse it as the display root for source-side
+    // results. Empty unless a snapshot was loaded successfully.
+    std::wstring loadedRoot;
     if (haveCompare) {
         std::wstring err;
-        std::wstring loadedRoot;
         if (indexio::ReadSnapshot(options.compareFrom, sourceIndex, loadedRoot, err)) {
             report.usedSnapshot = true;
             report.results.stats.sourceFiles = sourceIndex.stats().files;
@@ -396,7 +399,14 @@ ScanReport ScanController::run(const ScanOptions& options) {
             }
         };
 
-        ConcurrentComparer comparer(caseSensitive_, mode, acceptMft, options.source,
+        // Offline (`--compare`): the source device is absent, so `options.source`
+        // is empty and `sourceRoot_` would be unusable for display. The snapshot
+        // records the original source root (`loadedRoot`): use it as the
+        // comparer-side source root. It is display-only there — in FromIndex
+        // mode the source side is never read from the filesystem (digests come
+        // from the index), so no I/O can ever target the absent device.
+        const std::wstring& comparerSourceRoot = haveCompare ? loadedRoot : options.source;
+        ConcurrentComparer comparer(caseSensitive_, mode, acceptMft, comparerSourceRoot,
                                     options.destination,
                                     sourceFromIndex ? ConcurrentComparer::SourceKind::FromIndex
                                                     : ConcurrentComparer::SourceKind::Live,

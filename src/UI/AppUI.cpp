@@ -616,7 +616,7 @@ void AppUI::processEvents() {
                     if (trackRange > 0) {
                         const float newRatio = std::clamp(scrollbarDragRatio_ + dy * (1.0f / trackRange), 0.0f, 1.0f);
                         const int visibleRows = scrollbarTrackH / kRowH;
-                        const int maxScroll = std::max(0, static_cast<int>(FilteredRows().size()) - visibleRows);
+                        const int maxScroll = std::max(0, static_cast<int>(filteredCache_.size()) - visibleRows);
                         scroll_ = std::clamp(static_cast<int>(newRatio * static_cast<float>(maxScroll)), 0, maxScroll);
                     }
                     dirty_ = true;
@@ -801,18 +801,20 @@ void AppUI::OnMouseDown(int mx, int my) {
         if (hit(mx, my, r)) {
             filter_ = static_cast<uint8_t>(i);
             scroll_ = 0;
+            rebuildFilteredCache();
             dirty_.store(true);
         }
     }
 
-    // Scrollbar click/drag start.
-    const int scrollbarW = 12;
+    // Scrollbar click/drag start. Geometry is written to the members (no
+    // shadowing locals) so the motion-drag handler reads the same values.
+    constexpr int scrollbarW = 12;
     scrollbarTrackX = winW_ - kMargin - scrollbarW;
     if (mx >= scrollbarTrackX && mx < winW_ - kMargin &&
         my >= L.yList && my < L.listBottom) {
-        const int scrollbarTrackY = L.yList;
-        const int scrollbarTrackH = L.listBottom - L.yList;
-        auto rows = FilteredRows();
+        scrollbarTrackY = L.yList;
+        scrollbarTrackH = L.listBottom - L.yList;
+        const auto& rows = filteredCache_;
         const int visibleRows = scrollbarTrackH / kRowH;
         const int maxScroll = std::max(0, static_cast<int>(rows.size()) - visibleRows);
         scroll_ = std::clamp(scroll_, 0, maxScroll);
@@ -846,25 +848,10 @@ void AppUI::OnMouseDown(int mx, int my) {
     dirty_.store(true);
 }
 
-void AppUI::OnMouseMove(int mx, int my) {
-    (void)mx;
-    (void)my;
-    dirty_.store(true);
-}
-
-void AppUI::OnMouseUp() {
-    scrollbarDragging_ = false;
-}
-
 bool AppUI::isPointerOverList(float wx, float wy) {
     (void)wx;
     const Layout L = ComputeLayout(winW_, winH_);
     return wy >= L.yList && wy < L.listBottom;
-}
-
-bool AppUI::isPointerOverScrollbar(int mx, int my) {
-    return mx >= scrollbarTrackX && mx < scrollbarTrackX + 12 &&
-           my >= scrollbarTrackY && my < scrollbarTrackY + scrollbarTrackH;
 }
 
 void AppUI::OnKeyDown(unsigned int key, bool repeat) {
@@ -1014,8 +1001,14 @@ void AppUI::syncResultsCache(const bv::ScanOrchestrator::UiSnapshot& st) {
     if (st.resultsReady && !resultsReadySeen_) {
         uiResults_ = orch_.results();
         resultsReadySeen_ = true;
+        scroll_ = 0;
+        rebuildFilteredCache();
     }
     if (!st.resultsReady) resultsReadySeen_ = false;
+}
+
+void AppUI::rebuildFilteredCache() {
+    filteredCache_ = FilteredRows();
 }
 
 std::vector<const bv::FileResult*> AppUI::FilteredRows() const {
@@ -1323,7 +1316,7 @@ void AppUI::DrawResultsList(int yList, int listBottom) {
         return;
     }
 
-    auto rows = FilteredRows();
+    const auto& rows = filteredCache_;
     const int maxScroll = std::max(0, static_cast<int>(rows.size()) - visible);
     scroll_ = std::clamp(scroll_, 0, maxScroll);
 

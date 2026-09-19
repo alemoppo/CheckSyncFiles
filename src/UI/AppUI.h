@@ -47,12 +47,9 @@ private:
     void render(const bv::ScanOrchestrator::UiSnapshot& st);
 
     void OnMouseDown(int mx, int my);
-    void OnMouseMove(int mx, int my);
-    void OnMouseUp();
     void OnKeyDown(unsigned int key, bool repeat);
     void OnTextInput(const char* text);
     bool isPointerOverList(float wx, float wy);
-    bool isPointerOverScrollbar(int mx, int my);
     void startScanFromUi();
     void onLoadSnapshot();
     // Copies the finished results out of the orchestrator once per run, so the
@@ -60,6 +57,10 @@ private:
     void syncResultsCache(const bv::ScanOrchestrator::UiSnapshot& st);
 
     std::vector<const FileResult*> FilteredRows() const;
+    // Rebuilds filteredCache_ from uiResults_ + filter_. Called only when the
+    // results arrive or the filter changes, so per-frame rendering and mouse
+    // handlers never rescan the whole problem list.
+    void rebuildFilteredCache();
     void DrawResultsList(int yList, int listBottom);
     void DrawSummary(int summaryY, uint64_t hashingErrors);
 
@@ -113,6 +114,10 @@ private:
     // Cached copy of the last completed results (updated by syncResultsCache).
     ResultSet uiResults_;
     bool resultsReadySeen_ = false;
+    // Filtered view of uiResults_.problems, rebuilt only by rebuildFilteredCache
+    // (new results or filter change). Render + mouse handlers read this instead
+    // of rescanning problems every frame/event.
+    std::vector<const FileResult*> filteredCache_;
 
     // All business state lives here; the view reads a per-frame snapshot.
     bv::ScanOrchestrator orch_;

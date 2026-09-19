@@ -48,8 +48,16 @@ void HashOneCandidateInto(const ContentCandidate& c, bool offlineSource, FileInd
     const auto inc = [&stats](std::atomic<uint64_t>& x) {
         x.fetch_add(1, std::memory_order_relaxed);
     };
+    // Full path of the side that actually failed the read/hash. When only the
+    // source failed the source path is shown; otherwise (destination failed, or
+    // both failed) the destination path is shown because it is the side being
+    // verified and, in offline mode, the only accessible one.
+    const auto errorRoot = [&](bool srcOk, bool dstOk) -> const std::wstring& {
+        if (!srcOk && dstOk) return sourceRoot;
+        return destRoot;
+    };
     const auto reportReadError = [&](bool denied, bool hasSrc, bool hasDst, const Digest& sd,
-                                     const Digest& dd) {
+                                     const Digest& dd, const std::wstring& root) {
         if (denied) {
             inc(stats.accessDenied);
         } else {
@@ -57,7 +65,7 @@ void HashOneCandidateInto(const ContentCandidate& c, bool offlineSource, FileInd
         }
         FileResult r;
         r.status = denied ? Status::AccessDenied : Status::ReadError;
-        r.fullPath = pathutil::MakeAbsolute(sourceRoot, c.relativePath);
+        r.fullPath = pathutil::MakeAbsolute(root, c.relativePath);
         r.relativePath = c.relativePath;
         r.sizeSource = c.sizeSource;
         r.sizeDest = c.sizeDest;
@@ -123,7 +131,10 @@ void HashOneCandidateInto(const ContentCandidate& c, bool offlineSource, FileInd
         inc(stats.changedDuringScan);
         FileResult r;
         r.status = Status::ChangedDuringScan;
-        r.fullPath = pathutil::MakeAbsolute(destRoot, c.relativePath);
+        // `changed` is set by the source-side stat, `dstChanged` by the
+        // destination-side stat: show the side that actually changed.
+        r.fullPath = pathutil::MakeAbsolute(dstChanged ? destRoot : sourceRoot,
+                                            c.relativePath);
         r.relativePath = c.relativePath;
         r.sizeSource = c.sizeSource;
         r.sizeDest = c.sizeDest;
@@ -142,7 +153,10 @@ void HashOneCandidateInto(const ContentCandidate& c, bool offlineSource, FileInd
             inc(stats.contentMismatch);
             FileResult r;
             r.status = Status::ContentMismatch;
-            r.fullPath = pathutil::MakeAbsolute(sourceRoot, c.relativePath);
+            // Live scan: both sides exist, show the reference (source) side.
+            // Offline: the source device is absent, show the accessible side.
+            r.fullPath = pathutil::MakeAbsolute(offlineSource ? destRoot : sourceRoot,
+                                                c.relativePath);
             r.relativePath = c.relativePath;
             r.sizeSource = c.sizeSource;
             r.sizeDest = c.sizeDest;
@@ -160,7 +174,9 @@ void HashOneCandidateInto(const ContentCandidate& c, bool offlineSource, FileInd
                         dstStatus == hashing::HashStatus::NoAccess;
     if (verdict) *verdict = denied ? profiling::JobVerdict::AccessDenied
                                    : profiling::JobVerdict::ReadError;
-    reportReadError(denied, hasSrc, hasDst, srcDigest, dstDigest);
+    const bool srcOk = (srcStatus == hashing::HashStatus::Ok);
+    const bool dstOk = (dstStatus == hashing::HashStatus::Ok);
+    reportReadError(denied, hasSrc, hasDst, srcDigest, dstDigest, errorRoot(srcOk, dstOk));
 }
 
 } // namespace

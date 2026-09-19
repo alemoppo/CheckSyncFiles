@@ -275,10 +275,11 @@ void ConcurrentComparer::FlushHashCandidates(std::vector<ContentCandidate>& pend
     }
 }
 
-void ConcurrentComparer::onError(const ScanError& err, ConcurrentSink& sink) {
+void ConcurrentComparer::onError(const ScanError& err, ConcurrentSink& sink,
+                                   const std::wstring& root) {
     FileResult r;
     r.isDirectory = true; // errors occur on directories we cannot read
-    r.fullPath = pathutil::MakeAbsolute(sourceRoot_, err.path);
+    r.fullPath = pathutil::MakeAbsolute(root, err.path);
     r.relativePath = err.path;
     r.errorMessage = err.lostDevice
                          ? std::wstring(L"dispositivo scollegato durante l'operazione (riverificare)")
@@ -322,11 +323,11 @@ ConcurrentComparer::WorkerStatus ConcurrentComparer::runEnumWorker(
             runOneStep(side, root, *enumerator, table, sink, candidates, state);
         switch (attempt.result) {
             case EnumAttemptResult::Finished:
-                flushErrors(attempt.errors, sink);
+                flushErrors(attempt.errors, sink, root);
                 table.setSideDone(side);
                 return WorkerStatus::Success;
             case EnumAttemptResult::Cancelled:
-                flushErrors(attempt.errors, sink);
+                flushErrors(attempt.errors, sink, root);
                 table.setSideDone(side);
                 return WorkerStatus::Cancelled;
             case EnumAttemptResult::FailedWithEntries:
@@ -335,7 +336,7 @@ ConcurrentComparer::WorkerStatus ConcurrentComparer::runEnumWorker(
                 // verdicts, so the side is marked failed and nothing is reported
                 // as missing/extra. The attempt is retained (it is the final
                 // outcome), so its errors describe a real, incomplete scan.
-                flushErrors(attempt.errors, sink);
+                flushErrors(attempt.errors, sink, root);
                 notes.push_back(L"backend '" + step.name + L"' su '" + root + L"' (" +
                                 sideName +
                                 L") ha prodotto un albero incompleto; il confronto e "
@@ -356,7 +357,7 @@ ConcurrentComparer::WorkerStatus ConcurrentComparer::runEnumWorker(
                 }
                 // No fallback left: the attempt IS the final outcome, and its
                 // errors are the only explanation for the failure: keep them.
-                flushErrors(attempt.errors, sink);
+                flushErrors(attempt.errors, sink, root);
                 break; // falls through to Failed below
         }
     }
@@ -416,8 +417,9 @@ ConcurrentComparer::EnumAttempt ConcurrentComparer::runOneStep(
     return out;
 }
 
-void ConcurrentComparer::flushErrors(const std::vector<ScanError>& errors, ConcurrentSink& sink) {
-    for (const ScanError& e : errors) onError(e, sink);
+void ConcurrentComparer::flushErrors(const std::vector<ScanError>& errors, ConcurrentSink& sink,
+                                      const std::wstring& root) {
+    for (const ScanError& e : errors) onError(e, sink, root);
 }
 
 void ConcurrentComparer::noteAbandonedErrors(const std::vector<ScanError>& errors,

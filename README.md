@@ -329,7 +329,10 @@ progressione, pulsanti AVVIA / INTERROMPI / SNAPSHOT / ESPORTA CSV / **CARICA SN
 Extra / Dimensione / Contenuto / Errori) con scroll (rotella + scrollbar laterale
 trascinabile col mouse: drag del thumb o click sulla track), il toggle case-sensitive
 e la scelta del **back-end di enumerazione** (Auto / Win32 / MFT). Ogni riga mostra
-il **percorso completo** del file (`FileResult.fullPath`: radice + percorso relativo). Il pulsante SNAPSHOT cattura
+il **percorso completo** del file (`FileResult.fullPath`: radice + percorso relativo;
+Missing → lato sorgente, Extra → lato destinazione, errori → lato che ha fallito).
+Nel confronto offline la sorgente non esiste: le righe lato sorgente mostrano i percorsi
+registrati nello snapshot. Il pulsante SNAPSHOT cattura
 l'indice della sola sorgente in un file binario; ESPORTA CSV salva le voci non identiche
 dell'ultima scansione (dialoghi di salvataggio Windows nativi). CARICA SNAP. apre un
 dialogo di selezione e verifica la **sola destinazione** contro lo snapshot (la sorgente
@@ -404,7 +407,7 @@ src/
     PathUtil.h/.cpp       normalizzazione path, prefisso \\?\, case folding
   Comparison/
     ScanMode.h            Presence / Size / Content
-    ComparisonResult.h    Status, FileResult (con fullPath assoluto), Stats, ResultSet
+    ComparisonResult.h    Status, FileResult (con fullPath: dest per Extra, source per Missing, lato fallito per errori), Stats, ResultSet
     FileComparator.h/.cpp confronto (live e offline, Fase 5)
   Hashing/
     Sha256.cpp            SHA-256 CNG/BCrypt (Fase 3)
