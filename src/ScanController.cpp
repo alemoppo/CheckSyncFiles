@@ -286,6 +286,7 @@ ScanReport ScanController::run(const ScanOptions& options) {
         for (const ScanError& err : build.errors) {
             FileResult r;
             r.status = (err.winError == 5) ? Status::AccessDenied : Status::ReadError;
+            r.fullPath = pathutil::MakeAbsolute(options.source, err.path);
             r.relativePath = err.path;
             r.errorMessage = err.message;
             r.isDirectory = true;

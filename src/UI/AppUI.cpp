@@ -610,11 +610,25 @@ void AppUI::processEvents() {
                 break;
             case SDL_EVENT_MOUSE_MOTION:
                 dirty_ = true; // refresh hover highlights
+                if (scrollbarDragging_) {
+                    const float dy = static_cast<float>(ev.motion.y - scrollbarDragStartY_);
+                    const float trackRange = static_cast<float>(scrollbarTrackH - scrollbarThumbH);
+                    if (trackRange > 0) {
+                        const float newRatio = std::clamp(scrollbarDragRatio_ + dy * (1.0f / trackRange), 0.0f, 1.0f);
+                        const int visibleRows = scrollbarTrackH / kRowH;
+                        const int maxScroll = std::max(0, static_cast<int>(FilteredRows().size()) - visibleRows);
+                        scroll_ = std::clamp(static_cast<int>(newRatio * static_cast<float>(maxScroll)), 0, maxScroll);
+                    }
+                    dirty_ = true;
+                }
                 break;
             case SDL_EVENT_MOUSE_BUTTON_DOWN:
                 if (ev.button.button == SDL_BUTTON_LEFT) {
                     OnMouseDown(static_cast<int>(ev.button.x), static_cast<int>(ev.button.y));
                 }
+                break;
+            case SDL_EVENT_MOUSE_BUTTON_UP:
+                scrollbarDragging_ = false;
                 break;
             case SDL_EVENT_MOUSE_WHEEL:
                 // `mouse_x/mouse_y` are the cursor position; `x/y` are only the
@@ -791,13 +805,66 @@ void AppUI::OnMouseDown(int mx, int my) {
         }
     }
 
+    // Scrollbar click/drag start.
+    const int scrollbarW = 12;
+    scrollbarTrackX = winW_ - kMargin - scrollbarW;
+    if (mx >= scrollbarTrackX && mx < winW_ - kMargin &&
+        my >= L.yList && my < L.listBottom) {
+        const int scrollbarTrackY = L.yList;
+        const int scrollbarTrackH = L.listBottom - L.yList;
+        auto rows = FilteredRows();
+        const int visibleRows = scrollbarTrackH / kRowH;
+        const int maxScroll = std::max(0, static_cast<int>(rows.size()) - visibleRows);
+        scroll_ = std::clamp(scroll_, 0, maxScroll);
+        const float ratio = rows.empty() ? 1.0f
+            : static_cast<float>(visibleRows) / static_cast<float>(rows.size());
+        const int thumbH = std::max(20, static_cast<int>(scrollbarTrackH * ratio));
+        const int trackRange = scrollbarTrackH - thumbH;
+        const float scrollRatio = maxScroll > 0
+            ? static_cast<float>(scroll_) / static_cast<float>(maxScroll)
+            : 0.0f;
+        const int thumbY = scrollbarTrackY + (trackRange > 0
+            ? static_cast<int>(scrollRatio * static_cast<float>(trackRange))
+            : 0);
+
+        if (my >= thumbY && my < thumbY + thumbH) {
+            scrollbarDragging_ = true;
+            scrollbarDragStartY_ = my;
+            scrollbarDragRatio_ = scrollRatio;
+        } else {
+            // Click on track: center the thumb on the click position.
+            const float clickRatio = trackRange > 0
+                ? static_cast<float>(my - scrollbarTrackY - thumbH / 2) /
+                  static_cast<float>(trackRange)
+                : 0.0f;
+            scroll_ = std::clamp(static_cast<int>(clickRatio * static_cast<float>(maxScroll)),
+                                 0, maxScroll);
+        }
+        dirty_.store(true);
+    }
+
     dirty_.store(true);
+}
+
+void AppUI::OnMouseMove(int mx, int my) {
+    (void)mx;
+    (void)my;
+    dirty_.store(true);
+}
+
+void AppUI::OnMouseUp() {
+    scrollbarDragging_ = false;
 }
 
 bool AppUI::isPointerOverList(float wx, float wy) {
     (void)wx;
     const Layout L = ComputeLayout(winW_, winH_);
     return wy >= L.yList && wy < L.listBottom;
+}
+
+bool AppUI::isPointerOverScrollbar(int mx, int my) {
+    return mx >= scrollbarTrackX && mx < scrollbarTrackX + 12 &&
+           my >= scrollbarTrackY && my < scrollbarTrackY + scrollbarTrackH;
 }
 
 void AppUI::OnKeyDown(unsigned int key, bool repeat) {
@@ -1260,10 +1327,25 @@ void AppUI::DrawResultsList(int yList, int listBottom) {
     const int maxScroll = std::max(0, static_cast<int>(rows.size()) - visible);
     scroll_ = std::clamp(scroll_, 0, maxScroll);
 
-    const int cw = winW_ - 2 * kMargin;
+    const int cw = winW_ - 2 * kMargin - 12;
     const int ch = listBottom - listTop;
     const SDL_Rect clip{kMargin, listTop, cw, ch};
     SDL_SetRenderClipRect(renderer_, &clip);
+
+    // Compute scrollbar geometry (row-based ratio, not pixels).
+    scrollbarTrackX = winW_ - kMargin - 12;
+    scrollbarTrackY = listTop;
+    scrollbarTrackH = ch;
+    const float ratio = rows.empty() ? 1.0f
+        : static_cast<float>(visible) / static_cast<float>(rows.size());
+    scrollbarThumbH = std::max(20, static_cast<int>(ch * ratio));
+    const int trackRange = ch - scrollbarThumbH;
+    const float scrollRatio = maxScroll > 0
+        ? static_cast<float>(scroll_) / static_cast<float>(maxScroll)
+        : 0.0f;
+    scrollbarThumbY = scrollbarTrackY + (trackRange > 0
+        ? static_cast<int>(scrollRatio * static_cast<float>(trackRange))
+        : 0);
 
     for (int i = 0; i < visible; ++i) {
         const int idx = scroll_ + i;
@@ -1275,15 +1357,27 @@ void AppUI::DrawResultsList(int yList, int listBottom) {
         }
         DrawTextVCenter(renderer_, fontBody_, ToUtf8(StatusName(p.status)),
                         kMargin + 2, y, kRowH, StatusColor(p.status));
-        std::wstring full = (p.isDirectory ? L"[dir] " : L"") + p.relativePath;
+        std::wstring full = (p.isDirectory ? L"[dir] " : L"") +
+                            (p.fullPath.empty() ? p.relativePath : p.fullPath);
         if (!p.errorMessage.empty()) {
             std::wstring msg = p.errorMessage;
             if (msg.size() > 96) msg = msg.substr(0, 93) + L"...";
             full += L"  (" + msg + L")";
         }
+        if (full.size() > 180) full = full.substr(0, 177) + L"...";
         DrawTextVCenter(renderer_, fontBody_, ToUtf8(full), kMargin + 120, y, kRowH, kTextHi);
     }
+
     SDL_SetRenderClipRect(renderer_, nullptr);
+
+    // Scrollbar track and thumb (drawn outside the list clip so it is visible).
+    FillRect(renderer_, scrollbarTrackX, scrollbarTrackY, 12, ch, kPanel);
+    DrawRect(renderer_, scrollbarTrackX, scrollbarTrackY, 12, ch, kBorder);
+    if (rows.size() > static_cast<size_t>(visible)) {
+        FillRect(renderer_, scrollbarTrackX + 1, scrollbarThumbY, 10, scrollbarThumbH, kAccent);
+    } else {
+        FillRect(renderer_, scrollbarTrackX + 1, scrollbarTrackY + 1, 10, ch - 2, kBorder);
+    }
 }
 
 void AppUI::DrawSummary(int summaryY, uint64_t hashingErrors) {

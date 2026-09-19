@@ -57,6 +57,7 @@ void HashOneCandidateInto(const ContentCandidate& c, bool offlineSource, FileInd
         }
         FileResult r;
         r.status = denied ? Status::AccessDenied : Status::ReadError;
+        r.fullPath = pathutil::MakeAbsolute(sourceRoot, c.relativePath);
         r.relativePath = c.relativePath;
         r.sizeSource = c.sizeSource;
         r.sizeDest = c.sizeDest;
@@ -122,6 +123,7 @@ void HashOneCandidateInto(const ContentCandidate& c, bool offlineSource, FileInd
         inc(stats.changedDuringScan);
         FileResult r;
         r.status = Status::ChangedDuringScan;
+        r.fullPath = pathutil::MakeAbsolute(destRoot, c.relativePath);
         r.relativePath = c.relativePath;
         r.sizeSource = c.sizeSource;
         r.sizeDest = c.sizeDest;
@@ -140,6 +142,7 @@ void HashOneCandidateInto(const ContentCandidate& c, bool offlineSource, FileInd
             inc(stats.contentMismatch);
             FileResult r;
             r.status = Status::ContentMismatch;
+            r.fullPath = pathutil::MakeAbsolute(sourceRoot, c.relativePath);
             r.relativePath = c.relativePath;
             r.sizeSource = c.sizeSource;
             r.sizeDest = c.sizeDest;

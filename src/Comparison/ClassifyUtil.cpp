@@ -1,9 +1,12 @@
 #include "Comparison/ClassifyUtil.h"
 
+#include "Filesystem/PathUtil.h"
+
 namespace bv {
 
 bool ClassifyMatched(const FileEntry& src, const FileEntry& dst, ScanMode mode,
-                     ConcurrentSink& sink, std::vector<ContentCandidate>& candidates) {
+                      ConcurrentSink& sink, std::vector<ContentCandidate>& candidates,
+                      const std::wstring& destRoot) {
     auto& stats = sink.stats();
     const auto inc = [&stats](std::atomic<uint64_t>& c) {
         c.fetch_add(1, std::memory_order_relaxed);
@@ -22,6 +25,7 @@ bool ClassifyMatched(const FileEntry& src, const FileEntry& dst, ScanMode mode,
         inc(stats.sizeMismatch);
         FileResult r;
         r.status = Status::SizeMismatch;
+        r.fullPath = pathutil::MakeAbsolute(destRoot, dst.relativePath);
         r.relativePath = dst.relativePath;
         r.sizeSource = src.size;
         r.sizeDest = dst.size;
@@ -34,6 +38,7 @@ bool ClassifyMatched(const FileEntry& src, const FileEntry& dst, ScanMode mode,
         inc(stats.sizeMismatch);
         FileResult r;
         r.status = Status::SizeMismatch;
+        r.fullPath = pathutil::MakeAbsolute(destRoot, d.relativePath);
         r.relativePath = d.relativePath;
         r.sizeSource = s.size;
         r.sizeDest = d.size;

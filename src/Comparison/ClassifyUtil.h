@@ -31,6 +31,7 @@ struct ContentCandidate {
 // the caller can count/drain pending hash work.
 // Thread-safe: callable from the enumeration workers, which share `sink`.
 bool ClassifyMatched(const FileEntry& src, const FileEntry& dst, ScanMode mode,
-                     ConcurrentSink& sink, std::vector<ContentCandidate>& candidates);
+                      ConcurrentSink& sink, std::vector<ContentCandidate>& candidates,
+                      const std::wstring& destRoot);
 
 } // namespace bv

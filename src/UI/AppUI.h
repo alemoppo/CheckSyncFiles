@@ -47,9 +47,12 @@ private:
     void render(const bv::ScanOrchestrator::UiSnapshot& st);
 
     void OnMouseDown(int mx, int my);
+    void OnMouseMove(int mx, int my);
+    void OnMouseUp();
     void OnKeyDown(unsigned int key, bool repeat);
     void OnTextInput(const char* text);
     bool isPointerOverList(float wx, float wy);
+    bool isPointerOverScrollbar(int mx, int my);
     void startScanFromUi();
     void onLoadSnapshot();
     // Copies the finished results out of the orchestrator once per run, so the
@@ -91,6 +94,16 @@ private:
     // Last live byte count seen during the run (kept across the Hashing phase,
     // which reports candidates but no bytes), used for the live byte-rate.
     uint64_t lastLiveBytes_ = 0;
+
+    // Draggable scrollbar state
+    int scrollbarTrackX = 0;
+    int scrollbarTrackY = 0;
+    int scrollbarTrackH = 0;
+    int scrollbarThumbY = 0;
+    int scrollbarThumbH = 0;
+    bool scrollbarDragging_ = false;
+    int scrollbarDragStartY_ = 0;
+    float scrollbarDragRatio_ = 0.0f;
 
     // Cursor position (in UTF-16 code units) inside the focused path field.
     // Lives here because the field text is stored in the orchestrator; this is

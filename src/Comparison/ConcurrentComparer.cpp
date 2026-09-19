@@ -222,7 +222,8 @@ void ConcurrentComparer::onEntry(int side, FileEntry e, MatchTable& table, Concu
         src = std::move(peer);
         dst = std::move(e);
     }
-    const bool addedCandidate = ClassifyMatched(src, dst, mode_, sink, candidates);
+    const bool addedCandidate = ClassifyMatched(src, dst, mode_, sink, candidates,
+                                                  destRoot_);
     if (addedCandidate) {
         totalCandidates_.fetch_add(1, std::memory_order_relaxed);
         // Once a full batch of same-size pairs has accumulated, push it to the
@@ -277,6 +278,7 @@ void ConcurrentComparer::FlushHashCandidates(std::vector<ContentCandidate>& pend
 void ConcurrentComparer::onError(const ScanError& err, ConcurrentSink& sink) {
     FileResult r;
     r.isDirectory = true; // errors occur on directories we cannot read
+    r.fullPath = pathutil::MakeAbsolute(sourceRoot_, err.path);
     r.relativePath = err.path;
     r.errorMessage = err.lostDevice
                          ? std::wstring(L"dispositivo scollegato durante l'operazione (riverificare)")
@@ -474,6 +476,7 @@ void ConcurrentComparer::finalizeMissingExtra(MatchTable& table, ResultSet& out)
             ++out.stats.missingFiles;
             FileResult r;
             r.status = Status::Missing;
+            r.fullPath = pathutil::MakeAbsolute(sourceRoot_, e.relativePath);
             r.relativePath = e.relativePath;
             r.sizeSource = e.size;
             r.isDirectory = false;
@@ -487,6 +490,7 @@ void ConcurrentComparer::finalizeMissingExtra(MatchTable& table, ResultSet& out)
         if (pathutil::HasDescendant(sourceKeys, it.first)) continue;
         FileResult r;
         r.status = Status::Missing;
+        r.fullPath = pathutil::MakeAbsolute(sourceRoot_, e.relativePath);
         r.relativePath = e.relativePath;
         r.isDirectory = true;
         out.problems.push_back(std::move(r));
@@ -505,6 +509,7 @@ void ConcurrentComparer::finalizeMissingExtra(MatchTable& table, ResultSet& out)
         extraFolded.push_back(pathutil::FoldForCompare(e.relativePath));
         FileResult r;
         r.status = Status::Extra;
+        r.fullPath = pathutil::MakeAbsolute(destRoot_, e.relativePath);
         r.relativePath = e.relativePath;
         r.sizeDest = e.size;
         r.isDirectory = e.isDirectory;

@@ -21,6 +21,7 @@ enum class Status : uint8_t {
 struct FileResult {
     Status status = Status::Identical;
     std::wstring relativePath;
+    std::wstring fullPath;      // percorso assoluto (sourceRoot o destRoot + relativePath)
     uint64_t sizeSource = 0;
     uint64_t sizeDest = 0;
     std::wstring errorMessage; // for ReadError / AccessDenied / ChangedDuringScan

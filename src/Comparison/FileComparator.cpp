@@ -40,6 +40,7 @@ bool FileComparator::run(const std::wstring& destRoot,
             } else {
                 FileResult r;
                 r.status = Status::Extra;
+                r.fullPath = pathutil::MakeAbsolute(destRoot_, e.relativePath);
                 r.relativePath = std::move(e.relativePath);
                 r.sizeDest = e.size;
                 r.isDirectory = e.isDirectory;
@@ -53,9 +54,10 @@ bool FileComparator::run(const std::wstring& destRoot,
             }
             return true;
         },
-        [&](const ScanError& err) {
+         [&](const ScanError& err) {
             FileResult r;
             r.isDirectory = true; // errors occur on directories we cannot read
+            r.fullPath = pathutil::MakeAbsolute(destRoot_, err.path);
             r.relativePath = err.path;
             r.errorMessage = err.message;
             if (err.winError == kWinErrorAccessDenied) {
@@ -113,6 +115,7 @@ void FileComparator::classifyMatched(FileEntry& src, FileEntry& dst, ResultSet& 
         ++out.stats.sizeMismatch;
         FileResult r;
         r.status = Status::SizeMismatch;
+        r.fullPath = pathutil::MakeAbsolute(destRoot_, dst.relativePath);
         r.relativePath = std::move(dst.relativePath);
         r.sizeSource = src.size;
         r.sizeDest = dst.size;
@@ -132,6 +135,7 @@ void FileComparator::classifyMatched(FileEntry& src, FileEntry& dst, ResultSet& 
                 ++out.stats.sizeMismatch;
                 FileResult r;
                 r.status = Status::SizeMismatch;
+                r.fullPath = pathutil::MakeAbsolute(destRoot_, dst.relativePath);
                 r.relativePath = std::move(dst.relativePath);
                 r.sizeSource = src.size;
                 r.sizeDest = dst.size;
@@ -154,6 +158,7 @@ void FileComparator::classifyMatched(FileEntry& src, FileEntry& dst, ResultSet& 
                 ++out.stats.sizeMismatch;
                 FileResult r;
                 r.status = Status::SizeMismatch;
+                r.fullPath = pathutil::MakeAbsolute(destRoot_, dst.relativePath);
                 r.relativePath = dst.relativePath;
                 r.sizeSource = src.size;
                 r.sizeDest = dst.size;
@@ -200,6 +205,7 @@ void FileComparator::recordMissing(ResultSet& out) {
             ++out.stats.missingFiles;
             FileResult r;
             r.status = Status::Missing;
+            r.fullPath = pathutil::MakeAbsolute(sourceRoot_, e.relativePath);
             r.relativePath = e.relativePath;
             r.sizeSource = e.size;
             r.isDirectory = false;
@@ -213,6 +219,7 @@ void FileComparator::recordMissing(ResultSet& out) {
         if (pathutil::HasDescendant(keys, it.key)) continue;
         FileResult r;
         r.status = Status::Missing;
+        r.fullPath = pathutil::MakeAbsolute(sourceRoot_, it.entry->relativePath);
         r.relativePath = it.entry->relativePath;
         r.isDirectory = true;
         out.problems.push_back(std::move(r));
