@@ -329,8 +329,9 @@ progressione, pulsanti AVVIA / INTERROMPI / SNAPSHOT / ESPORTA CSV / **CARICA SN
 Extra / Dimensione / Contenuto / Errori) con scroll (rotella + scrollbar laterale
 trascinabile col mouse: drag del thumb o click sulla track), il toggle case-sensitive
 e la scelta del **back-end di enumerazione** (Auto / Win32 / MFT). Ogni riga mostra
-il **percorso completo** del file (`FileResult.fullPath`: radice + percorso relativo;
-Missing → lato sorgente, Extra → lato destinazione, errori → lato che ha fallito).
+il **percorso completo** del file (`FileResult.fullPath`: radice + percorso relativo,
+con il solo nome file in grassetto; Missing → lato sorgente, Extra → lato destinazione,
+errori → lato fallito se uno solo, altrimenti destinazione come fallback).
 Nel confronto offline la sorgente non esiste: le righe lato sorgente mostrano i percorsi
 registrati nello snapshot. Il pulsante SNAPSHOT cattura
 l'indice della sola sorgente in un file binario; ESPORTA CSV salva le voci non identiche

@@ -48,10 +48,11 @@ void HashOneCandidateInto(const ContentCandidate& c, bool offlineSource, FileInd
     const auto inc = [&stats](std::atomic<uint64_t>& x) {
         x.fetch_add(1, std::memory_order_relaxed);
     };
-    // Full path of the side that actually failed the read/hash. When only the
-    // source failed the source path is shown; otherwise (destination failed, or
-    // both failed) the destination path is shown because it is the side being
-    // verified and, in offline mode, the only accessible one.
+    // Which root to show for a read/hash error: the source root only when the
+    // source side alone failed; in every other case (destination failed alone,
+    // or both sides failed) the destination root. The both-failed case needs a
+    // deterministic fallback, and destination is the side being verified and,
+    // in offline mode, the only accessible one.
     const auto errorRoot = [&](bool srcOk, bool dstOk) -> const std::wstring& {
         if (!srcOk && dstOk) return sourceRoot;
         return destRoot;
@@ -132,7 +133,9 @@ void HashOneCandidateInto(const ContentCandidate& c, bool offlineSource, FileInd
         FileResult r;
         r.status = Status::ChangedDuringScan;
         // `changed` is set by the source-side stat, `dstChanged` by the
-        // destination-side stat: show the side that actually changed.
+        // destination-side stat: show the destination side when it changed,
+        // otherwise the source side. When both changed this deterministically
+        // shows the destination side.
         r.fullPath = pathutil::MakeAbsolute(dstChanged ? destRoot : sourceRoot,
                                             c.relativePath);
         r.relativePath = c.relativePath;

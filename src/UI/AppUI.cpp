@@ -221,6 +221,40 @@ void DrawTextVCenter(SDL_Renderer* ren, TTF_Font* font, const std::string& s,
     SDL_RenderTexture(ren, t, nullptr, &d);
 }
 
+// Draws text like DrawTextVCenter but returns the pixel width, so consecutive
+// segments (e.g. directory prefix + bold file name) can be chained.
+int DrawTextVCenterW(SDL_Renderer* ren, TTF_Font* font, const std::string& s,
+                     int x, int yBox, int boxH, RGBA c) {
+    SDL_Color col{c.r, c.g, c.b, c.a};
+    int tw = 0, th = 0;
+    SDL_Texture* t = TextTextureCached(ren, font, s, col, tw, th);
+    if (!t) return 0;
+    SDL_SetTextureBlendMode(t, SDL_BLENDMODE_BLEND);
+    const int ty = yBox + (boxH - th) / 2;
+    const SDL_FRect d{static_cast<float>(x), static_cast<float>(ty),
+                      static_cast<float>(tw), static_cast<float>(th)};
+    SDL_RenderTexture(ren, t, nullptr, &d);
+    return tw;
+}
+
+// Faux-bold variant of DrawTextVCenterW: same font/size (row metrics
+// unchanged), double strike with a 1px horizontal offset. Returns the width.
+int DrawTextVCenterBold(SDL_Renderer* ren, TTF_Font* font, const std::string& s,
+                        int x, int yBox, int boxH, RGBA c) {
+    SDL_Color col{c.r, c.g, c.b, c.a};
+    int tw = 0, th = 0;
+    SDL_Texture* t = TextTextureCached(ren, font, s, col, tw, th);
+    if (!t) return 0;
+    SDL_SetTextureBlendMode(t, SDL_BLENDMODE_BLEND);
+    const int ty = yBox + (boxH - th) / 2;
+    for (int dx = 0; dx <= 1; ++dx) {
+        const SDL_FRect d{static_cast<float>(x + dx), static_cast<float>(ty),
+                          static_cast<float>(tw), static_cast<float>(th)};
+        SDL_RenderTexture(ren, t, nullptr, &d);
+    }
+    return tw;
+}
+
 // Draws text centred both horizontally and vertically inside a box.
 void DrawTextCenterIn(SDL_Renderer* ren, TTF_Font* font, const std::string& s,
                       int xBox, int yBox, int boxW, int boxH, RGBA c) {
@@ -1350,15 +1384,29 @@ void AppUI::DrawResultsList(int yList, int listBottom) {
         }
         DrawTextVCenter(renderer_, fontBody_, ToUtf8(StatusName(p.status)),
                         kMargin + 2, y, kRowH, StatusColor(p.status));
-        std::wstring full = (p.isDirectory ? L"[dir] " : L"") +
-                            (p.fullPath.empty() ? p.relativePath : p.fullPath);
+        std::wstring head = (p.isDirectory ? L"[dir] " : L"") +
+                              (p.fullPath.empty() ? p.relativePath : p.fullPath);
+        std::wstring tail;
         if (!p.errorMessage.empty()) {
             std::wstring msg = p.errorMessage;
             if (msg.size() > 96) msg = msg.substr(0, 93) + L"...";
-            full += L"  (" + msg + L")";
+            tail = L"  (" + msg + L")";
         }
-        if (full.size() > 180) full = full.substr(0, 177) + L"...";
-        DrawTextVCenter(renderer_, fontBody_, ToUtf8(full), kMargin + 120, y, kRowH, kTextHi);
+        if (head.size() > 180) head = head.substr(0, 177) + L"...";
+        // Bold only the file name (last component with extension), not the path.
+        const size_t sep = head.find_last_of(L"\\/");
+        const std::string dirU8 =
+            ToUtf8(sep == std::wstring::npos ? std::wstring() : head.substr(0, sep + 1));
+        const std::string nameU8 =
+            ToUtf8(sep == std::wstring::npos ? head : head.substr(sep + 1));
+        int tx = kMargin + 120;
+        tx += DrawTextVCenterW(renderer_, fontBody_, dirU8, tx, y, kRowH, kTextHi);
+        if (!nameU8.empty()) {
+            tx += DrawTextVCenterBold(renderer_, fontBody_, nameU8, tx, y, kRowH, kTextHi);
+        }
+        if (!tail.empty()) {
+            DrawTextVCenter(renderer_, fontBody_, ToUtf8(tail), tx, y, kRowH, kTextHi);
+        }
     }
 
     SDL_SetRenderClipRect(renderer_, nullptr);
