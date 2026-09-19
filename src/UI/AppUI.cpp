@@ -3,7 +3,9 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <filesystem>
 #include <string>
+#include <system_error>
 #include <vector>
 
 #ifdef WIN32_LEAN_AND_MEAN
@@ -12,11 +14,13 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <objbase.h>
+#include <shellapi.h>
 #include <shobjidl.h>
 
 #include <SDL3/SDL.h>
 #include <SDL3_ttf/SDL_ttf.h>
 
+#include "Filesystem/PathUtil.h"
 #include "ScanController.h"
 #include "UI/Utf.h"
 
@@ -30,6 +34,11 @@ constexpr int kFieldH = 28;
 constexpr int kGap = 8;
 constexpr int kRowH = 20;
 constexpr int kBrowseW = 76;
+
+// Right-click context menu metrics.
+constexpr int kCtxRowH = 26;
+constexpr int kCtxPadX = 12;
+constexpr int kCtxPadY = 6;
 
 // Geometry for the whole window, shared by render() (drawing) and
 // OnMouseDown() (hit-testing) so the two can never drift apart.
@@ -640,6 +649,7 @@ void AppUI::processEvents() {
             case SDL_EVENT_WINDOW_RESIZED:
                 winW_ = ev.window.data1;
                 winH_ = ev.window.data2;
+                CloseContextMenu();
                 dirty_ = true;
                 break;
             case SDL_EVENT_MOUSE_MOTION:
@@ -657,8 +667,15 @@ void AppUI::processEvents() {
                 }
                 break;
             case SDL_EVENT_MOUSE_BUTTON_DOWN:
-                if (ev.button.button == SDL_BUTTON_LEFT) {
-                    OnMouseDown(static_cast<int>(ev.button.x), static_cast<int>(ev.button.y));
+                if (ev.button.button == SDL_BUTTON_RIGHT) {
+                    OnRightClick(static_cast<int>(ev.button.x), static_cast<int>(ev.button.y));
+                } else if (ev.button.button == SDL_BUTTON_LEFT) {
+                    if (ctxOpen_) {
+                        OnContextMenuClick(static_cast<int>(ev.button.x),
+                                           static_cast<int>(ev.button.y));
+                    } else {
+                        OnMouseDown(static_cast<int>(ev.button.x), static_cast<int>(ev.button.y));
+                    }
                 }
                 break;
             case SDL_EVENT_MOUSE_BUTTON_UP:
@@ -835,6 +852,7 @@ void AppUI::OnMouseDown(int mx, int my) {
         if (hit(mx, my, r)) {
             filter_ = static_cast<uint8_t>(i);
             scroll_ = 0;
+            CloseContextMenu();
             rebuildFilteredCache();
             dirty_.store(true);
         }
@@ -882,6 +900,119 @@ void AppUI::OnMouseDown(int mx, int my) {
     dirty_.store(true);
 }
 
+void AppUI::OnRightClick(int mx, int my) {
+    CloseContextMenu();
+    const Layout L = ComputeLayout(winW_, winH_);
+    // Same list area as DrawResultsList, excluding the scrollbar strip.
+    constexpr int scrollbarW = 12;
+    const int listRight = winW_ - kMargin - scrollbarW;
+    if (mx < kMargin || mx >= listRight || my < L.yList || my >= L.listBottom) {
+        dirty_ = true;
+        return;
+    }
+    if (filter_ == kFilterIdentical || filteredCache_.empty()) {
+        dirty_ = true;
+        return;
+    }
+    const int areaH = L.listBottom - L.yList;
+    const int visible = areaH / kRowH;
+    if (visible <= 0) {
+        dirty_ = true;
+        return;
+    }
+    const int maxScroll = std::max(0, static_cast<int>(filteredCache_.size()) - visible);
+    const int idx = std::clamp(scroll_, 0, maxScroll) + (my - L.yList) / kRowH;
+    if (idx < 0 || idx >= static_cast<int>(filteredCache_.size())) {
+        dirty_ = true;
+        return;
+    }
+    const FileResult& p = *filteredCache_[idx];
+    if (p.relativePath.empty()) {
+        dirty_ = true; // root-level error row: nothing to select in Explorer
+        return;
+    }
+
+    // One item per side whose path exists right now; a missing side simply
+    // contributes no item (e.g. Missing shows only A, Extra only B).
+    const auto existsSide = [](const std::wstring& root, const std::wstring& rel,
+                               std::wstring& out) {
+        if (root.empty()) return false;
+        out = pathutil::MakeAbsolute(pathutil::NormalizeRoot(root), rel);
+        std::error_code ec;
+        return std::filesystem::exists(out, ec) && !ec;
+    };
+    std::wstring cand;
+    if (existsSide(resultsSourceRoot_, p.relativePath, cand)) {
+        ctxItems_.push_back({"Apri A in Esplora risorse", cand});
+    }
+    if (existsSide(resultsDestRoot_, p.relativePath, cand)) {
+        ctxItems_.push_back({"Apri B in Esplora risorse", cand});
+    }
+    if (ctxItems_.empty()) {
+        dirty_ = true;
+        return;
+    }
+
+    // Size the menu from the longest label, then clamp it inside the window.
+    int maxTw = 0;
+    const SDL_Color col{kTextHi.r, kTextHi.g, kTextHi.b, kTextHi.a};
+    for (const auto& it : ctxItems_) {
+        int tw = 0, th = 0;
+        if (TextTextureCached(renderer_, fontBody_, it.labelUtf8, col, tw, th)) {
+            maxTw = std::max(maxTw, tw);
+        }
+    }
+    ctxW_ = maxTw + 2 * kCtxPadX;
+    ctxH_ = static_cast<int>(ctxItems_.size()) * kCtxRowH + 2 * kCtxPadY;
+    ctxX_ = std::clamp(mx, 4, std::max(4, winW_ - ctxW_ - 4));
+    ctxY_ = std::clamp(my, 4, std::max(4, winH_ - ctxH_ - 4));
+    ctxOpen_ = true;
+    dirty_ = true;
+}
+
+void AppUI::OnContextMenuClick(int mx, int my) {
+    size_t hitIdx = ctxItems_.size();
+    for (size_t i = 0; i < ctxItems_.size(); ++i) {
+        const int iy = ctxY_ + kCtxPadY + static_cast<int>(i) * kCtxRowH;
+        if (mx >= ctxX_ && mx < ctxX_ + ctxW_ && my >= iy && my < iy + kCtxRowH) {
+            hitIdx = i;
+            break;
+        }
+    }
+    std::wstring target;
+    if (hitIdx < ctxItems_.size()) target = ctxItems_[hitIdx].targetPath;
+    CloseContextMenu();
+    if (!target.empty()) {
+        // Re-check: the file may have vanished between menu and click.
+        std::error_code ec;
+        if (std::filesystem::exists(target, ec) && !ec) OpenInExplorer(target);
+    }
+    dirty_ = true;
+}
+
+void AppUI::DrawContextMenu() {
+    if (!ctxOpen_ || ctxItems_.empty()) return;
+    float fmx = 0.0f, fmy = 0.0f;
+    SDL_GetMouseState(&fmx, &fmy);
+    FillRect(renderer_, ctxX_, ctxY_, ctxW_, ctxH_, kField);
+    DrawRect(renderer_, ctxX_, ctxY_, ctxW_, ctxH_, kBorder);
+    for (size_t i = 0; i < ctxItems_.size(); ++i) {
+        const int iy = ctxY_ + kCtxPadY + static_cast<int>(i) * kCtxRowH;
+        const bool hover = fmx >= ctxX_ && fmx < ctxX_ + ctxW_ &&
+                           fmy >= iy && fmy < iy + kCtxRowH;
+        if (hover) FillRect(renderer_, ctxX_ + 1, iy, ctxW_ - 2, kCtxRowH, kAccent);
+        DrawTextVCenter(renderer_, fontBody_, ctxItems_[i].labelUtf8,
+                        ctxX_ + kCtxPadX, iy, kCtxRowH, kTextHi);
+    }
+}
+
+void AppUI::OpenInExplorer(const std::wstring& path) {
+    // /select opens the containing folder with the item highlighted; for a
+    // directory row this selects the directory inside its parent.
+    const std::wstring params = L"/select,\"" + path + L"\"";
+    ShellExecuteW(nullptr, L"open", L"explorer.exe", params.c_str(), nullptr, SW_SHOWNORMAL);
+}
+
 bool AppUI::isPointerOverList(float wx, float wy) {
     (void)wx;
     const Layout L = ComputeLayout(winW_, winH_);
@@ -898,6 +1029,11 @@ void AppUI::OnKeyDown(unsigned int key, bool repeat) {
         return;
     }
     if (key == SDLK_ESCAPE) {
+        if (ctxOpen_) {
+            CloseContextMenu();
+            dirty_.store(true);
+            return;
+        }
         if (inField) {
             orch_.setSourceFocus(false);
             orch_.setDestFocus(false);
@@ -1034,8 +1170,11 @@ void AppUI::onLoadSnapshot() {
 void AppUI::syncResultsCache(const bv::ScanOrchestrator::UiSnapshot& st) {
     if (st.resultsReady && !resultsReadySeen_) {
         uiResults_ = orch_.results();
+        resultsSourceRoot_ = st.source;
+        resultsDestRoot_ = st.dest;
         resultsReadySeen_ = true;
         scroll_ = 0;
+        CloseContextMenu();
         rebuildFilteredCache();
     }
     if (!st.resultsReady) resultsReadySeen_ = false;
@@ -1330,6 +1469,7 @@ void AppUI::render(const bv::ScanOrchestrator::UiSnapshot& st) {
     // ---- Results list ----
     DrawResultsList(L.yList, L.listBottom);
     DrawSummary(L.summaryY, st.hashingErrors);
+    DrawContextMenu();
 
     SDL_RenderPresent(renderer_);
     dirty_.store(false);

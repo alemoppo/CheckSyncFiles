@@ -332,6 +332,9 @@ e la scelta del **back-end di enumerazione** (Auto / Win32 / MFT). Ogni riga mos
 il **percorso completo** del file (`FileResult.fullPath`: radice + percorso relativo,
 con il solo nome file in grassetto; Missing → lato sorgente, Extra → lato destinazione,
 errori → lato fallito se uno solo, altrimenti destinazione come fallback).
+Con click destro su una riga si apre un menu con "Apri A in Esplora risorse" e/o
+"Apri B in Esplora risorse" (A = sorgente, B = destinazione; compare solo la voce
+il cui percorso esiste), che apre la cartella del file selezionandolo in Explorer.
 Nel confronto offline la sorgente non esiste: le righe lato sorgente mostrano i percorsi
 registrati nello snapshot. Il pulsante SNAPSHOT cattura
 l'indice della sola sorgente in un file binario; ESPORTA CSV salva le voci non identiche

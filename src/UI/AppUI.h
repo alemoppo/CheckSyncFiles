@@ -47,6 +47,17 @@ private:
     void render(const bv::ScanOrchestrator::UiSnapshot& st);
 
     void OnMouseDown(int mx, int my);
+    void OnRightClick(int mx, int my);
+    // Left-click while the context menu is open: activates the hit item or
+    // dismisses the menu. Always consumes the click.
+    void OnContextMenuClick(int mx, int my);
+    void DrawContextMenu();
+    // Opens Explorer on the folder containing `path`, with `path` selected.
+    static void OpenInExplorer(const std::wstring& path);
+    void CloseContextMenu() {
+        ctxOpen_ = false;
+        ctxItems_.clear();
+    }
     void OnKeyDown(unsigned int key, bool repeat);
     void OnTextInput(const char* text);
     bool isPointerOverList(float wx, float wy);
@@ -114,6 +125,22 @@ private:
     // Cached copy of the last completed results (updated by syncResultsCache).
     ResultSet uiResults_;
     bool resultsReadySeen_ = false;
+    // A/B roots used by the currently displayed results, captured when the
+    // results arrive so the context-menu targets never follow later field
+    // edits. A = source field, B = destination field.
+    std::wstring resultsSourceRoot_;
+    std::wstring resultsDestRoot_;
+
+    // Right-click context menu over a result row ("Apri A/B in Esplora
+    // risorse"). Only the items whose side path exists are shown, so the
+    // menu stores resolved target paths, never row indices.
+    struct CtxMenuItem {
+        std::string labelUtf8;
+        std::wstring targetPath;
+    };
+    bool ctxOpen_ = false;
+    int ctxX_ = 0, ctxY_ = 0, ctxW_ = 0, ctxH_ = 0;
+    std::vector<CtxMenuItem> ctxItems_;
     // Filtered view of uiResults_.problems, rebuilt only by rebuildFilteredCache
     // (new results or filter change). Render + mouse handlers read this instead
     // of rescanning problems every frame/event.
