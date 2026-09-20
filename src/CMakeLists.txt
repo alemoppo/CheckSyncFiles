@@ -14,6 +14,7 @@ add_library(bv_core STATIC
   Hashing/HashCache.cpp
   Hashing/HashUtil.cpp
   Hashing/Sha256.cpp
+  Profiling/DirTiming.cpp
   Profiling/HashProfile.cpp
   ScanController.cpp
   ScanOrchestrator.cpp

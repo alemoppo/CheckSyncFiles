@@ -45,6 +45,7 @@
 #include "Hashing/HashCache.h"
 #include "Hashing/Sha256.h"
 #include "Hashing/HashUtil.h"
+#include "Profiling/DirTiming.h"
 #include "Profiling/HashProfile.h"
 #include "ScanController.h"
 #include "ScanOrchestrator.h"
@@ -5220,6 +5221,164 @@ TEST("mft: lastWriteTime falls back to $FILE_NAME without $STANDARD_INFORMATION"
     CHECK_EQ(result.mtime, fnMtime);
     CHECK_EQ(result.standardMtime, 0ull); // no SI attribute
     CHECK_EQ(result.lastWriteTime, fnMtime); // fallback to $FILE_NAME
+});
+
+// ---------------------------------------------------------------------------
+// Slowest directories (Profiling/DirTiming): exact list top-N, Space-Saving
+// hash aggregation, live/offline/report integration, JSON section.
+
+TEST("dirtiming: DirTopN keeps the exact top-N within its bound", [] {
+    profiling::DirTopN top(5);
+    for (int i = 0; i < 50; ++i) {
+        top.add(L"dir" + std::to_wstring(i), static_cast<double>(i));
+    }
+    const auto v = top.sorted();
+    CHECK_EQ(v.size(), 5ull);
+    // Exact descending order of the five largest values.
+    for (size_t k = 0; k < v.size(); ++k) {
+        CHECK_EQ(v[k].seconds, static_cast<double>(49 - k));
+    }
+    CHECK(!top.empty());
+    profiling::DirTopN none(5);
+    CHECK(none.empty());
+});
+
+TEST("dirtiming: DirParent extracts the containing directory", [] {
+    CHECK(profiling::DirParent(L"C:\\a\\b.txt") == L"C:\\a");
+    CHECK(profiling::DirParent(L"C:\\a\\sub\\") == L"C:\\a\\sub");
+    CHECK(profiling::DirParent(L"nodir") == L"");
+});
+
+TEST("dirtiming: hash aggregation reaches top-N through many small files", [] {
+    // The core Space-Saving case: no single contribution of "agg" (1.0 each)
+    // ever beats the standing values, yet the directory's SUM (20.0) must
+    // still win the top. A per-file admission threshold would lose it.
+    profiling::DirHashTop top(/*displayN=*/3, /*counters=*/8);
+    for (int i = 0; i < 8; ++i) {
+        top.add(profiling::Side::Source, L"big" + std::to_wstring(i), 5.0); // full
+    }
+    for (int i = 0; i < 20; ++i) {
+        top.add(profiling::Side::Source, L"agg", 1.0); // 20 x 1.0 = 20.0 total
+    }
+    top.add(profiling::Side::Source, L"solo", 10.0);
+    const auto v = top.top(0);
+    CHECK_EQ(v.size(), 3ull);
+    CHECK_MSG(v[0].dir == L"agg", "summed directory must head the top");
+    CHECK(v[0].seconds == 25.0); // 5.0 carried error + 20 x 1.0
+    CHECK(v[1].dir == L"solo");
+    CHECK(v[1].seconds == 15.0); // 5.0 carried error + 10.0
+    CHECK(top.tracked(0) <= 8ull);
+});
+
+TEST("dirtiming: hash top stays bounded with many distinct directories", [] {
+    profiling::DirHashTop top(/*displayN=*/3, /*counters=*/8);
+    for (int i = 0; i < 500; ++i) {
+        top.add(profiling::Side::Dest, L"d" + std::to_wstring(i), 1.0 + (i % 7));
+    }
+    CHECK(top.top(1).size() <= 3ull);
+    CHECK_MSG(top.tracked(1) <= 8ull, "live counters must never exceed the budget");
+    CHECK(top.empty(0)); // side A untouched
+});
+
+TEST("dirtiming: live content scan times both sides (Win32)", [] {
+    const auto dir = MakeTempDir();
+    const std::wstring src = dir + L"\\src";
+    const std::wstring dst = dir + L"\\dst";
+    fs::create_directories(src + L"\\sub");
+    CHECK(WriteFileBytes(src + L"\\sub\\a.txt", "hello world, hello", 18));
+    CHECK(WriteFileBytes(src + L"\\sub\\b.txt", "second file here!", 17));
+    fs::copy(src, dst, fs::copy_options::recursive);
+
+    ScanOptions opts;
+    opts.source = src;
+    opts.destination = dst;
+    opts.mode = ScanMode::Content;
+    opts.hashThreads = 2;
+    opts.backend = EnumeratorBackend::Win32; // deterministic: no MFT walk column
+    const ScanReport r = ScanController(false).run(opts);
+    CHECK(r.sourceOk && r.destinationOk);
+    CHECK_EQ(r.results.stats.identicalFiles, 2ull);
+    CHECK(!r.dirTiming.listA.empty());
+    CHECK(!r.dirTiming.listB.empty());
+    CHECK(r.dirTiming.walkA.empty() && r.dirTiming.walkB.empty());
+    CHECK(!r.dirTiming.hashA.empty());
+    CHECK(!r.dirTiming.hashB.empty());
+});
+
+TEST("dirtiming: offline compare leaves side A untimed", [] {
+    const auto dir = MakeTempDir();
+    const std::wstring src = dir + L"\\src";
+    const std::wstring dst = dir + L"\\dst";
+    fs::create_directories(src + L"\\sub");
+    CHECK(WriteFileBytes(src + L"\\sub\\a.txt", "hello world, hello", 18));
+    fs::copy(src, dst, fs::copy_options::recursive);
+
+    ScanOptions cap;
+    cap.source = src;
+    cap.destination = src;
+    cap.mode = ScanMode::Content;
+    cap.hashThreads = 2;
+    cap.backend = EnumeratorBackend::Win32;
+    cap.snapshotOut = dir + L"\\src.bin";
+    CHECK(ScanController(false).run(cap).snapshotWritten);
+
+    ScanOptions off;
+    off.destination = dst;
+    off.mode = ScanMode::Content;
+    off.hashThreads = 2;
+    off.backend = EnumeratorBackend::Win32;
+    off.compareFrom = dir + L"\\src.bin";
+    const ScanReport r = ScanController(false).run(off);
+    CHECK(r.usedSnapshot);
+    // The A side comes from the index, not the filesystem: no timings.
+    CHECK(r.dirTiming.listA.empty());
+    CHECK(r.dirTiming.walkA.empty());
+    CHECK(r.dirTiming.hashA.empty());
+    CHECK(!r.dirTiming.listB.empty());
+    CHECK(!r.dirTiming.hashB.empty()); // destination files really hashed
+});
+
+TEST("dirtiming: snapshot capture times side A (enumeration + hashing)", [] {
+    const auto dir = MakeTempDir();
+    const std::wstring src = dir + L"\\src";
+    fs::create_directories(src + L"\\sub");
+    CHECK(WriteFileBytes(src + L"\\sub\\a.txt", "hello world, hello", 18));
+
+    ScanOptions cap;
+    cap.source = src;
+    cap.destination = src;
+    cap.mode = ScanMode::Content;
+    cap.hashThreads = 2;
+    cap.backend = EnumeratorBackend::Win32;
+    cap.snapshotOut = dir + L"\\src.bin";
+    const ScanReport r = ScanController(false).run(cap);
+    CHECK(r.snapshotWritten);
+    CHECK(!r.dirTiming.listA.empty()); // source tree really enumerated
+    CHECK(!r.dirTiming.hashA.empty()); // digests really computed for capture
+});
+
+TEST("dirtiming: json export carries the slowest_dirs section", [] {
+    ResultSet r;
+    {
+        FileResult p;
+        p.status = Status::Extra;
+        p.relativePath = L"new.bin";
+        r.problems.push_back(p);
+    }
+    profiling::DirTimingReport t;
+    t.listB.push_back({L"sub", 0.012});
+    t.hashB.push_back({L"sub", 0.34});
+
+    const std::wstring file = MakeTempDir() + L"\\slow.json";
+    std::wstring err;
+    CHECK(exporting::WriteJson(file, r, t, 7, err));
+    const std::string bytes = ReadFileBytes(file);
+    CHECK(bytes.find("\"problems\":[") != std::string::npos);
+    CHECK(bytes.find("\"slowest_dirs\":{") != std::string::npos);
+    CHECK(bytes.find("\"list_b\":[{\"dir\":\"sub\"") != std::string::npos);
+    CHECK(bytes.find("\"hash_b\":[{\"dir\":\"sub\"") != std::string::npos);
+    CHECK(bytes.find("\"hash_cache_hits\":7") != std::string::npos);
+    CHECK(bytes.find("\"status\":\"EXTRA\"") != std::string::npos);
 });
 
 // ---------------------------------------------------------------------------

@@ -7,6 +7,7 @@
 
 #include "Hashing/HashCache.h"
 #include "Hashing/Sha256.h"
+#include "Profiling/DirTiming.h"
 #include "Profiling/HashProfile.h"
 
 namespace bv {
@@ -30,12 +31,18 @@ using Digest = std::array<uint8_t, 32>;
 // profiler the Sha256File call is wrapped in FileBegin/FileEnd so the run can
 // collect per-side timing / concurrency / overlap statistics. Passing a null
 // session (the default) adds no overhead.
+// `dirHash` (optional) attributes this file's FileTimings.totalTicks to its
+// parent directory in the slowest-directories hash column. `side` selects the
+// run side exactly (Side::Source = tree A, Side::Dest = tree B: the side of
+// the FILE hashed here, in every flow). A cache hit returns before any
+// hashing, so it contributes nothing; only real read+hash work is recorded.
 void HashOneSide(const std::wstring& absPath, uint64_t expectedSize, uint64_t expectedMtime,
                  bool& changed, HashStatus& status, Digest& digest, bool valid,
                  HashCache* cache, std::atomic<size_t>& cacheHits,
                  profiling::HashSession* session = nullptr,
                  profiling::Side side = profiling::Side::Source,
-                 const std::atomic_bool* cancel = nullptr);
+                 const std::atomic_bool* cancel = nullptr,
+                 profiling::DirHashTop* dirHash = nullptr);
 
 } // namespace hashing
 } // namespace bv

@@ -78,14 +78,18 @@ public:
     // Win32 fallback only when the MFT fails before emitting any entry).
     // `fromIndex` is required when sourceKind == FromIndex and ignored otherwise.
     // `profiler` (optional) collects content-hash timing/concurrency metrics.
+    // `dirTiming` (optional) collects slowest-directories tops: per-side
+    // listing sinks for the enumerators plus the shared hash-time sink.
+    // Owned by the caller (ScanController); must outlive run().
     ConcurrentComparer(bool caseSensitive, ScanMode mode, bool acceptMft,
                        std::wstring sourceRoot, std::wstring destRoot, SourceKind sourceKind,
                        FileIndex* fromIndex, const std::atomic_bool* cancel = nullptr,
-                       profiling::HashProfiler* profiler = nullptr)
+                       profiling::HashProfiler* profiler = nullptr,
+                       profiling::RunDirTiming* dirTiming = nullptr)
         : caseSensitive_(caseSensitive), mode_(mode), acceptMft_(acceptMft),
           sourceRoot_(std::move(sourceRoot)), destRoot_(std::move(destRoot)),
           sourceKind_(sourceKind), fromIndex_(fromIndex), cancel_(cancel),
-          profile_(profiler) {}
+          profile_(profiler), dirTiming_(dirTiming) {}
 
     // Real-world entry: builds the per-side enumerator plan from `acceptMft`.
     Result run(ThreadPool& hashPool, const ProgressCallback& onProgress = {},
@@ -209,6 +213,7 @@ private:
     // can emit hash progress from different threads.
     std::mutex hashProgressMutex_;
     profiling::HashProfiler* profile_ = nullptr; // optional content-hash profiler
+    profiling::RunDirTiming* dirTiming_ = nullptr; // optional slowest-dirs sinks
     // Cached copy of (profile_ != null && profile_->enabled()) taken once in
     // runImpl, so the per-entry emit timing adds a single branch when profiling
     // is off and never calls QpcNow in a normal scan.

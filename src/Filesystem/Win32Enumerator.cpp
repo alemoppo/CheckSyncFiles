@@ -61,9 +61,20 @@ bool Win32Enumerator::enumerate(const std::wstring& root,
         Frame f = stack.back();
         stack.pop_back();
 
+        // Slowest-directories timing: only the FindFirst/FindNext syscalls are
+        // measured, never the entry callbacks (downstream consumers may block
+        // on hash-pool backpressure in Content mode; that cost belongs to the
+        // hash column, not to the listing). Accumulated per directory and
+        // reported once when its listing completes.
+        const bool timeDirs = dirSink_ != nullptr;
+        const auto clk = [&]() -> uint64_t { return timeDirs ? profiling::QpcNow() : 0; };
+        uint64_t listTicks = 0;
+
         const std::wstring pattern = pathutil::AddLongPathPrefix(f.abs + L"\\*");
         WIN32_FIND_DATAW fd;
+        uint64_t t = clk();
         HANDLE h = FindFirstFileW(pattern.c_str(), &fd);
+        listTicks += clk() - t;
         if (h == INVALID_HANDLE_VALUE) {
             const DWORD err = GetLastError();
             // ERROR_FILE_NOT_FOUND means an empty directory: not an error.
@@ -88,7 +99,17 @@ bool Win32Enumerator::enumerate(const std::wstring& root,
         }
 
         bool abort = false;
-        do {
+        // The first entry is already in `fd` (from FindFirstFileW); every
+        // further entry comes from FindNextFileW at the top of the loop, so a
+        // `continue` (e.g. for "." / "..") always advances to the next entry.
+        bool first = true;
+        for (;;) {
+            if (!first) {
+                t = clk();
+                if (!FindNextFileW(h, &fd)) break;
+                listTicks += clk() - t;
+            }
+            first = false;
             if (cancel && cancel->load(std::memory_order_relaxed)) {
                 abort = true;
                 break;
@@ -130,11 +151,19 @@ bool Win32Enumerator::enumerate(const std::wstring& root,
             if (isDir && !isReparse) {
                 stack.push_back({f.abs + L"\\" + name, childRel});
             }
-        } while (FindNextFileW(h, &fd));
+        }
 
         const DWORD loopErr = GetLastError();
         FindClose(h);
         if (abort) return true; // early stop requested by the consumer
+        if (timeDirs) {
+            // Scan-root-relative directory key (the walk root itself is "").
+            const std::wstring rel =
+                dirPrefix_.empty() ? f.rel
+                                   : (f.rel.empty() ? dirPrefix_
+                                                    : pathutil::JoinRel(dirPrefix_, f.rel));
+            dirSink_->list.add(rel, profiling::QpcToSeconds(listTicks));
+        }
 
         if (loopErr != ERROR_NO_MORE_FILES && loopErr != 0) {
             if (IsDeviceDisconnectError(loopErr)) {

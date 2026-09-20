@@ -252,9 +252,25 @@ Una voce completa occupa quindi `38 + len + (hasHash ? 32 : 0)` byte.
 dall'estensione (`.json` = JSON, altrimenti CSV) o forzato con `--export-format`.
 CSV: UTF-8 con BOM (Excel), colonne `status,path,size_source,size_destination,hash_source,
 hash_destination`, escaping RFC 4180 (virgola/quote/a-capo nei nomi). JSON: array in
-streaming (una voce per volta, memoria limitata), escaping RFC 8259, senza BOM.
+streaming (una voce per volta, memoria limitata), escaping RFC 8259, senza BOM; con
+l'export JSON è inclusa anche la sezione `slowest_dirs` (vedi sotto).
 Token di stato in italiano: `IDENTICO, MANCANTE, EXTRA, DIM_DIVERSA, CONTENUTO_DIVERSO,
 ERRORE_LETTURA, ACCESSO_NEGATO, MODIFICATO_DURANTE_SCAN`.
+
+### Directory più lente (top-N)
+
+A fine scansione la CLI stampa le directory che hanno richiesto più tempo, top 15 per
+colonna e per lato (A = sorgente, B = destinazione), senza mai sommare colonne diverse:
+- `listato`: tempo delle syscall FindFirst/FindNext per directory (backend Win32);
+- `walk`: tempo di resolve $I30 + walk-step per directory (backend MFT; **non** è un
+  listato puro, da cui il nome diverso);
+- `hash` (solo modalità Contenuto): somma dei `FileTimings.totalTicks` dei file
+  effettivamente letti+hashati sotto ogni directory padre. Gli hit della hash cache
+  costano ~zero e sono riportati come conteggio globale `hash cache hits (totale run)`,
+  non per-directory.
+In offline il lato A proviene dallo snapshot (non dal filesystem) e resta senza timing.
+La stessa sezione è esportata in JSON come `slowest_dirs` (`list_a/walk_a/list_b/walk_b/
+hash_a/hash_b` + `hash_cache_hits`); l'export CSV resta invariato.
 
 ### Cache hash persistente
 

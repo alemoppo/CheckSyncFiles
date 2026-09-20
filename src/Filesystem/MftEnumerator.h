@@ -49,6 +49,13 @@ public:
                    const ErrorCallback& onError,
                    const ProgressCallback& onProgress = {},
                    const std::atomic_bool* cancel = nullptr) override;
+    // Slowest-directories sink: MFT records `walkSeconds` (see DirTiming.h).
+    // Always scan-root-relative, so `relPrefix` is ignored here.
+    void setDirListSink(profiling::DirListSink* sink,
+                        const std::wstring& relPrefix = std::wstring()) override {
+        (void)relPrefix;
+        dirSink_ = sink;
+    }
 
     // Outcome of ParseRecordForTest: the fields that production logic consumes from
     // a parsed MFT record's $DATA / $FILE_NAME attributes, exposed so the ADS-size
@@ -165,7 +172,8 @@ public:
         const std::wstring& absDir, const std::wstring& relPrefix,
         uint64_t& outFiles, uint64_t& outDirs, uint64_t& outBytes,
         const EntryCallback& onEntry, const ErrorCallback& onError,
-        const ProgressCallback& onProgress, const std::atomic_bool* cancel);
+        const ProgressCallback& onProgress, const std::atomic_bool* cancel,
+        profiling::DirListSink* dirSink = nullptr);
 
     // Outcome of WalkDirectoryStepForTest: mirrors the MFT walk's per-directory
     // decision, including whether the Win32 fallback was triggered.
@@ -200,6 +208,11 @@ public:
         const ProgressCallback& onProgress, const std::atomic_bool* cancel,
         size_t* outDiagFallbackDirs = nullptr, uint32_t clusterSize = 4096,
         uint32_t bytesPerSector = 512, bool* outDiagIncomplete = nullptr);
+
+private:
+    // Optional slowest-directories sink (null = timing off). Set via
+    // setDirListSink before enumerate(); read by the walk loop below.
+    profiling::DirListSink* dirSink_ = nullptr;
 };
 
 } // namespace bv

@@ -1013,7 +1013,7 @@ MftEnumerator::SubtreeStatus MftEnumerator::EnumerateWin32Subtree(
     const std::wstring& absDir, const std::wstring& relPrefix, uint64_t& outFiles,
     uint64_t& outDirs, uint64_t& outBytes, const EntryCallback& onEntry,
     const ErrorCallback& onError, const ProgressCallback& onProgress,
-    const std::atomic_bool* cancel) {
+    const std::atomic_bool* cancel, profiling::DirListSink* dirSink) {
     outFiles = 0;
     outDirs = 0;
     outBytes = 0;
@@ -1061,6 +1061,9 @@ MftEnumerator::SubtreeStatus MftEnumerator::EnumerateWin32Subtree(
     };
 
     Win32Enumerator win32;
+    // The fallback subtree reports `listSeconds` through the same sink with
+    // scan-root-relative keys (relPrefix = this directory).
+    win32.setDirListSink(dirSink, relPrefix);
     const bool ok = win32.enumerate(absDir, subEntry, subError, subProgress, cancel);
     if (consumerAbort) return SubtreeStatus::Aborted;
     if (!ok) return lostDevice ? SubtreeStatus::DeviceLost : SubtreeStatus::Unreadable;
@@ -1117,7 +1120,8 @@ DirStepOutcome WalkDirectoryStep(
     const IFileEnumerator::ProgressCallback& onProgress,
     const std::atomic_bool* cancel, uint64_t& files, uint64_t& dirs, uint64_t& bytes,
     size_t& diagIndexBlocks, size_t& diagIndexChildren, size_t& diagWin32FallbackDirs,
-    std::vector<std::pair<uint64_t, ChildEntry>>& kids, bool& incomplete) {
+    std::vector<std::pair<uint64_t, ChildEntry>>& kids, bool& incomplete,
+    profiling::DirListSink* dirSink = nullptr) {
     RecInfo& d = recs[dirRec];
 
     // Resolve the directory's full $I30 (root entries + allocation leaf
@@ -1229,7 +1233,8 @@ DirStepOutcome WalkDirectoryStep(
             if (onProgress) onProgress(baseFiles + f, baseDirs + d, baseBytes + b, p);
         };
         const MftEnumerator::SubtreeStatus st = MftEnumerator::EnumerateWin32Subtree(
-            absDir, dirRel, fbFiles, fbDirs, fbBytes, onEntry, onError, fbProgress, cancel);
+            absDir, dirRel, fbFiles, fbDirs, fbBytes, onEntry, onError, fbProgress, cancel,
+            dirSink);
         files += fbFiles;
         dirs += fbDirs;
         bytes += fbBytes;
@@ -1583,10 +1588,16 @@ const uint64_t segSize = vd.BytesPerFileRecordSegment;
 
         std::vector<std::pair<uint64_t, ChildEntry>> kids;
         const uint64_t walkT0 = prof ? MftNow() : 0;
+        // Slowest-directories timing, independent of the diagnostic profiler:
+        // only the $I30 resolve phase is measured here. The child emit loop
+        // below (consumer callbacks) is excluded, exactly like the Win32 hook
+        // excludes entry callbacks.
+        const uint64_t dirT0 = dirSink_ ? MftNow() : 0;
         const DirStepOutcome step = WalkDirectoryStep(
             recs, nRecords, revChildren, rawReader, cluster, bytesPerSector, normRoot,
             dirRec, dirRel, onEntry, onError, onProgress, cancel, files, dirs, bytes,
-            diagIndexBlocks, diagIndexChildren, diagWin32FallbackDirs, kids, incomplete);
+            diagIndexBlocks, diagIndexChildren, diagWin32FallbackDirs, kids, incomplete,
+            dirSink_);
         if (step == DirStepOutcome::FallbackAborted) {
             CloseHandle(hVol);
             return true; // consumer asked to stop
@@ -1604,6 +1615,12 @@ const uint64_t segSize = vd.BytesPerFileRecordSegment;
         }
         if (step == DirStepOutcome::FallbackOk) continue;
         if (prof) MftAdd(profile.walkStep, MftNow() - walkT0, 1);
+        // Recorded only for the pure-MFT path: on FallbackOk the subtree was
+        // listed by the Win32 fallback, whose own hook reported `listSeconds`
+        // for the same directories (separate column, no double counting).
+        if (dirSink_ && step == DirStepOutcome::EmitMft) {
+            dirSink_->walk.add(dirRel, MftSecs(MftNow() - dirT0));
+        }
 
         // Emit children in alphabetical order (depth-first), skipping the
         // volume metafile band ($MFT, $Boot, ...).

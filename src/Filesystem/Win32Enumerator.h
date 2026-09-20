@@ -29,6 +29,18 @@ public:
                    const ErrorCallback& onError,
                    const ProgressCallback& onProgress = {},
                    const std::atomic_bool* cancel = nullptr) override;
+    void setDirListSink(profiling::DirListSink* sink,
+                        const std::wstring& relPrefix = std::wstring()) override {
+        dirSink_ = sink;
+        dirPrefix_ = relPrefix;
+    }
+
+private:
+    // Optional slowest-directories sink (null = timing off, behaviour
+    // unchanged). `dirPrefix_` is the scan-root-relative prefix of this walk
+    // (non-empty only when driven as an MFT fallback subtree).
+    profiling::DirListSink* dirSink_ = nullptr;
+    std::wstring dirPrefix_;
 };
 
 } // namespace bv

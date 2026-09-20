@@ -12,7 +12,7 @@ void HashOneSide(const std::wstring& absPath, uint64_t expectedSize, uint64_t ex
                  bool& changed, HashStatus& status, Digest& digest, bool valid,
                  HashCache* cache, std::atomic<size_t>& cacheHits,
                  profiling::HashSession* session, profiling::Side side,
-                 const std::atomic_bool* cancel) {
+                 const std::atomic_bool* cancel, profiling::DirHashTop* dirHash) {
     if (!valid) {
         status = HashStatus::ReadError;
         return;
@@ -73,15 +73,26 @@ void HashOneSide(const std::wstring& absPath, uint64_t expectedSize, uint64_t ex
         return;
     }
 
+    // FileTimings are collected whenever the hash profiler OR the
+    // slowest-directories sink needs them; only the profiler's FileBegin/End
+    // events stay gated on `prof`.
+    const bool wantFt = prof || dirHash != nullptr;
     profiling::FileTimings ft;
     if (prof) session->prof->FileBegin(*session, side, absPath, expectedSize);
-    if (prof) {
+    if (wantFt) {
         status = Sha256FileFromHandle<true>(h, digest, &ft, cancel);
     } else {
         status = Sha256FileFromHandle<false>(h, digest, nullptr, cancel);
     }
     if (prof) session->prof->FileEnd(*session, side, absPath, expectedSize, ft,
                                      status == HashStatus::Ok);
+    // Cache hits returned above without hashing, so reaching this point means
+    // real read+hash work happened. Fed regardless of `status`: failed reads
+    // still cost I/O time on this directory.
+    if (dirHash) {
+        dirHash->add(side, profiling::DirParent(absPath),
+                     profiling::QpcToSeconds(ft.totalTicks));
+    }
     if (status != HashStatus::Ok) {
         CloseHandle(h);
         return;

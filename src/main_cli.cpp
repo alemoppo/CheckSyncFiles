@@ -226,6 +226,45 @@ std::wstring FmtSec(double seconds) {
     return buf;
 }
 
+// One slowest-directories column (skipped when empty). List and hash times
+// are never summed: they are costs of different phases.
+void PrintDirColumn(const wchar_t* title,
+                    const std::vector<bv::profiling::DirEntry>& entries) {
+    if (entries.empty()) return;
+    std::wcout << title << L"\n";
+    for (const bv::profiling::DirEntry& e : entries) {
+        // The walk root itself is keyed "" (same convention as ScanError::path).
+        std::wcout << L"    " << FmtSec(e.seconds) << L"  "
+                   << (e.dir.empty() ? L"(radice)" : e.dir) << L"\n";
+    }
+}
+
+// Slowest-directories section: top-N per column, per side. `list` measures
+// Win32 FindFirst/FindNext syscall time per directory; `walk` measures the
+// MFT $I30 resolve + walk-step (NOT a pure listing, hence the separate name);
+// `hash` sums FileTimings.totalTicks of the files hashed under each parent
+// directory (cache hits cost ~zero and are counted globally below).
+void PrintSlowestDirs(const bv::ScanReport& report) {
+    const bv::profiling::DirTimingReport& t = report.dirTiming;
+    const bool anyList =
+        !t.listA.empty() || !t.walkA.empty() || !t.listB.empty() || !t.walkB.empty();
+    const bool anyHash = !t.hashA.empty() || !t.hashB.empty();
+    if (!anyList && !anyHash) return;
+    std::wcout << L"\nDirectory più lente (top " << bv::profiling::kDirTopN << L"):\n";
+    PrintDirColumn(L"  listato A (Win32, syscall per dir):", t.listA);
+    PrintDirColumn(L"  walk A (MFT $I30 resolve, non listato puro):", t.walkA);
+    PrintDirColumn(L"  listato B (Win32, syscall per dir):", t.listB);
+    PrintDirColumn(L"  walk B (MFT $I30 resolve, non listato puro):", t.walkB);
+    PrintDirColumn(L"  hash A (somma FileTimings per dir padre):", t.hashA);
+    PrintDirColumn(L"  hash B (somma FileTimings per dir padre):", t.hashB);
+    // Global run counter, not per-directory: a fully-cached run records no
+    // hash column at all (hits cost ~zero), but the count stays visible.
+    if (anyHash || report.hashCacheHits > 0) {
+        std::wcout << L"  hash cache hits (totale run): " << Group(report.hashCacheHits)
+                   << L"\n";
+    }
+}
+
 // Peak rate as MB/s (1 MB = 1024^2 bytes).
 std::wstring FmtMBS(uint64_t bytes, double seconds) {
     if (seconds <= 0.0) return L"n/d";
@@ -580,10 +619,6 @@ bv::ScanController controller(options.caseSensitive);
     } else if (!options.exportPath.empty()) {
         std::wcout << L"Esportazione FALLITA: " << report.exportError << L"\n";
     }
-    if (report.hashCacheHits > 0) {
-        std::wcout << L"Cache hash:          " << Group(report.hashCacheHits)
-                   << L" file non riletti\n";
-    }
     if (report.hashingErrors > 0) {
         std::wcout << L"Errori hash (worker):" << Group(report.hashingErrors) << L"\n";
     }
@@ -599,6 +634,8 @@ bv::ScanController controller(options.caseSensitive);
                << L"\n";
     std::wcout << L"Velocita effettiva:      "
                << FormatRate(report.results.stats.bytesSource, report.secondsTotal) << L"\n";
+
+    PrintSlowestDirs(report);
 
     if (options.hashProfiler) {
         PrintHashProfile(report.hashProfile);

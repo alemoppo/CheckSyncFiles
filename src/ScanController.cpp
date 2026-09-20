@@ -59,7 +59,7 @@ void HashSourceIndex(FileIndex& index, const std::wstring& root, ThreadPool& poo
                      std::atomic<size_t>& cacheHits,
                      const std::function<void(uint64_t done, uint64_t total)>& onProgress,
                      std::function<void()> onBatchSubmitted,
-                     profiling::HashProfiler* prof) {
+                     profiling::HashProfiler* prof, profiling::DirHashTop* dirHash) {
     std::vector<std::wstring> files;
     for (const auto& kv : index.entries()) {
         if (!kv.second.isDirectory) files.push_back(kv.second.relativePath);
@@ -77,7 +77,8 @@ void HashSourceIndex(FileIndex& index, const std::wstring& root, ThreadPool& poo
             // batch scope ends, so both stay valid for the whole task lifetime.
             // `root` is a const reference parameter alive through this call.
             const size_t relIndex = done + i;
-            pool.submit([&files, &slots, relIndex, i, &root, cache, &cacheHits, cancel, prof] {
+            pool.submit([&files, &slots, relIndex, i, &root, cache, &cacheHits, cancel, prof,
+                         dirHash] {
                 profiling::HashSession session(prof);
                 HashSlot& slot = slots[i];
                 if (cancel && cancel->load(std::memory_order_relaxed)) {
@@ -98,11 +99,20 @@ void HashSourceIndex(FileIndex& index, const std::wstring& root, ThreadPool& poo
                 }
                 profiling::FileTimings ft;
                 const bool pf = prof && prof->enabled();
+                // Collect FileTimings whenever the hash profiler OR the
+                // slowest-directories sink needs them.
+                const bool wantFt = pf || dirHash != nullptr;
                 if (pf) prof->FileBegin(session, profiling::Side::Source, abs, sz);
                 const bool ok =
-                    hashing::Sha256File(abs, slot.digest, pf ? &ft : nullptr, cancel) ==
+                    hashing::Sha256File(abs, slot.digest, wantFt ? &ft : nullptr, cancel) ==
                     hashing::HashStatus::Ok;
                 if (pf) prof->FileEnd(session, profiling::Side::Source, abs, sz, ft, ok);
+                // Snapshot-capture hashing is always tree A. A cache hit
+                // returned above without reading, so only real work lands here.
+                if (dirHash) {
+                    dirHash->add(profiling::Side::Source, profiling::DirParent(abs),
+                                 profiling::QpcToSeconds(ft.totalTicks));
+                }
                 if (ok) {
                     if (cache) cache->Store(abs, sz, mt, slot.digest);
                 } else {
@@ -129,6 +139,10 @@ ScanReport ScanController::run(const ScanOptions& options) {
     // decides whether to collect by handing it over or not).
     profiling::HashProfiler* hashProf = options.hashProfiler;
     if (hashProf) hashProf->setEnabled(true);
+
+    // Slowest-directories tops for this run (always collected, bounded top-N
+    // per column). Side A = source tree, side B = destination tree.
+    profiling::RunDirTiming dirTiming;
 
     const double t0 = NowSeconds();
     const bool haveCompare = !options.compareFrom.empty();
@@ -257,6 +271,9 @@ ScanReport ScanController::run(const ScanOptions& options) {
             // only populated through this single pass, so a fallback is safe).
             MftEnumerator mft;
             Win32Enumerator win32;
+            // Snapshot-capture enumerates the source tree: side A.
+            mft.setDirListSink(&dirTiming.a);
+            win32.setDirListSink(&dirTiming.a);
             if (MftEnumerator::IsSupported(options.source)) {
                 build = sourceIndex.build(options.source, mft, sourceProgress, options.cancel);
                 sourceOk = build.ok;
@@ -276,6 +293,7 @@ ScanReport ScanController::run(const ScanOptions& options) {
             }
         } else {
             Win32Enumerator win32;
+            win32.setDirListSink(&dirTiming.a);
             build = sourceIndex.build(options.source, win32, sourceProgress, options.cancel);
             sourceOk = build.ok;
         }
@@ -323,7 +341,8 @@ ScanReport ScanController::run(const ScanOptions& options) {
                 };
                 const double th0 = NowSeconds();
                 HashSourceIndex(sourceIndex, options.source, sourcePool, options.cancel,
-                                cache.get(), hits, hashProgress, {}, hashProf);
+                                cache.get(), hits, hashProgress, {}, hashProf,
+                                &dirTiming.hash);
                 hashThreadsActive.store(0, std::memory_order_relaxed);
                 report.secondsHashing += NowSeconds() - th0;
                 report.hashCacheHits += hits.load();
@@ -411,7 +430,7 @@ ScanReport ScanController::run(const ScanOptions& options) {
                                     sourceFromIndex ? ConcurrentComparer::SourceKind::FromIndex
                                                     : ConcurrentComparer::SourceKind::Live,
                                     sourceFromIndex ? &sourceIndex : nullptr, options.cancel,
-                                    hashProf);
+                                    hashProf, &dirTiming);
 
         ConcurrentComparer::Result cr = comparer.run(hashPool, enumProgress, hashProgress,
                                                      cache.get());
@@ -447,6 +466,11 @@ ScanReport ScanController::run(const ScanOptions& options) {
         }
     }
 
+    // Publish the slowest-directories tops as plain data (the live profilers
+    // hold a mutex and never cross the report boundary). Done before the
+    // export so the JSON section below can include them.
+    profiling::SnapshotRunTiming(dirTiming, report.dirTiming);
+
     // ---------------------------------------------------------------------
     // 3. Export the problems (non-identical entries) as CSV/JSON (optional).
     // ---------------------------------------------------------------------
@@ -456,7 +480,8 @@ ScanReport ScanController::run(const ScanOptions& options) {
                                           : options.exportFormat;
         std::wstring werr;
         const bool ok = fmt == exporting::ExportFormat::Json
-                            ? exporting::WriteJson(options.exportPath, report.results, werr)
+                            ? exporting::WriteJson(options.exportPath, report.results,
+                                                   report.dirTiming, report.hashCacheHits, werr)
                             : exporting::WriteCsv(options.exportPath, report.results, werr);
         report.exportWritten = ok;
         report.exportError = std::move(werr);

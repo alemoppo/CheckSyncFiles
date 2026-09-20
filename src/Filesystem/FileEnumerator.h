@@ -6,6 +6,7 @@
 #include <string>
 
 #include "FileEntry.h"
+#include "Profiling/DirTiming.h"
 
 namespace bv {
 
@@ -52,6 +53,17 @@ public:
                            const ErrorCallback& onError,
                            const ProgressCallback& onProgress = {},
                            const std::atomic_bool* cancel = nullptr) = 0;
+
+    // Optional per-directory listing-time sink for the "slowest directories"
+    // feature. Default no-op so test doubles and back-ends without per-dir
+    // timing stay untouched. `relPrefix` lets a backend that delegates a
+    // subtree to another enumerator (MFT -> Win32 fallback) keep reporting
+    // scan-root-relative paths.
+    virtual void setDirListSink(profiling::DirListSink* sink,
+                                const std::wstring& relPrefix = std::wstring()) {
+        (void)sink;
+        (void)relPrefix;
+    }
 };
 
 } // namespace bv

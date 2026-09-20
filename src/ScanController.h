@@ -10,6 +10,7 @@
 #include "Comparison/ScanMode.h"
 #include "Export/ExportUtil.h"
 #include "Filesystem/FileEnumerator.h"
+#include "Profiling/DirTiming.h"
 #include "Profiling/HashProfile.h"
 
 namespace bv {
@@ -31,7 +32,10 @@ void HashSourceIndex(FileIndex& index, const std::wstring& root, ThreadPool& poo
                      std::atomic<size_t>& cacheHits,
                      const std::function<void(uint64_t done, uint64_t total)>& onProgress,
                      std::function<void()> onBatchSubmitted = {},
-                     profiling::HashProfiler* prof = nullptr);
+                     profiling::HashProfiler* prof = nullptr,
+                     // Optional slowest-directories hash sink (run side A: the
+                     // source tree). Forces FileTimings collection for the feed.
+                     profiling::DirHashTop* dirHash = nullptr);
 
 // High level phases of a run, reported through ScanProgress.
 enum class ScanPhase : uint8_t {
@@ -134,6 +138,11 @@ struct ScanReport {
     // Aggregate content-hash profiling report (filled only when
     // ScanOptions::hashProfiler is non-null).
     profiling::HashProfileReport hashProfile;
+    // Slowest-directories tops (always collected, bounded top-N per column).
+    // In offline mode the A side comes from the snapshot index, so listA /
+    // walkA / hashA stay empty; only B is timed. No timings are stored in
+    // snapshots.
+    profiling::DirTimingReport dirTiming;
 };
 
 // Orchestrates a comparison run:

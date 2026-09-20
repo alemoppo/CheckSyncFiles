@@ -11,6 +11,7 @@
 #include "Comparison/ConcurrentSink.h"
 #include "Filesystem/FileIndex.h"
 #include "Hashing/HashCache.h"
+#include "Profiling/DirTiming.h"
 #include "Profiling/HashProfile.h"
 #include "Threading/ThreadPool.h"
 
@@ -57,7 +58,8 @@ void SubmitHashCandidates(const std::vector<ContentCandidate>& candidates, Threa
                           hashing::HashCache* cache, std::atomic<size_t>& cacheHits,
                           std::atomic<uint64_t>* hashDone = nullptr,
                           profiling::HashProfiler* prof = nullptr,
-                          profiling::Side side = profiling::Side::Source);
+                          profiling::Side side = profiling::Side::Source,
+                          profiling::DirHashTop* dirHash = nullptr);
 
 // Legacy whole-phase entry point (serial comparator): hashes `candidates` in
 // bounded batches of kHashBatchSize and folds the outcomes into `out`.
@@ -67,6 +69,7 @@ void RunHashPhase(const std::vector<ContentCandidate>& candidates, ThreadPool& p
                   const std::wstring& destRoot, ResultSet& out, const std::atomic_bool* cancel,
                   const std::function<void(uint64_t done, uint64_t total)>& onProgress,
                   hashing::HashCache* cache, std::atomic<size_t>& cacheHits,
-                  profiling::HashProfiler* prof = nullptr);
+                  profiling::HashProfiler* prof = nullptr,
+                  profiling::DirHashTop* dirHash = nullptr);
 
 } // namespace bv

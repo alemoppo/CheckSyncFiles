@@ -263,7 +263,8 @@ void ConcurrentComparer::FlushHashCandidates(std::vector<ContentCandidate>& pend
         SubmitHashCandidates(batch, *hashPool_, offlineSource_,
                              offlineSource_ ? fromIndex_ : nullptr, sourceRoot_, destRoot_, sink,
                              cancel_, cache_, cacheHits_, &hashDone_, profile_,
-                             static_cast<profiling::Side>(side));
+                             static_cast<profiling::Side>(side),
+                             dirTiming_ ? &dirTiming_->hash : nullptr);
         // The submitted tasks count themselves done as they finish; report
         // completion so far so progress keeps moving while the workers are still
         // enumerating.
@@ -375,6 +376,11 @@ ConcurrentComparer::EnumAttempt ConcurrentComparer::runOneStep(
     // (success/incomplete/terminal failure) or discarded (fallback) is decided
     // by the caller once the attempt's outcome is known.
     std::vector<ScanError> stagedErrors;
+    // Per-side listing sink for the slowest-directories feature (no-op when
+    // no timing state was provided; test doubles ignore it via the default).
+    if (dirTiming_) {
+        enumerator.setDirListSink(side == 0 ? &dirTiming_->a : &dirTiming_->b);
+    }
     const bool ok = enumerator.enumerate(
         root,
         [&](FileEntry&& e) -> bool {
