@@ -883,7 +883,8 @@ void AppUI::OnMouseDown(int mx, int my) {
             scroll_ = 0;
             timingScroll_ = 0;
             CloseContextMenu();
-            rebuildFilteredCache();
+            // The Tempistiche view never reads the filtered problems cache.
+            if (i != kFilterTimings) rebuildFilteredCache();
             dirty_.store(true);
         }
     }
