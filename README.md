@@ -260,15 +260,20 @@ ERRORE_LETTURA, ACCESSO_NEGATO, MODIFICATO_DURANTE_SCAN`.
 ### Directory più lente (top-N)
 
 A fine scansione la CLI stampa le directory che hanno richiesto più tempo, top 15 per
-colonna e per lato (A = sorgente, B = destinazione), senza mai sommare colonne diverse:
-- `listato`: tempo delle syscall FindFirst/FindNext per directory (backend Win32);
-- `walk`: tempo di resolve $I30 + walk-step per directory (backend MFT; **non** è un
-  listato puro, da cui il nome diverso);
-- `hash` (solo modalità Contenuto): somma dei `FileTimings.totalTicks` dei file
-  effettivamente letti+hashati sotto ogni directory padre. Gli hit della hash cache
-  costano ~zero e sono riportati come conteggio globale `hash cache hits (totale run)`,
-  non per-directory.
-In offline il lato A proviene dallo snapshot (non dal filesystem) e resta senza timing.
+colonna e per lato (A = sorgente, B = destinazione), senza mai sommare colonne diverse.
+`list` e `walk` sono top-N **esatte** delle directory misurate; `hash` è una top-N
+**stimata** (vedi sotto):
+- `listSeconds`: tempo delle syscall FindFirst/FindNext per directory (backend Win32);
+- `walkSeconds`: tempo di resolve $I30 + walk-step per directory (backend MFT; **non**
+  è un listato puro, da cui il nome diverso);
+- `hashSeconds` (solo modalità Contenuto): somma dei `FileTimings.totalTicks` dei file
+  effettivamente letti+hashati sotto ogni directory padre. Gli hit della hash cache sono
+  esclusi (costano ~zero) e conteggiati separatamente come globale
+  `hash cache hits (totale run)`, non per-directory.
+La colonna `hash` usa un'aggregazione bounded (Space-Saving, 64 contatori per lato):
+l'ordine mostrato è per stima e può differire da quello reale per valori vicini; il
+vincolo di memoria è intenzionale. In offline il lato A proviene dall'indice/snapshot
+(non dal filesystem) e resta senza timing; nessun timing viene salvato nello snapshot.
 La stessa sezione è esportata in JSON come `slowest_dirs` (`list_a/walk_a/list_b/walk_b/
 hash_a/hash_b` + `hash_cache_hits`); l'export CSV resta invariato.
 

@@ -24,6 +24,10 @@ bool WriteJson(const std::wstring& filePath, const ResultSet& result, std::wstri
 // `hashCacheHits` is the run-global counter (not per-directory). Seconds are
 // JSON numbers (fractional). Kept as a separate overload so the plain array
 // shape above stays byte-identical for existing consumers.
+// Semantics (no schema impact): `list_*`/`walk_*` are exact top-N of the
+// measured directories; `hash_a`/`hash_b` are estimate-ordered candidates
+// from the bounded Space-Saving aggregation, so their order may differ from
+// the true ranking for close values.
 bool WriteJson(const std::wstring& filePath, const ResultSet& result,
                const profiling::DirTimingReport& timing, uint64_t hashCacheHits,
                std::wstring& error);

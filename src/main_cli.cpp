@@ -257,6 +257,10 @@ void PrintSlowestDirs(const bv::ScanReport& report) {
     PrintDirColumn(L"  walk B (MFT $I30 resolve, non listato puro):", t.walkB);
     PrintDirColumn(L"  hash A (somma FileTimings per dir padre):", t.hashA);
     PrintDirColumn(L"  hash B (somma FileTimings per dir padre):", t.hashB);
+    if (anyHash) {
+        std::wcout << L"  Nota: la top-N hash è stimata (aggregazione bounded); "
+                      L"l'ordine può differire per valori vicini.\n";
+    }
     // Global run counter, not per-directory: a fully-cached run records no
     // hash column at all (hits cost ~zero), but the count stays visible.
     if (anyHash || report.hashCacheHits > 0) {

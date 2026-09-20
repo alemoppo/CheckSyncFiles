@@ -76,16 +76,24 @@ std::wstring DirParent(const std::wstring& absPath);
 // entry per directory (O(directories) memory). Space-Saving keeps O(counters)
 // memory with a hard guarantee: any directory whose true sum exceeds
 // totalFed/counters is always present, with est - err <= true <= est.
-// Ordering among near-tied directories is approximate; that is the documented
-// price of the memory bound.
 //
-// Thread-safe: one mutex held only for a map operation per hashed file.
-// Contention is negligible next to file I/O. No lock-free machinery.
+// Consequence for readers: top() returns ESTIMATE-ordered candidates, so the
+// hash top-N is intentionally approximate, NOT mathematically exact.
+// Directories with very close true values may come out in a different order
+// than their real ranking; the bounded memory is the deliberate price for
+// that. (The `list`/`walk` columns are exact top-N instead: each directory is
+// measured exactly once, so their min-heaps admit on the true value.)
+//
+// Thread-safe: one mutex per hashed-file update, held for the whole update:
+// directory lookup/insert plus, when the bounded counters are full, the
+// linear scan for the minimum estimate. Contention is negligible next to file
+// I/O. No lock-free machinery.
 class DirHashTop {
 public:
     explicit DirHashTop(size_t displayN = kDirTopN, size_t counters = kDirHashCounters);
     void add(Side fileSide, const std::wstring& dir, double seconds);
-    // Descending by estimated sum, at most displayN entries.
+    // Candidates in descending ESTIMATE order, at most displayN entries. This
+    // is a ranking by Space-Saving estimate, not an exact top-N: see above.
     std::vector<DirEntry> top(int runSide) const;
     bool empty(int runSide) const;
     // Live counters held (<= the configured counter budget). Test hook for
