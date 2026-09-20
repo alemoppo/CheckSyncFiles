@@ -114,6 +114,13 @@ public:
                             hashing::HashCache* cache = nullptr);
 
     size_t cacheHits() const { return cacheHits_.load(std::memory_order_relaxed); }
+    // Live table for progress observation (gauges only, never mutated here):
+    // set while the workers run, cleared after join. Valid only between those
+    // points; progress callbacks fire solely inside that window, so every read
+    // through this pointer observes a live table.
+    const MatchTable* matchTable() const {
+        return activeTable_.load(std::memory_order_acquire);
+    }
 
 private:
     struct WorkerState {
@@ -191,6 +198,7 @@ private:
     const std::atomic_bool* cancel_;
 
     std::atomic<size_t> cacheHits_{0};
+    std::atomic<const MatchTable*> activeTable_{nullptr};
     std::atomic<uint64_t> totalFiles_{0};
     std::atomic<uint64_t> totalDirs_{0};
     std::atomic<uint64_t> totalBytes_{0};

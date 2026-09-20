@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "Filesystem/FileEntry.h"
+#include "Profiling/HashProfile.h"
 
 namespace bv {
 
@@ -95,13 +96,21 @@ public:
             // throttle under cvMutex_, so a notify that lands just before we
             // block cannot be lost: either the predicate re-evaluates to true
             // and we proceed, or the notify wakes us directly.
+            // Observation only (live gauges): each throttle-path entry is
+            // counted with its parked time. The two QPC reads run solely on
+            // this rare path; the fast path below is untouched.
             std::unique_lock<std::mutex> lk(cvMutex_);
             throttleWaiters_.fetch_add(1, std::memory_order_relaxed);
+            throttleEngagements_.fetch_add(1, std::memory_order_relaxed);
+            const uint64_t t0 = profiling::QpcNow();
             cv_.wait(lk, [&] {
                 return pending_.load(std::memory_order_relaxed) < highWater_ ||
                        done_[1].load(std::memory_order_acquire) ||
                        (cancel_ && cancel_->load(std::memory_order_relaxed));
             });
+            const uint64_t dt = profiling::QpcNow() - t0;
+            throttleWaitTicks_.fetch_add(dt, std::memory_order_relaxed);
+            AtomicMax(throttleMaxWaitTicks_, dt);
             throttleWaiters_.fetch_sub(1, std::memory_order_relaxed);
         }
 
@@ -111,6 +120,10 @@ public:
         if (it == s.map.end()) {
             s.map.emplace(key, Slot{side, std::move(e)});
             pending_.fetch_add(1, std::memory_order_relaxed);
+            // Observation only: per-side live count and observed peaks.
+            pendingSide_[side].fetch_add(1, std::memory_order_relaxed);
+            AtomicMax(peakTotal_, pending_.load(std::memory_order_relaxed));
+            AtomicMax(peakSide_[side], pendingSide_[side].load(std::memory_order_relaxed));
             return Outcome::Inserted;
         }
         if (it->second.side == side) {
@@ -122,9 +135,11 @@ public:
         // Cross-side match: consume the stored peer. The just-inserted entry is
         // never stored, so pending_ goes from old_count to old_count - 1 (it is
         // never temporarily old_count + 1).
+        const int storedSide = it->second.side;
         peer = std::move(it->second.entry);
         s.map.erase(it);
         pending_.fetch_sub(1, std::memory_order_relaxed);
+        pendingSide_[storedSide].fetch_sub(1, std::memory_order_relaxed);
         // Release the shard lock BEFORE waking a waiter: the waiter must be able
         // to take the shard it needs immediately, and the notify must never
         // happen under a shard lock.
@@ -172,6 +187,31 @@ public:
     }
 
     uint64_t pendingCount() const { return pending_.load(std::memory_order_relaxed); }
+    // Live per-side gauges: entries currently stored per inserting side
+    // (side 0 = source, 1 = destination). Relaxed atomic reads for display.
+    uint64_t pendingSideA() const { return pendingSide_[0].load(std::memory_order_relaxed); }
+    uint64_t pendingSideB() const { return pendingSide_[1].load(std::memory_order_relaxed); }
+    // Observed maxima this run (updated on the insert path only). Gauges, not
+    // exact under concurrency: a racing decrement can hide a transient top.
+    uint64_t peakSideA() const { return peakSide_[0].load(std::memory_order_relaxed); }
+    uint64_t peakSideB() const { return peakSide_[1].load(std::memory_order_relaxed); }
+    uint64_t peakTotal() const { return peakTotal_.load(std::memory_order_relaxed); }
+    // Backpressure observation (source side only, the only parked worker):
+    // throttle-path entries so far, cumulative parked QPC ticks, longest
+    // single park in QPC ticks. Zero-cost on the fast path (measured only
+    // around the actual wait above).
+    uint64_t throttleEngagements() const {
+        return throttleEngagements_.load(std::memory_order_relaxed);
+    }
+    uint64_t throttleWaitTicks() const {
+        return throttleWaitTicks_.load(std::memory_order_relaxed);
+    }
+    uint64_t throttleMaxWaitTicks() const {
+        return throttleMaxWaitTicks_.load(std::memory_order_relaxed);
+    }
+    // The backpressure threshold (entries). Read-only for display; the
+    // throttling behaviour itself is unchanged.
+    uint64_t highWater() const { return highWater_; }
 
     // Number of workers currently parked in the throttle wait. Only the source
     // worker ever throttles, so this is 0 or 1. Diagnostic/test hook: a test can
@@ -198,11 +238,24 @@ private:
         return h;
     }
 
+    static void AtomicMax(std::atomic<uint64_t>& target, uint64_t v) {
+        uint64_t prev = target.load(std::memory_order_relaxed);
+        while (v > prev &&
+               !target.compare_exchange_weak(prev, v, std::memory_order_relaxed)) {
+        }
+    }
+
     size_t shardCount_;
     uint64_t mask_;
     std::unique_ptr<Shard[]> shards_;
     uint64_t highWater_ = 1ull << 20; // ~1M unmatched entries: throttle writers
     std::atomic<uint64_t> pending_{0};       // entries currently stored (unmatched)
+    std::atomic<uint64_t> pendingSide_[2]{0, 0}; // ... split by inserting side
+    std::atomic<uint64_t> peakSide_[2]{0, 0};    // observed per-side maxima
+    std::atomic<uint64_t> peakTotal_{0};         // observed total maximum
+    std::atomic<uint64_t> throttleEngagements_{0}; // throttle-path entries
+    std::atomic<uint64_t> throttleWaitTicks_{0};   // cumulative parked QPC ticks
+    std::atomic<uint64_t> throttleMaxWaitTicks_{0}; // longest single park (QPC)
     std::atomic<uint64_t> throttleWaiters_{0}; // workers parked in the throttle wait
     std::atomic<bool> done_[2]{false, false};
     const std::atomic_bool* cancel_ = nullptr;

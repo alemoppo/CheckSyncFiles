@@ -115,6 +115,9 @@ ConcurrentComparer::Result ConcurrentComparer::runImpl(
 
     MatchTable table(6);
     table.setCancel(cancel_); // set once here, before any worker starts (see setCancel)
+    // Publish the table for live progress gauges; cleared at the end so no
+    // reader can ever observe a destroyed table.
+    activeTable_.store(&table, std::memory_order_release);
     ConcurrentSink sink;
     std::vector<ContentCandidate> candidatesA;
     std::vector<ContentCandidate> candidatesB;
@@ -179,6 +182,7 @@ ConcurrentComparer::Result ConcurrentComparer::runImpl(
     AddStats(r.results.stats, post.stats);
     for (FileResult& p : post.problems) r.results.problems.push_back(std::move(p));
     sortProblems(r.results);
+    activeTable_.store(nullptr, std::memory_order_release);
     return r;
 }
 

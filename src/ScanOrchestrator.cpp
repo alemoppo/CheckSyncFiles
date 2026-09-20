@@ -219,7 +219,7 @@ bool ScanOrchestrator::startLiveScan() {
     options.onProgress = [this](const ScanProgress& p) {
         {
             std::lock_guard<std::mutex> lk(mtx_);
-            progress_ = p;
+            storeProgressLocked(p);
         }
         notify();
     };
@@ -277,7 +277,7 @@ bool ScanOrchestrator::startSnapshotScan(const std::wstring& outFile) {
     options.onProgress = [this](const ScanProgress& p) {
         {
             std::lock_guard<std::mutex> lk(mtx_);
-            progress_ = p;
+            storeProgressLocked(p);
         }
         notify();
     };
@@ -355,6 +355,25 @@ ScanOrchestrator::UiSnapshot ScanOrchestrator::snapshot() const {
 ResultSet ScanOrchestrator::results() const {
     std::lock_guard<std::mutex> lk(mtx_);
     return results_;
+}
+
+void ScanOrchestrator::storeProgressLocked(const ScanProgress& p) {
+    if (p.matchHighWater == 0) {
+        ScanProgress q = p;
+        q.matchPendingA = progress_.matchPendingA;
+        q.matchPendingB = progress_.matchPendingB;
+        q.matchPeakA = progress_.matchPeakA;
+        q.matchPeakB = progress_.matchPeakB;
+        q.matchPeakTotal = progress_.matchPeakTotal;
+        q.matchHighWater = progress_.matchHighWater;
+        q.throttleParked = progress_.throttleParked;
+        q.throttleEngagements = progress_.throttleEngagements;
+        q.throttleWaitTicks = progress_.throttleWaitTicks;
+        q.throttleMaxWaitTicks = progress_.throttleMaxWaitTicks;
+        progress_ = q;
+    } else {
+        progress_ = p;
+    }
 }
 
 profiling::DirTimingReport ScanOrchestrator::dirTiming() const {

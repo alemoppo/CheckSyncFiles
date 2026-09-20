@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
+#include <limits>
 #include <string>
 #include <system_error>
 #include <vector>
@@ -21,6 +22,7 @@
 #include <SDL3_ttf/SDL_ttf.h>
 
 #include "Filesystem/PathUtil.h"
+#include "Profiling/HashProfile.h"
 #include "ScanController.h"
 #include "UI/Utf.h"
 
@@ -436,6 +438,24 @@ constexpr int kTimingSideW = 64;
 constexpr int kTimingSideH = 26;
 constexpr int kTimingSideGap = 8;
 constexpr int kTimingLineH = 20;
+
+// Dynamic bar scale: smallest "nice" value >= v on the 1/2/2.5/5/10 ladder
+// (37->50, 480->500, 1000->1000, 1200->2000, 23000->25000, 870000->1000000),
+// so small counts stay readable without tracking every fluctuation. The GUI
+// feeds it the run peaks (monotonic), hence the scale only ever ratchets up.
+uint64_t NiceCeil(uint64_t v) {
+    if (v == 0) return 10;
+    uint64_t d = 1;
+    while (d <= v / 10) d *= 10; // largest 10^k <= v (v realistic: no overflow)
+    if (d > (std::numeric_limits<uint64_t>::max)() / 100) {
+        return (std::numeric_limits<uint64_t>::max)();
+    }
+    for (uint64_t m : {10ull, 20ull, 25ull, 50ull, 100ull}) {
+        const uint64_t c = d * m / 10;
+        if (c >= v) return c;
+    }
+    return d * 10; // unreachable (m = 100 always covers v < 10*d)
+}
 
 std::wstring FormatRateCountW(uint64_t count, double seconds) {
     if (seconds <= 0.0 || count == 0) return L"n/d";
@@ -1532,7 +1552,7 @@ void AppUI::render(const bv::ScanOrchestrator::UiSnapshot& st) {
 
     // ---- Results list / Tempistiche view ----
     if (filter_ == kFilterTimings) {
-        DrawTimings(L.yList, L.listBottom, running);
+        DrawTimings(L.yList, L.listBottom, st);
     } else {
         DrawResultsList(L.yList, L.listBottom);
     }
@@ -1543,21 +1563,100 @@ void AppUI::render(const bv::ScanOrchestrator::UiSnapshot& st) {
     dirty_.store(false);
 }
 
-void AppUI::DrawTimings(int yList, int listBottom, bool running) {
+void AppUI::DrawTimings(int yList, int listBottom, const bv::ScanOrchestrator::UiSnapshot& st) {
+    const bool running = st.running;
     // A/B side selector (same geometry as the click handler in OnMouseDown).
     DrawToggle(renderer_, fontBody_, "A", kMargin, yList,
                kTimingSideW, kTimingSideH, timingSide_ == 0);
     DrawToggle(renderer_, fontBody_, "B", kMargin + kTimingSideW + kTimingSideGap, yList,
                kTimingSideW, kTimingSideH, timingSide_ == 1);
     int y = yList + kTimingSideH + 8;
+    const int areaW = winW_ - 2 * kMargin;
+
+    // Right-aligned text, vertically centred in a kTimingLineH box.
+    const auto drawRightVCenter = [&](const std::string& s, int rightX, int yy, RGBA c) {
+        SDL_Color col{c.r, c.g, c.b, c.a};
+        int tw = 0, th = 0;
+        SDL_Texture* t = TextTextureCached(renderer_, fontBody_, s, col, tw, th);
+        if (!t) return;
+        SDL_SetTextureBlendMode(t, SDL_BLENDMODE_BLEND);
+        const SDL_FRect d{static_cast<float>(rightX - tw),
+                          static_cast<float>(yy + (kTimingLineH - th) / 2),
+                          static_cast<float>(tw), static_cast<float>(th)};
+        SDL_RenderTexture(renderer_, t, nullptr, &d);
+    };
+
+    if (!running && !resultsReadySeen_) {
+        DrawText(renderer_, fontBody_, "Avvia una scansione per vedere le tempistiche.",
+                 kMargin, y, kTextLo);
+        return;
+    }
+
+    // ---- Live MatchTable gauges (per-frame progress, both sides) ----
+    // Currently-unmatched entries per side, observed peaks, and the throttle
+    // threshold as a tick when it fits the dynamic scale. The scale ratchets
+    // on the run peaks, so it never oscillates while values fluctuate. The
+    // threshold stays conceptually separate: it is only a tick, never the
+    // scale itself.
+    const ScanProgress& mp = st.progress;
+    DrawText(renderer_, fontBold_, "MatchTable live", kMargin, y + 1, kTextHi);
+    const uint64_t peakMax = std::max(
+        {mp.matchPeakA, mp.matchPeakB, mp.matchPendingA, mp.matchPendingB});
+    const uint64_t scale = NiceCeil(peakMax);
+    drawRightVCenter("scala 0-" + Group(scale), kMargin + areaW - 8, y, kTextLo);
+    y += kTimingLineH;
+    const auto drawBar = [&](const char* label, uint64_t val, uint64_t peak, int yy) {
+        DrawTextVCenter(renderer_, fontBody_, label, kMargin, yy, kTimingLineH, kTextHi);
+        const int barX = kMargin + 24;
+        const int numW = 230;
+        const int barW = std::max(40, areaW - 24 - numW - 16);
+        const int barH = 12;
+        const int barY = yy + (kTimingLineH - barH) / 2;
+        FillRect(renderer_, barX, barY, barW, barH, kPanel);
+        DrawRect(renderer_, barX, barY, barW, barH, kBorder);
+        const double frac = scale > 0 ? std::min(1.0, static_cast<double>(val) /
+                                                       static_cast<double>(scale))
+                                      : 0.0;
+        if (frac > 0.0) {
+            FillRect(renderer_, barX + 1, barY + 1,
+                     std::max(1, static_cast<int>(frac * static_cast<double>(barW - 2))),
+                     barH - 2, kAccent);
+        }
+        if (mp.matchHighWater > 0 && mp.matchHighWater <= scale) {
+            const int tx = barX + static_cast<int>(static_cast<double>(barW) *
+                                                   static_cast<double>(mp.matchHighWater) /
+                                                   static_cast<double>(scale));
+            FillRect(renderer_, tx - 1, barY - 2, 2, barH + 4, kBad);
+        }
+        drawRightVCenter(Group(val) + " (picco " + Group(peak) + ")", kMargin + areaW - 8,
+                         yy, kTextHi);
+    };
+    drawBar("A", mp.matchPendingA, mp.matchPeakA, y);
+    y += kTimingLineH;
+    drawBar("B", mp.matchPendingB, mp.matchPeakB, y);
+    y += kTimingLineH;
+    DrawText(renderer_, fontBody_,
+             "Totale A+B: " + Group(mp.matchPendingA + mp.matchPendingB) + " (picco " +
+                 Group(mp.matchPeakTotal) + ")",
+             kMargin, y + 1, kTextHi);
+    y += kTimingLineH;
+    std::string bp = mp.throttleParked > 0 ? "Backpressure: attivo, "
+                                           : "Backpressure: non attivo, ";
+    bp += "interventi " + Group(mp.throttleEngagements);
+    bp += ", attesa totale " + ToUtf8(FormatSecW(profiling::QpcToSeconds(mp.throttleWaitTicks)));
+    bp += ", max " + ToUtf8(FormatSecW(profiling::QpcToSeconds(mp.throttleMaxWaitTicks)));
+    bp += ", soglia ";
+    if (mp.matchHighWater == 0) {
+        bp += "n/d";
+    } else {
+        bp += Group(mp.matchHighWater);
+        if (mp.matchHighWater > scale) bp += " (oltre scala)";
+    }
+    DrawText(renderer_, fontBody_, bp, kMargin, y + 1, kTextLo);
+    y += kTimingLineH + 6;
 
     if (running && !resultsReadySeen_) {
         DrawText(renderer_, fontBody_, "Scansione in corso...", kMargin, y, kTextLo);
-        return;
-    }
-    if (!resultsReadySeen_) {
-        DrawText(renderer_, fontBody_, "Avvia una scansione per vedere le tempistiche.",
-                 kMargin, y, kTextLo);
         return;
     }
     DrawText(renderer_, fontBody_, "Hash cache hit: " + Group(uiHashCacheHits_),
@@ -1620,7 +1719,6 @@ void AppUI::DrawTimings(int yList, int listBottom, bool running) {
         right.push_back({3, "(nessun dato hash: run senza verifica contenuti)"});
     }
 
-    const int areaW = winW_ - 2 * kMargin;
     const bool sideBySide = winW_ >= 720;
     const int panelsTop = y;
     const int panelsH = std::max(kTimingLineH, listBottom - y);
@@ -1630,18 +1728,6 @@ void AppUI::DrawTimings(int yList, int listBottom, bool running) {
     timingScroll_ = std::clamp(timingScroll_, 0,
                                std::max(0, static_cast<int>(maxLines) - visibleLines));
 
-    // Right-aligned text, vertically centred in a kTimingLineH box.
-    const auto drawRightVCenter = [&](const std::string& s, int rightX, int yy, RGBA c) {
-        SDL_Color col{c.r, c.g, c.b, c.a};
-        int tw = 0, th = 0;
-        SDL_Texture* t = TextTextureCached(renderer_, fontBody_, s, col, tw, th);
-        if (!t) return;
-        SDL_SetTextureBlendMode(t, SDL_BLENDMODE_BLEND);
-        const SDL_FRect d{static_cast<float>(rightX - tw),
-                          static_cast<float>(yy + (kTimingLineH - th) / 2),
-                          static_cast<float>(tw), static_cast<float>(th)};
-        SDL_RenderTexture(renderer_, t, nullptr, &d);
-    };
     // Display-only path fit: truncate (never alter the stored data). The walk
     // root itself is keyed "" like ScanError::path; show it as "(radice)".
     const auto fitDir = [&](const std::wstring& d, int colW) {

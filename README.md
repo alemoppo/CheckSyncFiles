@@ -352,7 +352,11 @@ scrollbar laterale trascinabile col mouse: drag del thumb o click sulla track), 
 toggle case-sensitive e la scelta del **back-end di enumerazione** (Auto / Win32 / MFT).
 La vista Tempistiche mostra le directory più lente del run (selettore lato A/B,
 pannelli Enumerazione + Hash con nota "Top-N stimata" per l'hash, conteggio globale
-degli hash cache hit; in offline il lato A spiega che proviene dallo snapshot). Ogni riga mostra
+degli hash cache hit; in offline il lato A spiega che proviene dallo snapshot).
+In alto la sezione "MatchTable live" mostra in tempo reale, con due barre a scala
+dinamica, gli elementi A/B in attesa di match, i picchi, la soglia di backpressure
+come tacca (solo testo se oltre scala) e lo stato del backpressure (attivo/non attivo,
+interventi, attesa totale e massima). Ogni riga mostra
 il **percorso completo** del file (`FileResult.fullPath`: radice + percorso relativo,
 con il solo nome file in grassetto; Missing → lato sorgente, Extra → lato destinazione,
 errori → lato fallito se uno solo, altrimenti destinazione come fallback).

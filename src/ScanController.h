@@ -61,6 +61,20 @@ struct ScanProgress {
     // Number of hash workers actually running during ScanPhase::Hashing
     // (live, updated while the phase is in progress); 0 in the other phases.
     unsigned int threads = 0;
+    // Live MatchTable gauges (entries currently stored, unmatched), sampled
+    // on every progress tick while the comparer runs; zero when no table
+    // exists (source-index build, snapshot-capture hashing). Relaxed,
+    // instantaneous reads: exact per instant, may skew across fields.
+    uint64_t matchPendingA = 0; // side 0 (source tree) currently stored
+    uint64_t matchPendingB = 0; // side 1 (destination tree) currently stored
+    uint64_t matchPeakA = 0;    // observed per-side maxima this run
+    uint64_t matchPeakB = 0;
+    uint64_t matchPeakTotal = 0;
+    uint64_t matchHighWater = 0; // backpressure threshold (entries); 0 = none
+    uint64_t throttleParked = 0; // workers currently parked (0/1, source only)
+    uint64_t throttleEngagements = 0; // throttle-path entries so far
+    uint64_t throttleWaitTicks = 0;   // cumulative parked time (QPC ticks)
+    uint64_t throttleMaxWaitTicks = 0; // longest single park (QPC ticks)
 };
 
 struct ScanOptions {

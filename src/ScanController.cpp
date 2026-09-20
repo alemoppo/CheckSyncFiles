@@ -182,7 +182,8 @@ ScanReport ScanController::run(const ScanOptions& options) {
     std::atomic<unsigned int> hashThreadsActive{0};
 
     const auto emitProgress = [&](ScanPhase phase, uint64_t files, uint64_t dirs,
-                                  uint64_t bytes, const std::wstring& path) {
+                                  uint64_t bytes, const std::wstring& path,
+                                  const MatchTable* table = nullptr) {
         if (options.onProgress) {
             ScanProgress p;
             p.phase = phase;
@@ -191,6 +192,22 @@ ScanReport ScanController::run(const ScanOptions& options) {
             p.bytes = bytes;
             p.currentPath = path;
             p.threads = hashThreadsActive.load(std::memory_order_relaxed);
+            // Live MatchTable gauges (observation only): every tick carries
+            // the current readings, so overlapping phases can never clobber
+            // them with zeros. Null when no table exists (index build,
+            // snapshot capture): fields stay zero.
+            if (table != nullptr) {
+                p.matchPendingA = table->pendingSideA();
+                p.matchPendingB = table->pendingSideB();
+                p.matchPeakA = table->peakSideA();
+                p.matchPeakB = table->peakSideB();
+                p.matchPeakTotal = table->peakTotal();
+                p.matchHighWater = table->highWater();
+                p.throttleParked = table->throttleWaiters();
+                p.throttleEngagements = table->throttleEngagements();
+                p.throttleWaitTicks = table->throttleWaitTicks();
+                p.throttleMaxWaitTicks = table->throttleMaxWaitTicks();
+            }
             options.onProgress(p);
         }
     };
@@ -397,27 +414,9 @@ ScanReport ScanController::run(const ScanOptions& options) {
         ThreadPool hashPool(mode == ScanMode::Content ? resolveHashThreads() : 0);
         if (mode == ScanMode::Content) report.hashThreadsUsed = hashPool.threadCount();
 
-        const IFileEnumerator::ProgressCallback enumProgress =
-            [&](uint64_t files, uint64_t dirs, uint64_t bytes, const std::wstring& path) {
-                emitProgress(ScanPhase::CompareDestination, files, dirs, bytes, path);
-            };
-        double hashStart = 0.0;
-        double compareHashSeconds = 0.0;
-        bool hashing = false;
-        const auto hashProgress = [&](uint64_t done, uint64_t total) {
-            if (!hashing) {
-                hashing = true;
-                hashStart = NowSeconds();
-                hashThreadsActive.store(hashPool.threadCount(), std::memory_order_relaxed);
-            }
-            emitProgress(ScanPhase::Hashing, done, total, 0, L"");
-            if (done >= total) {
-                hashing = false;
-                hashThreadsActive.store(0, std::memory_order_relaxed);
-                compareHashSeconds += NowSeconds() - hashStart;
-            }
-        };
-
+        // Built before the progress lambdas so they can read the live table
+        // through matchTable() on every tick (observation only; the comparer
+        // owns the table and outlives every callback).
         // Offline (`--compare`): the source device is absent, so `options.source`
         // is empty and `sourceRoot_` would be unusable for display. The snapshot
         // records the original source root (`loadedRoot`): use it as the
@@ -431,6 +430,28 @@ ScanReport ScanController::run(const ScanOptions& options) {
                                                     : ConcurrentComparer::SourceKind::Live,
                                     sourceFromIndex ? &sourceIndex : nullptr, options.cancel,
                                     hashProf, &dirTiming);
+
+        const IFileEnumerator::ProgressCallback enumProgress =
+            [&](uint64_t files, uint64_t dirs, uint64_t bytes, const std::wstring& path) {
+                emitProgress(ScanPhase::CompareDestination, files, dirs, bytes, path,
+                             comparer.matchTable());
+            };
+        double hashStart = 0.0;
+        double compareHashSeconds = 0.0;
+        bool hashing = false;
+        const auto hashProgress = [&](uint64_t done, uint64_t total) {
+            if (!hashing) {
+                hashing = true;
+                hashStart = NowSeconds();
+                hashThreadsActive.store(hashPool.threadCount(), std::memory_order_relaxed);
+            }
+            emitProgress(ScanPhase::Hashing, done, total, 0, L"", comparer.matchTable());
+            if (done >= total) {
+                hashing = false;
+                hashThreadsActive.store(0, std::memory_order_relaxed);
+                compareHashSeconds += NowSeconds() - hashStart;
+            }
+        };
 
         ConcurrentComparer::Result cr = comparer.run(hashPool, enumProgress, hashProgress,
                                                      cache.get());

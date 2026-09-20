@@ -78,7 +78,8 @@ private:
     // "Tempistiche" view: slowest directories of the cached run, read-only
     // from uiDirTiming_ (never recomputed here). Dedicated drawing, separate
     // from DrawResultsList: different dataset, no scrolling model shared.
-    void DrawTimings(int yList, int listBottom, bool running);
+    void DrawTimings(int yList, int listBottom,
+                     const bv::ScanOrchestrator::UiSnapshot& st);
     void DrawSummary(int summaryY, uint64_t hashingErrors);
 
     // hits ------------------------------------------------------------------

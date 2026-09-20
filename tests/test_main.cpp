@@ -4005,6 +4005,101 @@ TEST("matchtable: same-side duplicate key replaces (last wins, like FileIndex)",
     if (rem.size() == 1) CHECK(rem[0].second.relativePath == L"x");
 });
 
+TEST("matchtable: per-side pending counts and peaks track inserts and matches", [] {
+    bv::MatchTable t(2);
+    FileEntry peer;
+    const auto ins = [&](const wchar_t* k, int side) {
+        FileEntry e;
+        e.relativePath = k;
+        return t.insert(k, side, std::move(e), peer);
+    };
+    CHECK(ins(L"a1", 0) == bv::MatchTable::Outcome::Inserted);
+    CHECK(ins(L"a2", 0) == bv::MatchTable::Outcome::Inserted);
+    CHECK(ins(L"b1", 1) == bv::MatchTable::Outcome::Inserted);
+    CHECK_EQ(t.pendingCount(), 3ull);
+    CHECK_EQ(t.pendingSideA(), 2ull);
+    CHECK_EQ(t.pendingSideB(), 1ull);
+    CHECK_EQ(t.peakSideA(), 2ull);
+    CHECK_EQ(t.peakSideB(), 1ull);
+    CHECK_EQ(t.peakTotal(), 3ull);
+    // Cross-side match consumes the STORED side (A here); the matching B
+    // insert was never stored, so B is unchanged.
+    CHECK(ins(L"a1", 1) == bv::MatchTable::Outcome::Matched);
+    CHECK_EQ(t.pendingSideA(), 1ull);
+    CHECK_EQ(t.pendingSideB(), 1ull);
+    CHECK_EQ(t.pendingCount(), 2ull);
+    // Peaks never shrink on match.
+    CHECK_EQ(t.peakSideA(), 2ull);
+    CHECK_EQ(t.peakTotal(), 3ull);
+    // Same-side replace: counts untouched.
+    CHECK(ins(L"a2", 0) == bv::MatchTable::Outcome::Replaced);
+    CHECK_EQ(t.pendingSideA(), 1ull);
+    CHECK_EQ(t.pendingCount(), 2ull);
+    CHECK_EQ(t.highWater(), 1ull << 20);
+});
+
+TEST("matchtable: throttle engagements and waits are observed without parking", [] {
+    // highWater=2: the third source insert takes the throttle path. With side
+    // 1 already done the predicate passes immediately, so nothing parks but
+    // the engagement is still counted (with ~zero wait).
+    bv::MatchTable t(2, /*highWater=*/2);
+    t.setSideDone(1);
+    FileEntry peer;
+    const auto ins = [&](const wchar_t* k, int side) {
+        FileEntry e;
+        e.relativePath = k;
+        return t.insert(k, side, std::move(e), peer);
+    };
+    CHECK(ins(L"a", 0) == bv::MatchTable::Outcome::Inserted);
+    CHECK(ins(L"b", 0) == bv::MatchTable::Outcome::Inserted);
+    CHECK_EQ(t.throttleEngagements(), 0ull);
+    CHECK(ins(L"c", 0) == bv::MatchTable::Outcome::Inserted);
+    CHECK_EQ(t.throttleEngagements(), 1ull);
+    CHECK_EQ(t.throttleWaiters(), 0ull);
+    CHECK(t.throttleMaxWaitTicks() <= t.throttleWaitTicks());
+    CHECK_EQ(t.highWater(), 2ull);
+    // The table stays functional: a late peer still matches.
+    CHECK(ins(L"a", 1) == bv::MatchTable::Outcome::Matched);
+    CHECK_EQ(t.pendingSideA(), 2ull);
+});
+
+TEST("progress: comparer ticks carry live match gauges and the threshold", [] {
+    // Source-only tree (empty destination): nothing ever matches, so side A
+    // stays pending while the comparer drains it. Deterministic: the root
+    // completion tick already follows the first stored insert.
+    const auto dir = MakeTempDir();
+    const std::wstring src = dir + L"\\src";
+    const std::wstring dst = dir + L"\\dst";
+    fs::create_directories(src + L"\\sub");
+    for (int i = 0; i < 10; ++i) {
+        CHECK(WriteFileBytes(src + L"\\sub\\f" + std::to_wstring(i) + L".dat", "data", 4));
+    }
+    fs::create_directories(dst);
+
+    ScanOptions opts;
+    opts.source = src;
+    opts.destination = dst;
+    opts.mode = ScanMode::Presence;
+    opts.backend = EnumeratorBackend::Win32;
+    uint64_t maxA = 0;
+    uint64_t maxPeakA = 0;
+    uint64_t hw = 0;
+    uint64_t ticks = 0;
+    opts.onProgress = [&](const bv::ScanProgress& p) {
+        ++ticks;
+        maxA = std::max(maxA, p.matchPendingA);
+        maxPeakA = std::max(maxPeakA, p.matchPeakA);
+        if (p.matchHighWater != 0) hw = p.matchHighWater;
+    };
+    ScanController ctrl(false);
+    const ScanReport r = ctrl.run(opts);
+    CHECK(r.sourceOk && r.destinationOk);
+    CHECK(ticks > 0);
+    CHECK_EQ(hw, 1ull << 20); // default threshold published on comparer ticks
+    CHECK_MSG(maxA > 0, "source-only tree must show pending A while draining");
+    CHECK(maxPeakA >= maxA);
+});
+
 TEST("matchtable: one-sided backpressure never deadlocks while matching (tight high-water)", [] {
     // highWater=1 forces the source worker (side 0) to park at essentially every
     // insert and rely on the destination (side 1) - which is never gated - to

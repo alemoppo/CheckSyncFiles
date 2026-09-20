@@ -126,6 +126,11 @@ public:
 
 private:
     void workerThread(ScanOptions options);
+    // Stores a progress tick; ticks emitted without a live MatchTable (index
+    // build, capture hashing, final Done) carry matchHighWater == 0 and must
+    // not wipe the gauges: the previous readings are preserved. Caller holds
+    // mtx_.
+    void storeProgressLocked(const ScanProgress& p);
     unsigned int threadToCount() const;
     // Copies the callback out of the lock and invokes it (the callback may run
     // on the worker thread; it must be cheap and never take this mutex).
