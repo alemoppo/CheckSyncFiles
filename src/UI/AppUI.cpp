@@ -422,6 +422,21 @@ std::wstring FormatHms(double seconds) {
     return buf;
 }
 
+// Per-directory seconds with millisecond resolution ("1.234 s"), for the
+// Tempistiche view. Matches the CLI FmtSec granularity.
+std::wstring FormatSecW(double seconds) {
+    if (seconds < 0.0) seconds = 0.0;
+    wchar_t buf[32];
+    swprintf(buf, 32, L"%.3f s", seconds);
+    return buf;
+}
+
+// Tempistiche view: A/B side selector geometry (shared by draw + hit-test).
+constexpr int kTimingSideW = 64;
+constexpr int kTimingSideH = 26;
+constexpr int kTimingSideGap = 8;
+constexpr int kTimingLineH = 20;
+
 std::wstring FormatRateCountW(uint64_t count, double seconds) {
     if (seconds <= 0.0 || count == 0) return L"n/d";
     double v = static_cast<double>(count) / seconds;
@@ -701,7 +716,12 @@ void AppUI::processEvents() {
                     const int ticks = static_cast<int>(wheelAccum_);
                     if (ticks != 0) {
                         wheelAccum_ -= static_cast<float>(ticks);
-                        scroll_ -= ticks;
+                        // The Tempistiche view has its own line model.
+                        if (filter_ == kFilterTimings) {
+                            timingScroll_ = std::max(0, timingScroll_ - ticks);
+                        } else {
+                            scroll_ -= ticks;
+                        }
                         dirty_ = true;
                     }
                 }
@@ -852,18 +872,40 @@ void AppUI::OnMouseDown(int mx, int my) {
         dirty_.store(true);
     }
 
-    // Filters.
+    // Filters (7 problem views + the Tempistiche timings view).
     const int fr = 92;
-    for (int i = 0; i < 7; ++i) {
+    for (int i = 0; i < 8; ++i) {
         const int x = kMargin + i * fr;
         const SDL_FRect r{static_cast<float>(x), static_cast<float>(L.y8),
                           static_cast<float>(fr - 8), 26.0f};
         if (hit(mx, my, r)) {
             filter_ = static_cast<uint8_t>(i);
             scroll_ = 0;
+            timingScroll_ = 0;
             CloseContextMenu();
             rebuildFilteredCache();
             dirty_.store(true);
+        }
+    }
+
+    // Tempistiche view: A/B side selector at the top of the list area.
+    if (filter_ == kFilterTimings) {
+        const SDL_FRect ra{static_cast<float>(kMargin), static_cast<float>(L.yList),
+                           static_cast<float>(kTimingSideW), static_cast<float>(kTimingSideH)};
+        const SDL_FRect rb{static_cast<float>(kMargin + kTimingSideW + kTimingSideGap),
+                           static_cast<float>(L.yList),
+                           static_cast<float>(kTimingSideW), static_cast<float>(kTimingSideH)};
+        if (hit(mx, my, ra) && timingSide_ != 0) {
+            timingSide_ = 0;
+            timingScroll_ = 0;
+            dirty_.store(true);
+            return;
+        }
+        if (hit(mx, my, rb) && timingSide_ != 1) {
+            timingSide_ = 1;
+            timingScroll_ = 0;
+            dirty_.store(true);
+            return;
         }
     }
 
@@ -1187,8 +1229,13 @@ void AppUI::syncResultsCache(const bv::ScanOrchestrator::UiSnapshot& st) {
         resultsSourceRoot_ = st.source;
         resultsDestRoot_ = st.dest;
         resultsOffline_ = st.lastUsedSnapshot;
+        // Same hook: the timings belong to this run, so a new run always
+        // replaces them (never stale, empty when the run timed nothing).
+        uiDirTiming_ = orch_.dirTiming();
+        uiHashCacheHits_ = st.hashCacheHits;
         resultsReadySeen_ = true;
         scroll_ = 0;
+        timingScroll_ = 0;
         CloseContextMenu();
         rebuildFilteredCache();
     }
@@ -1218,6 +1265,7 @@ std::vector<const bv::FileResult*> AppUI::FilteredRows() const {
                     rows.push_back(&p);
                 break;
             case kFilterIdentical: break; // count only
+            case kFilterTimings: break;  // dedicated view, no problem rows
             default: break;
         }
     }
@@ -1473,21 +1521,185 @@ void AppUI::render(const bv::ScanOrchestrator::UiSnapshot& st) {
     }
 
     // ---- Filters ----
-    const char* filterNames[7] = {"Tutti", "Identici", "Mancanti", "Extra",
-                                  "Dimensione", "Contenuto", "Errori"};
+    const char* filterNames[8] = {"Tutti", "Identici", "Mancanti", "Extra",
+                                  "Dimensione", "Contenuto", "Errori", "Tempistiche"};
     const int fr = 92;
-    for (int i = 0; i < 7; ++i) {
+    for (int i = 0; i < 8; ++i) {
         DrawToggle(renderer_, fontBody_, filterNames[i], kMargin + i * fr, L.y8,
                    fr - 8, 26, filter_ == static_cast<uint8_t>(i));
     }
 
-    // ---- Results list ----
-    DrawResultsList(L.yList, L.listBottom);
+    // ---- Results list / Tempistiche view ----
+    if (filter_ == kFilterTimings) {
+        DrawTimings(L.yList, L.listBottom, running);
+    } else {
+        DrawResultsList(L.yList, L.listBottom);
+    }
     DrawSummary(L.summaryY, st.hashingErrors);
     DrawContextMenu();
 
     SDL_RenderPresent(renderer_);
     dirty_.store(false);
+}
+
+void AppUI::DrawTimings(int yList, int listBottom, bool running) {
+    // A/B side selector (same geometry as the click handler in OnMouseDown).
+    DrawToggle(renderer_, fontBody_, "A", kMargin, yList,
+               kTimingSideW, kTimingSideH, timingSide_ == 0);
+    DrawToggle(renderer_, fontBody_, "B", kMargin + kTimingSideW + kTimingSideGap, yList,
+               kTimingSideW, kTimingSideH, timingSide_ == 1);
+    int y = yList + kTimingSideH + 8;
+
+    if (running && !resultsReadySeen_) {
+        DrawText(renderer_, fontBody_, "Scansione in corso...", kMargin, y, kTextLo);
+        return;
+    }
+    if (!resultsReadySeen_) {
+        DrawText(renderer_, fontBody_, "Avvia una scansione per vedere le tempistiche.",
+                 kMargin, y, kTextLo);
+        return;
+    }
+    DrawText(renderer_, fontBody_, "Hash cache hit: " + Group(uiHashCacheHits_),
+             kMargin, y, kTextLo);
+    y += kTimingLineH + 6;
+
+    // Offline side A comes from the snapshot index, never from a live
+    // filesystem: explain instead of showing empty tables. Side B is normal.
+    if (timingSide_ == 0 && resultsOffline_) {
+        DrawText(renderer_, fontBody_,
+                 "Nessun dato di tempistica disponibile: il lato A proviene dallo snapshot.",
+                 kMargin, y, kTextLo);
+        return;
+    }
+
+    const std::vector<profiling::DirEntry>& list =
+        timingSide_ == 0 ? uiDirTiming_.listA : uiDirTiming_.listB;
+    const std::vector<profiling::DirEntry>& walk =
+        timingSide_ == 0 ? uiDirTiming_.walkA : uiDirTiming_.walkB;
+    const std::vector<profiling::DirEntry>& hash =
+        timingSide_ == 0 ? uiDirTiming_.hashA : uiDirTiming_.hashB;
+    if (list.empty() && walk.empty() && hash.empty()) {
+        DrawText(renderer_, fontBody_, "Nessun dato di tempistica per questo run.",
+                 kMargin, y, kTextLo);
+        return;
+    }
+
+    // Display-only line model: titles, headers, notes and rows as uniform
+    // lines. Built per frame from the already-ordered report vectors (no
+    // re-sorting, no aggregation here); at most a few dozen lines.
+    struct TLine {
+        int kind = 0; // 0 title, 1 header, 2 row, 3 note
+        const char* text = "";   // title/header/note (UTF-8 literal)
+        const char* right = "";  // header right label
+        const profiling::DirEntry* entry = nullptr; // rows only
+    };
+    std::vector<TLine> left;
+    std::vector<TLine> right;
+    if (!list.empty()) {
+        left.push_back({0, "Enumerazione directory (Listato)"});
+        left.push_back({1, "Directory", "Tempo"});
+        for (const auto& e : list) left.push_back({2, "", "", &e});
+    }
+    if (!walk.empty()) {
+        left.push_back({0, "Enumerazione directory (Walk MFT)"});
+        left.push_back({1, "Directory", "Tempo"});
+        for (const auto& e : walk) left.push_back({2, "", "", &e});
+    }
+    if (left.empty()) {
+        left.push_back({3, "(nessuna enumerazione cronometrata)"});
+    }
+    right.push_back({0, "Hash directory"});
+    // The hash column is estimate-ordered (bounded aggregation), never
+    // presented as an exact top-N: same wording as CLI/README.
+    right.push_back({3, "Top-N stimata (aggregazione bounded)"});
+    if (!hash.empty()) {
+        right.push_back({1, "Directory", "Tempo hash"});
+        for (const auto& e : hash) right.push_back({2, "", "", &e});
+    } else {
+        right.push_back({3, "(nessun dato hash: run senza verifica contenuti)"});
+    }
+
+    const int areaW = winW_ - 2 * kMargin;
+    const bool sideBySide = winW_ >= 720;
+    const int panelsTop = y;
+    const int panelsH = std::max(kTimingLineH, listBottom - y);
+    const int visibleLines = std::max(1, panelsH / kTimingLineH);
+    const size_t maxLines = sideBySide ? std::max(left.size(), right.size())
+                                       : left.size() + right.size();
+    timingScroll_ = std::clamp(timingScroll_, 0,
+                               std::max(0, static_cast<int>(maxLines) - visibleLines));
+
+    // Right-aligned text, vertically centred in a kTimingLineH box.
+    const auto drawRightVCenter = [&](const std::string& s, int rightX, int yy, RGBA c) {
+        SDL_Color col{c.r, c.g, c.b, c.a};
+        int tw = 0, th = 0;
+        SDL_Texture* t = TextTextureCached(renderer_, fontBody_, s, col, tw, th);
+        if (!t) return;
+        SDL_SetTextureBlendMode(t, SDL_BLENDMODE_BLEND);
+        const SDL_FRect d{static_cast<float>(rightX - tw),
+                          static_cast<float>(yy + (kTimingLineH - th) / 2),
+                          static_cast<float>(tw), static_cast<float>(th)};
+        SDL_RenderTexture(renderer_, t, nullptr, &d);
+    };
+    // Display-only path fit: truncate (never alter the stored data). The walk
+    // root itself is keyed "" like ScanError::path; show it as "(radice)".
+    const auto fitDir = [&](const std::wstring& d, int colW) {
+        std::wstring s = d.empty() ? L"(radice)" : d;
+        const size_t budget = static_cast<size_t>(std::max(10, (colW - 116) / 7));
+        if (s.size() > budget) s = s.substr(0, budget - 3) + L"...";
+        return ToUtf8(s);
+    };
+    const auto drawLine = [&](int x, int w, const TLine& ln, int yy) {
+        if (ln.kind == 0) {
+            DrawText(renderer_, fontBold_, ln.text, x + 8, yy + 1, kTextHi);
+        } else if (ln.kind == 1) {
+            DrawTextVCenter(renderer_, fontBody_, ln.text, x + 8, yy, kTimingLineH, kTextLo);
+            drawRightVCenter(ln.right, x + w - 8, yy, kTextLo);
+        } else if (ln.kind == 3) {
+            DrawTextVCenter(renderer_, fontBody_, ln.text, x + 8, yy, kTimingLineH, kTextLo);
+        } else {
+            DrawTextVCenter(renderer_, fontBody_, fitDir(ln.entry->dir, w), x + 8, yy,
+                            kTimingLineH, kTextHi);
+            drawRightVCenter(ToUtf8(FormatSecW(ln.entry->seconds)), x + w - 8, yy, kTextHi);
+        }
+    };
+
+    if (sideBySide) {
+        const int lw = (areaW - 8) / 2;
+        const int lx = kMargin;
+        const int rx = lx + lw + 8;
+        const int rw = areaW - lw - 8;
+        const SDL_Rect clip{lx, panelsTop, lw + 8 + rw, panelsH};
+        SDL_SetRenderClipRect(renderer_, &clip);
+        FillRect(renderer_, lx, panelsTop, lw, panelsH, kField);
+        DrawRect(renderer_, lx, panelsTop, lw, panelsH, kBorder);
+        FillRect(renderer_, rx, panelsTop, rw, panelsH, kField);
+        DrawRect(renderer_, rx, panelsTop, rw, panelsH, kBorder);
+        for (int i = 0; i < visibleLines; ++i) {
+            const size_t li = static_cast<size_t>(timingScroll_) + static_cast<size_t>(i);
+            const int yy = panelsTop + i * kTimingLineH;
+            if (li < left.size()) drawLine(lx, lw, left[li], yy);
+            if (li < right.size()) drawLine(rx, rw, right[li], yy);
+        }
+        SDL_SetRenderClipRect(renderer_, nullptr);
+    } else {
+        const SDL_Rect clip{kMargin, panelsTop, areaW, panelsH};
+        SDL_SetRenderClipRect(renderer_, &clip);
+        FillRect(renderer_, kMargin, panelsTop, areaW, panelsH, kField);
+        DrawRect(renderer_, kMargin, panelsTop, areaW, panelsH, kBorder);
+        for (int i = 0; i < visibleLines; ++i) {
+            const size_t li = static_cast<size_t>(timingScroll_) + static_cast<size_t>(i);
+            const int yy = panelsTop + i * kTimingLineH;
+            if (li < left.size()) {
+                drawLine(kMargin, areaW, left[li], yy);
+            } else if (li - left.size() < right.size()) {
+                drawLine(kMargin, areaW, right[li - left.size()], yy);
+            } else {
+                break;
+            }
+        }
+        SDL_SetRenderClipRect(renderer_, nullptr);
+    }
 }
 
 void AppUI::DrawResultsList(int yList, int listBottom) {

@@ -53,7 +53,8 @@ public:
         ScanProgress progress;
         unsigned int threadCountUsed = 0; // hash workers actually launched
         double lastSecondsTotal = 0.0;    // duration of the last completed scan
-        uint64_t hashingErrors = 0;       // worker exceptions during hashing
+        uint64_t hashingErrors = 0;  // worker exceptions during hashing
+        uint64_t hashCacheHits = 0;  // persistent-cache hits of the last run
         bool lastSnapshotWritten = false;
         bool lastUsedSnapshot = false;
         bool lastDegraded = false;
@@ -119,6 +120,9 @@ public:
     // The completed results (moved into the snapshot's caller once, when a run
     // finishes; cheap to copy, kept out of UiSnapshot to bound per-frame cost).
     ResultSet results() const;
+    // The slowest-directories tops of the last run (same one-shot pattern as
+    // results(): plain data vectors, copied once, never per-frame).
+    profiling::DirTimingReport dirTiming() const;
 
 private:
     void workerThread(ScanOptions options);
@@ -159,6 +163,8 @@ private:
     bool destinationOk_ = true;
     std::vector<std::wstring> notes_;
     uint64_t hashingErrors_ = 0;
+    uint64_t hashCacheHits_ = 0;
+    profiling::DirTimingReport dirTiming_;
     std::wstring lastSnapshotPath_;
     std::wstring statusNote_;
 

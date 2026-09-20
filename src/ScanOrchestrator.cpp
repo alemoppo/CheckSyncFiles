@@ -344,6 +344,7 @@ ScanOrchestrator::UiSnapshot ScanOrchestrator::snapshot() const {
     s.threadCountUsed = threadCountUsed_;
     s.lastSecondsTotal = lastSecondsTotal_;
     s.hashingErrors = hashingErrors_;
+    s.hashCacheHits = hashCacheHits_;
     s.lastSnapshotWritten = lastSnapshotWritten_;
     s.lastUsedSnapshot = lastUsedSnapshot_;
     s.lastDegraded = lastDegraded_;
@@ -354,6 +355,11 @@ ScanOrchestrator::UiSnapshot ScanOrchestrator::snapshot() const {
 ResultSet ScanOrchestrator::results() const {
     std::lock_guard<std::mutex> lk(mtx_);
     return results_;
+}
+
+profiling::DirTimingReport ScanOrchestrator::dirTiming() const {
+    std::lock_guard<std::mutex> lk(mtx_);
+    return dirTiming_;
 }
 
 unsigned int ScanOrchestrator::threadToCount() const {
@@ -375,6 +381,8 @@ void ScanOrchestrator::resetForRunLocked() {
     destinationOk_ = true;
     notes_.clear();
     hashingErrors_ = 0;
+    hashCacheHits_ = 0;
+    dirTiming_ = {};
     statusNote_.clear();
     lastSnapshotPath_.clear();
 }
@@ -403,6 +411,8 @@ void ScanOrchestrator::workerThread(ScanOptions options) {
         threadCountUsed_ = report.hashThreadsUsed;
         lastSecondsTotal_ = report.secondsTotal;
         hashingErrors_ = report.hashingErrors;
+        hashCacheHits_ = report.hashCacheHits;
+        dirTiming_ = report.dirTiming;
         progress_.phase = ScanPhase::Done;
         progress_.files = results_.stats.sourceFiles;
         progress_.dirs = results_.stats.sourceDirs;

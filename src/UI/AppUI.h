@@ -8,6 +8,7 @@
 #include <SDL3/SDL.h>
 
 #include "Comparison/ComparisonResult.h"
+#include "Profiling/DirTiming.h"
 #include "ScanOrchestrator.h"
 
 struct TTF_Font;
@@ -40,6 +41,7 @@ private:
     static constexpr Uint8 kFilterSize = 4;
     static constexpr Uint8 kFilterContent = 5;
     static constexpr Uint8 kFilterErrors = 6;
+    static constexpr Uint8 kFilterTimings = 7;
 
     bool init();
     void shutdown();
@@ -73,6 +75,10 @@ private:
     // handlers never rescan the whole problem list.
     void rebuildFilteredCache();
     void DrawResultsList(int yList, int listBottom);
+    // "Tempistiche" view: slowest directories of the cached run, read-only
+    // from uiDirTiming_ (never recomputed here). Dedicated drawing, separate
+    // from DrawResultsList: different dataset, no scrolling model shared.
+    void DrawTimings(int yList, int listBottom, bool running);
     void DrawSummary(int summaryY, uint64_t hashingErrors);
 
     // hits ------------------------------------------------------------------
@@ -125,6 +131,15 @@ private:
     // Cached copy of the last completed results (updated by syncResultsCache).
     ResultSet uiResults_;
     bool resultsReadySeen_ = false;
+    // Slowest-directories tops of the displayed run, cached once with the
+    // results above (same hook, so a new run always replaces them and they
+    // can never go stale). Plus the run-global hash-cache hit count.
+    profiling::DirTimingReport uiDirTiming_;
+    uint64_t uiHashCacheHits_ = 0;
+    // Tempistiche view state (GUI-only): selected side (0 = A, 1 = B) and the
+    // first visible content line of the panels (wheel scroll, own model).
+    int timingSide_ = 0;
+    int timingScroll_ = 0;
     // A/B roots used by the currently displayed results, captured when the
     // results arrive so the context-menu targets never follow later field
     // edits. A = source field, B = destination field.

@@ -347,9 +347,12 @@ SDL: aggiungere `C:\msys64\mingw64\bin` al PATH oppure copiarle accanto all'`.ex
 La GUI fa girare la scansione su un thread separato, mostra l'avanzamento, barra di
 progressione, pulsanti AVVIA / INTERROMPI / SNAPSHOT / ESPORTA CSV / **CARICA SNAP.**
 (confronto offline), la lista dei problemi filtrabile (Tutti / Identici / Mancanti /
-Extra / Dimensione / Contenuto / Errori) con scroll (rotella + scrollbar laterale
-trascinabile col mouse: drag del thumb o click sulla track), il toggle case-sensitive
-e la scelta del **back-end di enumerazione** (Auto / Win32 / MFT). Ogni riga mostra
+Extra / Dimensione / Contenuto / Errori / **Tempistiche**) con scroll (rotella +
+scrollbar laterale trascinabile col mouse: drag del thumb o click sulla track), il
+toggle case-sensitive e la scelta del **back-end di enumerazione** (Auto / Win32 / MFT).
+La vista Tempistiche mostra le directory più lente del run (selettore lato A/B,
+pannelli Enumerazione + Hash con nota "Top-N stimata" per l'hash, conteggio globale
+degli hash cache hit; in offline il lato A spiega che proviene dallo snapshot). Ogni riga mostra
 il **percorso completo** del file (`FileResult.fullPath`: radice + percorso relativo,
 con il solo nome file in grassetto; Missing → lato sorgente, Extra → lato destinazione,
 errori → lato fallito se uno solo, altrimenti destinazione come fallback).
