@@ -121,6 +121,7 @@ private:
     int scrollbarThumbY = 0;
     int scrollbarThumbH = 0;
     bool scrollbarDragging_ = false;
+    bool sliderDragging_ = false; // verify-percent slider thumb drag
     int scrollbarDragStartY_ = 0;
     float scrollbarDragRatio_ = 0.0f;
 
@@ -128,6 +129,21 @@ private:
     // Lives here because the field text is stored in the orchestrator; this is
     // the only UI-side bit of the editing state.
     size_t caret_ = 0;
+    // Classic text-field selection: the selected range is
+    // [min(selAnchor_, caret_), max(selAnchor_, caret_)) in UTF-16 code units.
+    // Collapsed (anchor == caret) means "no selection". Collapse it on focus
+    // change, blur and Escape; both ends always sit on codepoint boundaries.
+    size_t selAnchor_ = 0;
+    bool HasSelection() const { return selAnchor_ != caret_; }
+    void ClearSelection() { selAnchor_ = caret_; }
+    // Erases the selected range from buf (ends clamped); caret collapses to
+    // its start. Returns true when something was erased.
+    bool EraseSelection(std::wstring& buf);
+    // Left button held after a press inside a path field: motion extends.
+    bool fieldDrag_ = false;
+    // Last left-press inside a field, for double-click word selection.
+    Uint64 lastClickTicks_ = 0;
+    int lastClickField_ = 0; // 0 = none/outside, 1 = source, 2 = dest
 
     // Cached copy of the last completed results (updated by syncResultsCache).
     ResultSet uiResults_;

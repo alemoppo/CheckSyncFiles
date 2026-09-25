@@ -153,7 +153,7 @@ private:
     std::wstring dest_;
     bool sourceFocus_ = false;
     bool destFocus_ = false;
-    ScanMode mode_ = ScanMode::Presence;
+    ScanMode mode_ = ScanMode::Content; // GUI default: slider picks Size/Content
     bool caseSensitive_ = false;
     EnumeratorBackend backend_ = EnumeratorBackend::Auto;
     int threadSel_ = 0;

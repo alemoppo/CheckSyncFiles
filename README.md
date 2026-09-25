@@ -290,7 +290,7 @@ con percentuale/pattern effettivi. La chiave cache include livello effettivo
 (letture complete condividono sempre la chiave 100/Edges); snapshot e confronti
 offline leggono sempre per intero. Il JSON riporta la sezione run-level
 `verify` (`mode`, `percent_requested`, `pattern`, `random`). La GUI offre tre
-toggle pattern + stepper percentuale (0% = solo dimensione) e un banner
+toggle pattern + slider percentuale trascinabile con % interna e tasti -/+ da 1% (0% = solo dimensione) e un banner
 run-level quando la lettura è stata davvero parziale.
 
 ### Cache hash persistente
@@ -364,8 +364,10 @@ La GUI fa girare la scansione su un thread separato, mostra l'avanzamento, barra
 progressione, pulsanti AVVIA / INTERROMPI / SNAPSHOT / ESPORTA CSV / **CARICA SNAP.**
 (confronto offline), la lista dei problemi filtrabile (Tutti / Identici / Mancanti /
 Extra / Dimensione / Contenuto / Errori / **Tempistiche**) con scroll (rotella +
-scrollbar laterale trascinabile col mouse: drag del thumb o click sulla track), il
-toggle case-sensitive e la scelta del **back-end di enumerazione** (Auto / Win32 / MFT).
+scrollbar laterale trascinabile col mouse: drag del thumb o click sulla track) e la
+scelta del **back-end di enumerazione** (Auto / Win32 / MFT). La modalità di confronto
+si sceglie solo dallo slider di verifica (0% = Dimensione, 1-99% = Contenuto parziale,
+100% = Contenuto completo): Presenza e case-sensitive restano disponibili solo da CLI.
 La vista Tempistiche mostra le directory più lente del run (selettore lato A/B,
 pannelli Enumerazione + Hash con nota "Top-N stimata" per l'hash, conteggio globale
 degli hash cache hit; in offline il lato A spiega che proviene dallo snapshot).

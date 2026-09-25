@@ -42,6 +42,28 @@ constexpr int kCtxRowH = 26;
 constexpr int kCtxPadX = 12;
 constexpr int kCtxPadY = 6;
 
+// Verify-percent slider geometry (shared by draw, hit-test and drag so the
+// three can never drift apart). Layout on the y3b row, after the three
+// pattern toggles (3 x 90px starting at kMargin + 100):
+//   [Solo dimensione] [-] [=== slider 45% ===] [+] [Contenuto completo]
+constexpr int kVerifyStepX0 = kMargin + 100 + 3 * 90 + 16;
+constexpr int kVerifyLblW = 118;
+constexpr int kVerifyBtnW = 28;
+constexpr int kVerifySliderW = 190;
+constexpr int kVerifyThumbW = 10;
+constexpr int kVerifyMinusX = kVerifyStepX0 + kVerifyLblW;
+constexpr int kVerifySliderX = kVerifyMinusX + kVerifyBtnW + 8;
+constexpr int kVerifyPlusX = kVerifySliderX + kVerifySliderW + 8;
+constexpr int kVerifyCtlH = 22;
+
+// Slider pixel -> 0..100 percent (clamped, rounded).
+int SliderPercentFromX(int mx) {
+    const double frac =
+        static_cast<double>(mx - kVerifySliderX) / static_cast<double>(kVerifySliderW);
+    const int p = static_cast<int>(frac * 100.0 + 0.5);
+    return std::clamp(p, 0, 100);
+}
+
 // Geometry for the whole window, shared by render() (drawing) and
 // OnMouseDown() (hit-testing) so the two can never drift apart.
 struct Layout {
@@ -51,7 +73,7 @@ struct Layout {
     int browseX = 0;     // browse button left edge
     int browseW = kBrowseW;
 
-    int y1 = 0, y2 = 0, y3 = 0, y3b = 0, y3c = 0, y4 = 0, y5 = 0;
+    int y1 = 0, y2 = 0, y3 = 0, y3b = 0, y4 = 0, y5 = 0;
     int y6 = 0, y7 = 0, y8 = 0, yList = 0, listBottom = 0, summaryY = 0;
     int metricsY = 0; // dedicated footer row for Tempo / Velocita
 
@@ -73,10 +95,9 @@ Layout ComputeLayout(int W, int H) {
 
     L.y1 = kMargin + titleH;
     L.y2 = L.y1 + kFieldH + kGap;
-    L.y3 = L.y2 + kFieldH + kGap + 8;
-    L.y3b = L.y3 + 30; // back-end selection row
-    L.y3c = L.y3b + 30; // partial-verify pattern/percent row
-    L.y4 = L.y3c + 30;
+    L.y3 = L.y2 + kFieldH + kGap + 8; // back-end selection row
+    L.y3b = L.y3 + 30; // partial-verify pattern/percent row
+    L.y4 = L.y3b + 30;
     L.y5 = L.y4 + 30;
     L.y6 = L.y5 + 40;
     L.y7 = L.y6 + 30;
@@ -352,6 +373,36 @@ size_t NextCodepoint(const std::wstring& s, size_t caret) {
     if (caret + 1 < s.size() && s[caret] >= 0xD800 && s[caret] <= 0xDBFF &&
         s[caret + 1] >= 0xDC00 && s[caret + 1] <= 0xDFFF) return caret + 2;
     return caret + 1;
+}
+
+// Word character for double-click selection in path fields: letters, digits
+// and filename-friendly punctuation. Separators (backslash, slash, colon,
+// space, quotes) break words, so a double-click selects one path component.
+bool IsSelWordChar(wchar_t c) {
+    if (c >= 0xD800 && c <= 0xDFFF) return false; // never split a surrogate pair
+    if (c >= 0x80) return true;
+    return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+           c == L'_' || c == L'.' || c == L'-' || c == L'~';
+}
+
+// Classic double-click word selection around pos (codepoint-snapped).
+void SelectWord(const std::wstring& s, size_t pos, size_t& anchor, size_t& caret) {
+    pos = std::min(pos, s.size());
+    if (pos > 0 && pos < s.size() && s[pos] >= 0xDC00 && s[pos] <= 0xDFFF &&
+        s[pos - 1] >= 0xD800 && s[pos - 1] <= 0xDBFF) --pos;
+    size_t lo = pos;
+    while (lo > 0) {
+        const size_t p = PrevCodepoint(s, lo);
+        if (!IsSelWordChar(s[p])) break;
+        lo = p;
+    }
+    size_t hi = pos;
+    while (hi < s.size()) {
+        if (!IsSelWordChar(s[hi])) break;
+        hi = NextCodepoint(s, hi);
+    }
+    anchor = lo;
+    caret = hi;
 }
 
 // Horizontal pixel offset of a caret at `caret` inside `text`, relative to the
@@ -712,6 +763,10 @@ void AppUI::processEvents() {
                 break;
             case SDL_EVENT_MOUSE_MOTION:
                 dirty_ = true; // refresh hover highlights
+                if (sliderDragging_) {
+                    orch_.setVerifyPercent(SliderPercentFromX(static_cast<int>(ev.motion.x)));
+                    dirty_ = true;
+                }
                 if (scrollbarDragging_) {
                     const float dy = static_cast<float>(ev.motion.y - scrollbarDragStartY_);
                     const float trackRange = static_cast<float>(scrollbarTrackH - scrollbarThumbH);
@@ -722,6 +777,20 @@ void AppUI::processEvents() {
                         scroll_ = std::clamp(static_cast<int>(newRatio * static_cast<float>(maxScroll)), 0, maxScroll);
                     }
                     dirty_ = true;
+                }
+                if (fieldDrag_) { // drag extends the field selection (anchor held)
+                    const bv::ScanOrchestrator::UiSnapshot dgs = orch_.snapshot();
+                    const Layout dgl = ComputeLayout(winW_, winH_);
+                    const int tx = static_cast<int>(ev.motion.x);
+                    if (dgs.sourceFocus && !dgs.useSnapshot) {
+                        caret_ = CaretFromPixelX(fontBody_, dgs.source, tx,
+                                                 static_cast<int>(dgl.fieldX) + 6);
+                        dirty_ = true;
+                    } else if (dgs.destFocus) {
+                        caret_ = CaretFromPixelX(fontBody_, dgs.dest, tx,
+                                                 static_cast<int>(dgl.fieldX) + 6);
+                        dirty_ = true;
+                    }
                 }
                 break;
             case SDL_EVENT_MOUSE_BUTTON_DOWN:
@@ -738,6 +807,7 @@ void AppUI::processEvents() {
                 break;
             case SDL_EVENT_MOUSE_BUTTON_UP:
                 scrollbarDragging_ = false;
+                sliderDragging_ = false;
                 break;
             case SDL_EVENT_MOUSE_WHEEL:
                 // `mouse_x/mouse_y` are the cursor position; `x/y` are only the
@@ -786,6 +856,7 @@ void AppUI::OnMouseDown(int mx, int my) {
             orch_.setSource(picked);
             orch_.useLiveSource(); // manual source: back to live enumeration
             if (st.sourceFocus) caret_ = picked.size(); // replacement, not edit
+            ClearSelection();
             dirty_.store(true);
         }
         return;
@@ -795,27 +866,53 @@ void AppUI::OnMouseDown(int mx, int my) {
         if (BrowseFolder(picked)) {
             orch_.setDest(picked);
             if (st.destFocus) caret_ = picked.size();
+            ClearSelection();
             dirty_.store(true);
         }
         return;
     }
 
-    // Path fields: focus (a click also moves the caret to the click position).
+    // Path fields: click moves the caret (single click collapses any
+    // selection), drag extends the selection, double-click selects a word.
     if (hit(mx, my, L.sourceField)) {
         if (offline) return; // source field is disabled while offline
+        const Uint64 now = SDL_GetTicks();
+        const bool dbl = st.sourceFocus && lastClickField_ == 1 &&
+                         now - lastClickTicks_ < 500;
         orch_.setSourceFocus(true);
         orch_.setDestFocus(false);
-        caret_ = CaretFromPixelX(fontBody_, st.source, mx,
-                                 static_cast<int>(L.fieldX) + 6);
+        const size_t pos =
+            CaretFromPixelX(fontBody_, st.source, mx, static_cast<int>(L.fieldX) + 6);
+        if (dbl) {
+            SelectWord(st.source, pos, selAnchor_, caret_);
+        } else {
+            caret_ = pos;
+            selAnchor_ = pos;
+        }
+        lastClickTicks_ = now;
+        lastClickField_ = 1;
+        fieldDrag_ = true;
         SDL_StartTextInput(window_);
         dirty_.store(true);
         return;
     }
     if (hit(mx, my, L.destField)) {
+        const Uint64 now = SDL_GetTicks();
+        const bool dbl = st.destFocus && lastClickField_ == 2 &&
+                         now - lastClickTicks_ < 500;
         orch_.setDestFocus(true);
         orch_.setSourceFocus(false);
-        caret_ = CaretFromPixelX(fontBody_, st.dest, mx,
-                                 static_cast<int>(L.fieldX) + 6);
+        const size_t pos =
+            CaretFromPixelX(fontBody_, st.dest, mx, static_cast<int>(L.fieldX) + 6);
+        if (dbl) {
+            SelectWord(st.dest, pos, selAnchor_, caret_);
+        } else {
+            caret_ = pos;
+            selAnchor_ = pos;
+        }
+        lastClickTicks_ = now;
+        lastClickField_ = 2;
+        fieldDrag_ = true;
         SDL_StartTextInput(window_);
         dirty_.store(true);
         return;
@@ -823,31 +920,15 @@ void AppUI::OnMouseDown(int mx, int my) {
     if (st.sourceFocus || st.destFocus) {
         orch_.setSourceFocus(false);
         orch_.setDestFocus(false);
+        ClearSelection();
+        lastClickField_ = 0;
         SDL_StopTextInput(window_);
         dirty_.store(true);
     }
 
-    // Mode radios.
-    const int mr = 110;
-    for (int i = 0; i < 3; ++i) {
-        const int x = kMargin + 100 + i * mr;
-        const SDL_FRect r{static_cast<float>(x), static_cast<float>(L.y3 + 2),
-                          static_cast<float>(mr - 12), 22.0f};
-        if (hit(mx, my, r)) {
-            orch_.setMode(static_cast<ScanMode>(i));
-            dirty_.store(true);
-        }
-    }
-
-    // Case sensitivity toggle (after the mode radios).
-    {
-        const int x = kMargin + 100 + 3 * mr;
-        const SDL_FRect r{static_cast<float>(x), static_cast<float>(L.y3 + 2), 104.0f, 22.0f};
-        if (hit(mx, my, r)) {
-            orch_.setCaseSensitive(!st.caseSensitive);
-            dirty_.store(true);
-        }
-    }
+    // NOTE: no mode/case widgets here anymore. The verify slider below is the
+    // only Size/Content selector (0% = Size, >0% = Content); Presence and the
+    // case-sensitivity toggle live on as engine/CLI features only.
 
     // Back-end selection row (Auto / Win32 / MFT).
     {
@@ -858,7 +939,7 @@ void AppUI::OnMouseDown(int mx, int my) {
                           {EnumeratorBackend::Mft, L"MFT"}};
         for (int i = 0; i < 3; ++i) {
             const int x = kMargin + 100 + i * br;
-            const SDL_FRect r{static_cast<float>(x), static_cast<float>(L.y3b + 2),
+            const SDL_FRect r{static_cast<float>(x), static_cast<float>(L.y3 + 2),
                               static_cast<float>(br - 12), 22.0f};
             if (hit(mx, my, r)) {
                 orch_.setBackend(bes[i].v);
@@ -868,7 +949,7 @@ void AppUI::OnMouseDown(int mx, int my) {
     }
 
     // Partial-verify row: three peer pattern toggles (not a dropdown) plus a
-    // percent stepper with explicit end labels. Applies to Content mode only;
+    // draggable percent slider (-/+ step by 1) with explicit end labels.
     // the controller ignores it otherwise. Percent 0 means size comparison
     // (mapped to Size at scan start); the row geometry below must match the
     // draw code exactly.
@@ -876,24 +957,33 @@ void AppUI::OnMouseDown(int mx, int my) {
         const int pr = 90;
         for (int i = 0; i < 3; ++i) {
             const int x = kMargin + 100 + i * pr;
-            const SDL_FRect r{static_cast<float>(x), static_cast<float>(L.y3c + 2),
+            const SDL_FRect r{static_cast<float>(x), static_cast<float>(L.y3b + 2),
                               static_cast<float>(pr - 12), 22.0f};
             if (hit(mx, my, r)) {
                 orch_.setVerifyPattern(static_cast<PartialPattern>(i));
                 dirty_.store(true);
             }
         }
-        const int px0 = kMargin + 100 + 3 * pr + 16;
-        const SDL_FRect rMinus{static_cast<float>(px0 + 118), static_cast<float>(L.y3c + 2),
-                               30.0f, 22.0f};
-        const SDL_FRect rPlus{static_cast<float>(px0 + 118 + 38 + 64 + 8),
-                              static_cast<float>(L.y3c + 2), 30.0f, 22.0f};
+        const SDL_FRect rMinus{static_cast<float>(kVerifyMinusX),
+                               static_cast<float>(L.y3b + 2),
+                               static_cast<float>(kVerifyBtnW), 22.0f};
+        const SDL_FRect rSlider{static_cast<float>(kVerifySliderX),
+                                static_cast<float>(L.y3b + 2),
+                                static_cast<float>(kVerifySliderW), 22.0f};
+        const SDL_FRect rPlus{static_cast<float>(kVerifyPlusX),
+                              static_cast<float>(L.y3b + 2),
+                              static_cast<float>(kVerifyBtnW), 22.0f};
         if (hit(mx, my, rMinus)) {
-            orch_.setVerifyPercent(st.verifyPercent - 5);
+            orch_.setVerifyPercent(st.verifyPercent - 1); // fine adjust
+            dirty_.store(true);
+        }
+        if (hit(mx, my, rSlider)) {
+            orch_.setVerifyPercent(SliderPercentFromX(mx));
+            sliderDragging_ = true;
             dirty_.store(true);
         }
         if (hit(mx, my, rPlus)) {
-            orch_.setVerifyPercent(st.verifyPercent + 5);
+            orch_.setVerifyPercent(st.verifyPercent + 1); // fine adjust
             dirty_.store(true);
         }
     }
@@ -1141,6 +1231,16 @@ bool AppUI::isPointerOverList(float wx, float wy) {
     return wy >= L.yList && wy < L.listBottom;
 }
 
+bool AppUI::EraseSelection(std::wstring& buf) {
+    const size_t a = std::min(selAnchor_, buf.size());
+    const size_t c = std::min(caret_, buf.size());
+    if (a == c) return false;
+    buf.erase(std::min(a, c), std::max(a, c) - std::min(a, c));
+    caret_ = std::min(a, c);
+    selAnchor_ = caret_;
+    return true;
+}
+
 void AppUI::OnKeyDown(unsigned int key, bool repeat) {
     (void)repeat;
     bv::ScanOrchestrator::UiSnapshot st = orch_.snapshot();
@@ -1159,6 +1259,8 @@ void AppUI::OnKeyDown(unsigned int key, bool repeat) {
         if (inField) {
             orch_.setSourceFocus(false);
             orch_.setDestFocus(false);
+            ClearSelection();
+            lastClickField_ = 0;
             SDL_StopTextInput(window_);
             dirty_.store(true);
         }
@@ -1167,8 +1269,10 @@ void AppUI::OnKeyDown(unsigned int key, bool repeat) {
     if (!inField) return;
 
     const bool ctrl = (SDL_GetModState() & SDL_KMOD_CTRL) != 0;
+    const bool shift = (SDL_GetModState() & SDL_KMOD_SHIFT) != 0;
     std::wstring buf = st.sourceFocus ? st.source : st.dest;
     caret_ = std::min(caret_, buf.size());
+    selAnchor_ = std::min(selAnchor_, buf.size());
 
     // Edits write the whole field back through the orchestrator.
     const auto commit = [&] {
@@ -1176,58 +1280,97 @@ void AppUI::OnKeyDown(unsigned int key, bool repeat) {
         else orch_.setDest(buf);
         dirty_.store(true);
     };
+    // Selection bounds, ordered.
+    const auto selLo = [&] { return std::min(selAnchor_, caret_); };
+    const auto selHi = [&] { return std::max(selAnchor_, caret_); };
 
-    if (ctrl && key == SDLK_V) { // paste
+    if (ctrl && key == SDLK_V) { // paste: replace the selection first
         if (SDL_HasClipboardText()) {
             char* clip = SDL_GetClipboardText();
             if (clip) {
                 const std::wstring ws = FromUtf8(clip);
                 SDL_free(clip);
+                EraseSelection(buf);
                 buf.insert(caret_, ws);
                 caret_ += ws.size();
+                ClearSelection();
                 commit();
             }
         }
         return;
     }
-    if (ctrl && key == SDLK_C) { // copy the whole field
-        if (!buf.empty()) SDL_SetClipboardText(ToUtf8(buf).c_str());
+    if (ctrl && key == SDLK_C) { // copy selection, else the whole field
+        if (HasSelection()) {
+            SDL_SetClipboardText(ToUtf8(buf.substr(selLo(), selHi() - selLo())).c_str());
+        } else if (!buf.empty()) {
+            SDL_SetClipboardText(ToUtf8(buf).c_str());
+        }
         return;
     }
-    if (ctrl && key == SDLK_X) { // cut: copy, then clear
-        if (!buf.empty()) SDL_SetClipboardText(ToUtf8(buf).c_str());
-        buf.clear();
-        caret_ = 0;
-        commit();
+    if (ctrl && key == SDLK_X) { // cut selection, else clear the whole field
+        if (HasSelection()) {
+            SDL_SetClipboardText(ToUtf8(buf.substr(selLo(), selHi() - selLo())).c_str());
+            EraseSelection(buf);
+            commit();
+        } else if (!buf.empty()) {
+            SDL_SetClipboardText(ToUtf8(buf).c_str());
+            buf.clear();
+            caret_ = 0;
+            ClearSelection();
+            commit();
+        }
         return;
     }
-    if (ctrl && key == SDLK_A) return; // no selection model yet: ignore
+    if (ctrl && key == SDLK_A) { // select all
+        selAnchor_ = 0;
+        caret_ = buf.size();
+        dirty_.store(true);
+        return;
+    }
 
     switch (key) {
         case SDLK_BACKSPACE:
-            RemoveCodepointBefore(buf, caret_);
+            if (!EraseSelection(buf)) RemoveCodepointBefore(buf, caret_);
             commit();
             break;
         case SDLK_DELETE:
-            if (caret_ < buf.size()) {
+            if (EraseSelection(buf)) {
+                commit();
+            } else if (caret_ < buf.size()) {
                 RemoveCodepointAt(buf, caret_);
                 commit();
             }
             break;
         case SDLK_LEFT:
-            caret_ = PrevCodepoint(buf, caret_);
+            if (shift) {
+                caret_ = PrevCodepoint(buf, caret_);
+            } else if (HasSelection()) {
+                caret_ = selLo(); // collapse to the start
+                ClearSelection();
+            } else {
+                caret_ = PrevCodepoint(buf, caret_);
+            }
             dirty_.store(true);
             break;
         case SDLK_RIGHT:
-            caret_ = NextCodepoint(buf, caret_);
+            if (shift) {
+                caret_ = NextCodepoint(buf, caret_);
+            } else if (HasSelection()) {
+                caret_ = selHi(); // collapse to the end
+                ClearSelection();
+            } else {
+                caret_ = NextCodepoint(buf, caret_);
+            }
             dirty_.store(true);
             break;
         case SDLK_HOME:
             caret_ = 0;
+            if (!shift) ClearSelection();
             dirty_.store(true);
             break;
         case SDLK_END:
             caret_ = buf.size();
+            if (!shift) ClearSelection();
             dirty_.store(true);
             break;
         default:
@@ -1245,8 +1388,11 @@ void AppUI::OnTextInput(const char* text) {
     if (ws.empty()) return;
     std::wstring buf = st.sourceFocus ? st.source : st.dest;
     caret_ = std::min(caret_, buf.size());
+    selAnchor_ = std::min(selAnchor_, buf.size());
+    EraseSelection(buf); // typing replaces the selection
     buf.insert(caret_, ws);
     caret_ += ws.size();
+    ClearSelection();
     if (st.sourceFocus) {
         orch_.setSource(buf);
     } else {
@@ -1384,9 +1530,21 @@ void AppUI::render(const bv::ScanOrchestrator::UiSnapshot& st) {
     }
     DrawRect(renderer_, L.fieldX, L.y1, L.fieldW, kFieldH,
              st.useSnapshot ? kBorder : (st.sourceFocus ? kAccent : kBorder));
+    if (st.sourceFocus && !st.useSnapshot) {
+        // Selection highlight behind the text (classic input behavior).
+        caret_ = std::min(caret_, st.source.size());
+        selAnchor_ = std::min(selAnchor_, st.source.size());
+        const size_t lo = std::min(selAnchor_, caret_);
+        const size_t hi = std::max(selAnchor_, caret_);
+        if (hi > lo) {
+            const int textLeft = static_cast<int>(L.fieldX) + 6;
+            const int x0 = CaretPixelX(fontBody_, st.source, lo, textLeft);
+            const int x1 = CaretPixelX(fontBody_, st.source, hi, textLeft);
+            FillRect(renderer_, x0, L.y1 + 4, x1 - x0, kFieldH - 8, kAccent);
+        }
+    }
     DrawTextVCenter(renderer_, fontBody_, ToUtf8(srcText), L.fieldX + 6, L.y1, kFieldH, srcCol);
     if (st.sourceFocus && !st.useSnapshot) {
-        caret_ = std::min(caret_, st.source.size());
         const int cx = CaretPixelX(fontBody_, st.source, caret_,
                                    static_cast<int>(L.fieldX) + 6);
         FillRect(renderer_, cx, L.y1 + 4, 1, kFieldH - 8, kTextHi);
@@ -1400,9 +1558,20 @@ void AppUI::render(const bv::ScanOrchestrator::UiSnapshot& st) {
     DrawTextVCenter(renderer_, fontBody_, "Destinaz.:", L.labelX, L.y2, kFieldH, kTextLo);
     FillRect(renderer_, L.fieldX, L.y2, L.fieldW, kFieldH, kField);
     DrawRect(renderer_, L.fieldX, L.y2, L.fieldW, kFieldH, st.destFocus ? kAccent : kBorder);
-    DrawTextVCenter(renderer_, fontBody_, ToUtf8(st.dest), L.fieldX + 6, L.y2, kFieldH, kTextHi);
     if (st.destFocus) {
         caret_ = std::min(caret_, st.dest.size());
+        selAnchor_ = std::min(selAnchor_, st.dest.size());
+        const size_t lo = std::min(selAnchor_, caret_);
+        const size_t hi = std::max(selAnchor_, caret_);
+        if (hi > lo) {
+            const int textLeft = static_cast<int>(L.fieldX) + 6;
+            const int x0 = CaretPixelX(fontBody_, st.dest, lo, textLeft);
+            const int x1 = CaretPixelX(fontBody_, st.dest, hi, textLeft);
+            FillRect(renderer_, x0, L.y2 + 4, x1 - x0, kFieldH - 8, kAccent);
+        }
+    }
+    DrawTextVCenter(renderer_, fontBody_, ToUtf8(st.dest), L.fieldX + 6, L.y2, kFieldH, kTextHi);
+    if (st.destFocus) {
         const int cx = CaretPixelX(fontBody_, st.dest, caret_,
                                    static_cast<int>(L.fieldX) + 6);
         FillRect(renderer_, cx, L.y2 + 4, 1, kFieldH - 8, kTextHi);
@@ -1410,48 +1579,48 @@ void AppUI::render(const bv::ScanOrchestrator::UiSnapshot& st) {
     const bool overDstBrowse = hit(static_cast<int>(mx), static_cast<int>(my), L.destBrowse);
     DrawPickerButton(renderer_, fontBody_, L.destBrowse, overDstBrowse);
 
-    // ---- Modalita ----
-    DrawTextVCenter(renderer_, fontBody_, "Modalita:", L.labelX, L.y3, 26, kTextLo);
-    const char* modeNames[3] = {"Presenza", "Dimensione", "Contenuto"};
-    const int mr = 110;
-    for (int i = 0; i < 3; ++i) {
-        DrawToggle(renderer_, fontBody_, modeNames[i], kMargin + 100 + i * mr, L.y3 + 2,
-                   mr - 12, 22, static_cast<int>(st.mode) == i);
-    }
-    DrawToggle(renderer_, fontBody_, "Case-sens.", kMargin + 100 + 3 * mr, L.y3 + 2,
-               104, 22, st.caseSensitive);
-
     // ---- Back-end ----
-    DrawTextVCenter(renderer_, fontBody_, "Back-end:", L.labelX, L.y3b, 26, kTextLo);
+    DrawTextVCenter(renderer_, fontBody_, "Back-end:", L.labelX, L.y3, 26, kTextLo);
     const char* beNames[3] = {"Auto", "Win32", "MFT"};
     const int br = 90;
     for (int i = 0; i < 3; ++i) {
-        DrawToggle(renderer_, fontBody_, beNames[i], kMargin + 100 + i * br, L.y3b + 2,
+        DrawToggle(renderer_, fontBody_, beNames[i], kMargin + 100 + i * br, L.y3 + 2,
                    br - 12, 22, static_cast<int>(st.backend) == i);
     }
 
-    // ---- Verifica parziale (Content mode) ----
-    DrawTextVCenter(renderer_, fontBody_, "Verifica:", L.labelX, L.y3c, 26, kTextLo);
+    // ---- Verifica (Size/Content via slider) ----
+    DrawTextVCenter(renderer_, fontBody_, "Verifica:", L.labelX, L.y3b, 26, kTextLo);
     const char* patNames[3] = {"Edges", "Center", "Random"};
     const int pr = 90;
     for (int i = 0; i < 3; ++i) {
-        DrawToggle(renderer_, fontBody_, patNames[i], kMargin + 100 + i * pr, L.y3c + 2,
+        DrawToggle(renderer_, fontBody_, patNames[i], kMargin + 100 + i * pr, L.y3b + 2,
                    pr - 8, 22, static_cast<int>(st.verifyPattern) == i);
     }
     {
-        const int px0 = kMargin + 100 + 3 * pr + 16;
-        DrawTextVCenter(renderer_, fontBody_, "Solo dimensione", px0, L.y3c, 26, kTextLo);
-        DrawToggle(renderer_, fontBody_, "-", px0 + 118, L.y3c + 2, 30, 22, false);
+        const int px0 = kVerifyStepX0;
+        DrawTextVCenter(renderer_, fontBody_, "Solo dimensione", px0, L.y3b, 26, kTextLo);
+        DrawToggle(renderer_, fontBody_, "-", kVerifyMinusX, L.y3b + 2, kVerifyBtnW, 22,
+                   false);
+        // Slider track with proportional fill, thumb handle and % inside.
+        const int pct = std::clamp(st.verifyPercent, 0, 100);
+        FillRect(renderer_, kVerifySliderX, L.y3b + 2, kVerifySliderW, 22, kPanel);
+        const int fillW = (kVerifySliderW * pct) / 100;
+        if (fillW > 0) {
+            FillRect(renderer_, kVerifySliderX, L.y3b + 2, fillW, 22, kAccent);
+        }
+        DrawRect(renderer_, kVerifySliderX, L.y3b + 2, kVerifySliderW, 22, kBorder);
+        const int thumbX =
+            kVerifySliderX + (kVerifySliderW * pct) / 100 - kVerifyThumbW / 2;
+        FillRect(renderer_, thumbX, L.y3b + 2, kVerifyThumbW, 22, kAccentHover);
+        DrawRect(renderer_, thumbX, L.y3b + 2, kVerifyThumbW, 22, kBorder);
         wchar_t pctBuf[16];
-        swprintf(pctBuf, 16, L"%d%%", st.verifyPercent);
-        FillRect(renderer_, px0 + 118 + 38, L.y3c + 2, 64, 22, kPanel);
-        DrawRect(renderer_, px0 + 118 + 38, L.y3c + 2, 64, 22, kBorder);
-        DrawTextCenterIn(renderer_, fontBody_, ToUtf8(pctBuf), px0 + 118 + 38, L.y3c + 2,
-                         64, 22, kTextHi);
-        DrawToggle(renderer_, fontBody_, "+", px0 + 118 + 38 + 64 + 8, L.y3c + 2, 30, 22,
+        swprintf(pctBuf, 16, L"%d%%", pct);
+        DrawTextCenterIn(renderer_, fontBody_, ToUtf8(pctBuf), kVerifySliderX, L.y3b + 2,
+                         kVerifySliderW, 22, kTextHi);
+        DrawToggle(renderer_, fontBody_, "+", kVerifyPlusX, L.y3b + 2, kVerifyBtnW, 22,
                    false);
         DrawTextVCenter(renderer_, fontBody_, "Contenuto completo",
-                        px0 + 118 + 38 + 64 + 8 + 30 + 8, L.y3c, 26, kTextLo);
+                        kVerifyPlusX + kVerifyBtnW + 8, L.y3b, 26, kTextLo);
     }
 
     // ---- Thread ----
