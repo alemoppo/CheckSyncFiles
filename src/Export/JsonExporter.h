@@ -30,7 +30,7 @@ bool WriteJson(const std::wstring& filePath, const ResultSet& result, std::wstri
 // the true ranking for close values.
 bool WriteJson(const std::wstring& filePath, const ResultSet& result,
                const profiling::DirTimingReport& timing, uint64_t hashCacheHits,
-               std::wstring& error);
+               const VerifyInfo& verify, std::wstring& error);
 
 } // namespace exporting
 } // namespace bv

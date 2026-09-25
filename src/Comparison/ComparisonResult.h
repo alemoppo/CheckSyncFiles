@@ -5,6 +5,8 @@
 #include <string>
 #include <vector>
 
+#include "Comparison/ScanMode.h"
+
 namespace bv {
 
 enum class Status : uint8_t {
@@ -13,6 +15,13 @@ enum class Status : uint8_t {
     Extra,           // present only in destination
     SizeMismatch,    // same relative path, different size
     ContentMismatch, // same path+size, different content (Phase 3)
+    // Partial-verification outcomes (Content mode with percent < 100): NEVER
+    // reuse Identical/ContentMismatch for these, so a future switch missing
+    // the new cases fails loudly instead of misclassifying silently.
+    // IdenticalPartial is a verdict value only (counted in
+    // Stats::identicalPartialFiles, never stored in problems: see below).
+    IdenticalPartial,      // no difference found in the sampled portions
+    ContentMismatchPartial, // difference found in the sampled portions
     ReadError,       // could not be read/enumerated (non-access error)
     AccessDenied,    // access denied while enumerating or reading
     ChangedDuringScan, // file was modified between enumeration and verification
@@ -34,6 +43,13 @@ struct FileResult {
     bool hasHashDest = false;
     std::array<uint8_t, 32> hashSource{};
     std::array<uint8_t, 32> hashDest{};
+
+    // Partial verification actually applied to this file (Content mode with
+    // percent < 100): the EFFECTIVE percent/pattern (see EffectiveLevel),
+    // never the nominal user choice and never Random. Meaningful only for
+    // ContentMismatchPartial rows (100/Edges otherwise).
+    int verifiedPercent = 100;
+    PartialPattern verifiedPattern = PartialPattern::Edges;
 };
 
 struct Stats {
@@ -49,7 +65,13 @@ struct Stats {
     uint64_t extraFiles = 0;
     uint64_t extraDirs = 0;
     uint64_t sizeMismatch = 0;
-    uint64_t contentMismatch = 0;
+    uint64_t contentMismatch = 0; // full-content mismatches only
+
+    // Partial-verification outcomes (Content mode with percent < 100):
+    // identical-partial files are counted here, never stored in problems
+    // (memory bound); partial mismatches ARE stored (they are differences).
+    uint64_t identicalPartialFiles = 0;
+    uint64_t contentMismatchPartial = 0;
 
     uint64_t readErrors = 0;
     uint64_t accessDenied = 0;
@@ -57,6 +79,20 @@ struct Stats {
 
     uint64_t bytesSource = 0; // sum of source file sizes
     uint64_t bytesDest = 0;   // sum of destination file sizes
+};
+
+// Run-level partial-verification record: what was requested vs effectively
+// applied (see the run-level rules in ScanController::run). Stored in
+// ScanReport, exported to JSON, and shown in the CLI/GUI run banners.
+struct VerifyInfo {
+    int percentRequested = 100;
+    // Actually applied: < 100 only for a live-live Content compare without
+    // snapshot capture (capture/index digests are always full).
+    int percentEffective = 100;
+    // Resolved pattern (never Random; Edges whenever the effective read is
+    // full). Meaningful only when percentEffective < 100.
+    PartialPattern pattern = PartialPattern::Edges;
+    bool patternRandom = false; // the user chose Random (resolved once/run)
 };
 
 // Result of a comparison. Only the non-identical entries are kept in `problems`

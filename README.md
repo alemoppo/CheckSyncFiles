@@ -277,10 +277,26 @@ vincolo di memoria è intenzionale. In offline il lato A proviene dall'indice/sn
 La stessa sezione è esportata in JSON come `slowest_dirs` (`list_a/walk_a/list_b/walk_b/
 hash_a/hash_b` + `hash_cache_hits`); l'export CSV resta invariato.
 
+### Verifica parziale del contenuto (euristica)
+
+In modalità Contenuto, `--verify-percent <1-100>` (default 100) legge solo una
+frazione di ogni file sopra i 2 MiB e `--verify-pattern <edges|center|random>`
+(default `edges`) sceglie il campionamento: testa+coda, blocco centrale
+allineato a MiB, o uno dei due sorteggiato una volta per run. Sotto soglia o a
+100% la lettura è sempre completa. `IDENTICO_PARZIALE` significa "nessuna
+differenza nelle parti lette" (conteggiato, non elencato) e **non** equivale a
+verifica completa; le differenze trovate diventano `CONTENUTO_DIVERSO_PARZIALE`
+con percentuale/pattern effettivi. La chiave cache include livello effettivo
+(letture complete condividono sempre la chiave 100/Edges); snapshot e confronti
+offline leggono sempre per intero. Il JSON riporta la sezione run-level
+`verify` (`mode`, `percent_requested`, `pattern`, `random`). La GUI offre tre
+toggle pattern + stepper percentuale (0% = solo dimensione) e un banner
+run-level quando la lettura è stata davvero parziale.
+
 ### Cache hash persistente
 
 `--hash-cache <file>` attiva una cache SHA-256 con chiave `(path assoluto, dimensione,
-ultima modifica)`: se il file è invariato il digest viene riusato e il file **non viene
+ultima modifica, percentuale e pattern effettivi)`: se il file è invariato il digest viene riusato e il file **non viene
 riletto**. La cache è un'ottimizzazione opzionale: non cambia mai un verdetto (la chiave
 viene calcolata sul file corrente prima del lookup). Un file di cache corrotto viene
 ignorato con un avviso, mai bloccante.
@@ -389,6 +405,7 @@ rileva `CMakeLists.txt`). Il codice usa solo C++17 standard + API Win32.
 ```text
 bv_cli --source <percorso> --dest <percorso> [--mode presence|size|content]
        [--case-sensitive] [--enum auto|win32|mft] [--list-problems [--limit N]]
+       [--verify-percent <1-100>] [--verify-pattern edges|center|random]
        [--snapshot-out <file>] [--compare <snapshot>] [--hash-cache <file>]
        [--export <file>] [--export-format csv|json] [--help]
 ```

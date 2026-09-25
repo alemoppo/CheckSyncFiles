@@ -12,7 +12,9 @@ void HashOneSide(const std::wstring& absPath, uint64_t expectedSize, uint64_t ex
                  bool& changed, HashStatus& status, Digest& digest, bool valid,
                  HashCache* cache, std::atomic<size_t>& cacheHits,
                  profiling::HashSession* session, profiling::Side side,
-                 const std::atomic_bool* cancel, profiling::DirHashTop* dirHash) {
+                 const std::atomic_bool* cancel, profiling::DirHashTop* dirHash,
+                 const partial::PartialReadPlan* plan, int effPercent,
+                 PartialPattern effPattern) {
     if (!valid) {
         status = HashStatus::ReadError;
         return;
@@ -62,7 +64,8 @@ void HashOneSide(const std::wstring& absPath, uint64_t expectedSize, uint64_t ex
     // cache exists and profiling is on; otherwise one false branch.
     const bool wantCacheTiming = prof && cache;
     const uint64_t c0 = wantCacheTiming ? profiling::QpcNow() : 0;
-    const bool cacheHit = cache && cache->Lookup(absPath, sz, mt, digest);
+    const bool cacheHit =
+        cache && cache->Lookup(absPath, sz, mt, digest, effPercent, effPattern);
     if (wantCacheTiming) {
         session->prof->NoteCacheLookup(*session, side, profiling::QpcNow() - c0);
     }
@@ -80,9 +83,9 @@ void HashOneSide(const std::wstring& absPath, uint64_t expectedSize, uint64_t ex
     profiling::FileTimings ft;
     if (prof) session->prof->FileBegin(*session, side, absPath, expectedSize);
     if (wantFt) {
-        status = Sha256FileFromHandle<true>(h, digest, &ft, cancel);
+        status = Sha256FileFromHandle<true>(h, digest, &ft, cancel, plan);
     } else {
-        status = Sha256FileFromHandle<false>(h, digest, nullptr, cancel);
+        status = Sha256FileFromHandle<false>(h, digest, nullptr, cancel, plan);
     }
     if (prof) session->prof->FileEnd(*session, side, absPath, expectedSize, ft,
                                      status == HashStatus::Ok);
@@ -109,7 +112,7 @@ void HashOneSide(const std::wstring& absPath, uint64_t expectedSize, uint64_t ex
         session->prof->NoteStatAfter(*session, side, profiling::QpcNow() - t2Start);
     }
     CloseHandle(h);
-    if (cache) cache->Store(absPath, sz, mt, digest);
+    if (cache) cache->Store(absPath, sz, mt, digest, effPercent, effPattern);
 }
 
 } // namespace hashing

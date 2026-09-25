@@ -12,7 +12,10 @@ namespace hashing {
 namespace {
 
 constexpr uint32_t kMagic = 0x43485642; // "BVHC"
-constexpr uint32_t kCacheVersion = 1;
+// v2: keys gained the effective (percent, pattern) components. v1 files are
+// rejected once and rebuilt: their 3-component keys could never match a v2
+// lookup, so keeping them would only waste memory.
+constexpr uint32_t kCacheVersion = 2;
 
 // Sanity bound for a corrupt cache so a garbage length cannot cause a huge
 // allocation (64 MiB worth of keys is already an enormous cache).
@@ -21,12 +24,21 @@ constexpr uint64_t kMaxEntries = 1ull << 30;
 
 } // namespace
 
-std::string HashCache::MakeKey(const std::wstring& absPath, uint64_t size, uint64_t mtime) {
+std::string HashCache::MakeKey(const std::wstring& absPath, uint64_t size, uint64_t mtime,
+                               int effPercent, PartialPattern effPattern) {
+    // A full read always keys as 100/Edges, whatever pattern came with it:
+    // this normalization lives HERE (not only at callers) so no call path
+    // can accidentally fork the full-read key space.
+    if (effPercent == 100) effPattern = PartialPattern::Edges;
     std::string k = pathutil::ToUtf8(absPath);
     k += '\x01';
     k += std::to_string(size);
     k += '\x01';
     k += std::to_string(mtime);
+    k += '\x01';
+    k += std::to_string(effPercent);
+    k += '\x01';
+    k += std::to_string(static_cast<int>(effPattern));
     return k;
 }
 
@@ -77,18 +89,20 @@ HashCache::HashCache(const std::wstring& filePath, std::wstring& error) {
 }
 
 bool HashCache::Lookup(const std::wstring& absPath, uint64_t size, uint64_t mtime,
-                       std::array<uint8_t, 32>& digest) const {
+                       std::array<uint8_t, 32>& digest, int effPercent,
+                       PartialPattern effPattern) const {
     std::lock_guard<std::mutex> lock(mutex_);
-    const auto it = map_.find(MakeKey(absPath, size, mtime));
+    const auto it = map_.find(MakeKey(absPath, size, mtime, effPercent, effPattern));
     if (it == map_.end()) return false;
     digest = it->second;
     return true;
 }
 
 void HashCache::Store(const std::wstring& absPath, uint64_t size, uint64_t mtime,
-                      const std::array<uint8_t, 32>& digest) {
+                      const std::array<uint8_t, 32>& digest, int effPercent,
+                      PartialPattern effPattern) {
     std::lock_guard<std::mutex> lock(mutex_);
-    map_[MakeKey(absPath, size, mtime)] = digest;
+    map_[MakeKey(absPath, size, mtime, effPercent, effPattern)] = digest;
 }
 
 size_t HashCache::size() const {

@@ -39,6 +39,12 @@ void WriteDirList(std::ofstream& out, const char* name,
     out << "]" << (lastList ? "" : ",");
 }
 
+// Lowercase pattern token for the run-level verify section. Resolved
+// upstream: Random can never reach the export.
+const char* VerifyPatternToken(PartialPattern pattern) {
+    return pattern == PartialPattern::Center ? "center" : "edges";
+}
+
 } // namespace
 
 bool WriteJson(const std::wstring& filePath, const ResultSet& result, std::wstring& error) {
@@ -74,7 +80,7 @@ bool WriteJson(const std::wstring& filePath, const ResultSet& result, std::wstri
 
 bool WriteJson(const std::wstring& filePath, const ResultSet& result,
                const profiling::DirTimingReport& timing, uint64_t hashCacheHits,
-               std::wstring& error) {
+               const VerifyInfo& verify, std::wstring& error) {
     std::ofstream out(pathutil::AddLongPathPrefix(filePath).c_str(),
                       std::ios::binary | std::ios::out | std::ios::trunc);
     if (!out) {
@@ -100,7 +106,15 @@ bool WriteJson(const std::wstring& filePath, const ResultSet& result,
     WriteDirList(out, "walk_b", timing.walkB);
     WriteDirList(out, "hash_a", timing.hashA);
     WriteDirList(out, "hash_b", timing.hashB, /*lastList=*/true);
-    out << ",\"hash_cache_hits\":" << hashCacheHits << "}}\n";
+    out << ",\"hash_cache_hits\":" << hashCacheHits;
+    // Run-level verification mode (always present, marked complete when the
+    // effective read was full): requested percent, resolved pattern, and
+    // whether Random was resolved for this run.
+    out << ",\"verify\":{\"mode\":\""
+        << (verify.percentEffective < 100 ? "partial" : "full") << "\""
+        << ",\"percent_requested\":" << verify.percentRequested
+        << ",\"pattern\":\"" << VerifyPatternToken(verify.pattern) << "\""
+        << ",\"random\":" << (verify.patternRandom ? "true" : "false") << "}}\n";
 
     out.flush();
     if (!out.good()) {

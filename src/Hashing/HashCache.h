@@ -6,6 +6,8 @@
 #include <string>
 #include <unordered_map>
 
+#include "Comparison/ScanMode.h"
+
 namespace bv {
 namespace hashing {
 
@@ -26,19 +28,28 @@ public:
     // broken cache never blocks a scan.
     explicit HashCache(const std::wstring& filePath, std::wstring& error);
 
+    // `effPercent`/`effPattern` are ALWAYS the effective level (see
+    // partial::EffectiveLevel): 100/Edges for any full read, whatever was
+    // requested. A digest read fully under any requested combination shares
+    // one key, so cross-run lookups hit regardless of the originating level.
     bool Lookup(const std::wstring& absPath, uint64_t size, uint64_t mtime,
-                std::array<uint8_t, 32>& digest) const;
+                std::array<uint8_t, 32>& digest, int effPercent, PartialPattern effPattern) const;
     void Store(const std::wstring& absPath, uint64_t size, uint64_t mtime,
-               const std::array<uint8_t, 32>& digest);
+               const std::array<uint8_t, 32>& digest, int effPercent,
+               PartialPattern effPattern);
 
     // Writes the whole cache back. Returns false and fills `error` on I/O error.
     bool Save(std::wstring& error) const;
 
     size_t size() const;
 
-    // Combined key (path \x01 size \x01 mtime). The separator is a control
-    // character, which NTFS forbids inside file names, so it cannot collide.
-    static std::string MakeKey(const std::wstring& absPath, uint64_t size, uint64_t mtime);
+    // Combined key (path \x01 size \x01 mtime \x01 percent \x01 pattern). The
+    // separator is a control character, which NTFS forbids inside file names,
+    // so it cannot collide. The pattern is ALWAYS normalized to Edges when
+    // the effective percent is 100 (here, not only at callers): a full read
+    // must produce one key whatever pattern was requested alongside it.
+    static std::string MakeKey(const std::wstring& absPath, uint64_t size, uint64_t mtime,
+                               int effPercent, PartialPattern effPattern);
 
 private:
     std::string filePath_; // UTF-8

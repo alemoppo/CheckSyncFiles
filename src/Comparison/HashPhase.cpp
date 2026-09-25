@@ -24,6 +24,8 @@ void AddStats(Stats& target, const Stats& add) {
     target.extraDirs += add.extraDirs;
     target.sizeMismatch += add.sizeMismatch;
     target.contentMismatch += add.contentMismatch;
+    target.identicalPartialFiles += add.identicalPartialFiles;
+    target.contentMismatchPartial += add.contentMismatchPartial;
     target.readErrors += add.readErrors;
     target.accessDenied += add.accessDenied;
     target.changedDuringScan += add.changedDuringScan;
@@ -44,7 +46,24 @@ void HashOneCandidateInto(const ContentCandidate& c, bool offlineSource, FileInd
                           hashing::HashCache* cache, std::atomic<size_t>& cacheHits,
                           profiling::HashSession* session,
                           profiling::JobVerdict* verdict = nullptr,
-                          profiling::DirHashTop* dirHash = nullptr) {
+                          profiling::DirHashTop* dirHash = nullptr,
+                          ContentVerifyLevel verify = ContentVerifyLevel{}) {
+    // The read plan is computed ONCE per file from the source size (candidates
+    // only exist when both sides share it: ClassifyMatched guarantees
+    // sizeSource == sizeDest, otherwise this is SizeMismatch upstream) and the
+    // IDENTICAL plan object is applied to both sides A and B below. Never
+    // recompute per side: the digests are comparable only over the same bytes.
+    // Offline source digests come from the snapshot index (always captured
+    // fully), so the destination must also read fully: a partial read could
+    // never match a full digest. Same for a degraded/no-hash snapshot.
+    partial::PartialReadPlan plan;
+    if (!offlineSource && verify.percent < 100) {
+        plan = partial::ComputePartialReadPlan(c.sizeSource, verify.percent, verify.pattern);
+    } else {
+        plan.isFullRead = true; // default-constructed plan already means this
+    }
+    const partial::EffectiveVerify eff =
+        partial::EffectiveLevel(plan, verify.percent, verify.pattern);
     auto& stats = sink.stats();
     const auto inc = [&stats](std::atomic<uint64_t>& x) {
         x.fetch_add(1, std::memory_order_relaxed);
@@ -103,7 +122,8 @@ void HashOneCandidateInto(const ContentCandidate& c, bool offlineSource, FileInd
     } else {
         hashing::HashOneSide(pathutil::MakeAbsolute(sourceRoot, c.relativePath), c.sizeSource,
                              c.srcMtime, changed, srcStatus, srcDigest, true, cache, cacheHits,
-                             session, profiling::Side::Source, cancel, dirHash);
+                             session, profiling::Side::Source, cancel, dirHash, &plan,
+                             eff.percent, eff.pattern);
         hasSrc = (srcStatus == hashing::HashStatus::Ok);
         if (srcStatus == hashing::HashStatus::Cancelled ||
             (cancel && cancel->load(std::memory_order_relaxed))) {
@@ -119,7 +139,8 @@ void HashOneCandidateInto(const ContentCandidate& c, bool offlineSource, FileInd
     }
     hashing::HashOneSide(pathutil::MakeAbsolute(destRoot, c.relativePath), c.sizeDest, c.dstMtime,
                          dstChanged, dstStatus, dstDigest, true, cache, cacheHits, session,
-                         profiling::Side::Dest, cancel, dirHash);
+                         profiling::Side::Dest, cancel, dirHash, &plan,
+                         eff.percent, eff.pattern);
     hasDst = (dstStatus == hashing::HashStatus::Ok);
     if (dstStatus == hashing::HashStatus::Cancelled ||
         (cancel && cancel->load(std::memory_order_relaxed))) {
@@ -151,12 +172,27 @@ void HashOneCandidateInto(const ContentCandidate& c, bool offlineSource, FileInd
     if (srcStatus == hashing::HashStatus::Ok && dstStatus == hashing::HashStatus::Ok) {
         if (srcDigest == dstDigest) {
             if (verdict) *verdict = profiling::JobVerdict::Identical;
-            inc(stats.identicalFiles);
+            if (plan.isFullRead) {
+                inc(stats.identicalFiles);
+            } else {
+                // Verdict IdenticalPartial (section-0 decision): counted in
+                // stats, never stored in problems (memory bound).
+                inc(stats.identicalPartialFiles);
+            }
         } else {
             if (verdict) *verdict = profiling::JobVerdict::ContentMismatch;
-            inc(stats.contentMismatch);
             FileResult r;
-            r.status = Status::ContentMismatch;
+            if (plan.isFullRead) {
+                inc(stats.contentMismatch);
+                r.status = Status::ContentMismatch;
+            } else {
+                inc(stats.contentMismatchPartial);
+                r.status = Status::ContentMismatchPartial;
+                // The EFFECTIVE level (never nominal, never Random): what this
+                // file was actually verified with.
+                r.verifiedPercent = eff.percent;
+                r.verifiedPattern = eff.pattern;
+            }
             // Live scan: both sides exist, show the reference (source) side.
             // Offline: the source device is absent, show the accessible side.
             r.fullPath = pathutil::MakeAbsolute(offlineSource ? destRoot : sourceRoot,
@@ -191,7 +227,8 @@ void SubmitHashCandidates(const std::vector<ContentCandidate>& candidates, Threa
                           ConcurrentSink& sink, const std::atomic_bool* cancel,
                           hashing::HashCache* cache, std::atomic<size_t>& cacheHits,
                           std::atomic<uint64_t>* hashDone, profiling::HashProfiler* prof,
-                          profiling::Side side, profiling::DirHashTop* dirHash) {
+                          profiling::Side side, profiling::DirHashTop* dirHash,
+                          ContentVerifyLevel verify) {
     // Per-job profiling is armed exactly when the profiler is enabled. The
     // enqueue timestamp is captured at the call site for each candidate (the
     // moment this producer hands the task to the pool); the executing worker
@@ -205,7 +242,7 @@ void SubmitHashCandidates(const std::vector<ContentCandidate>& candidates, Threa
         // destroyed as soon as this call returns, and a task can never confuse
         // one candidate with a neighbouring element.
         pool.submit([c, offlineSource, index, &sourceRoot, &destRoot, &sink, cancel, cache,
-                     &cacheHits, hashDone, prof, profOn, side, enq, dirHash] {
+                     &cacheHits, hashDone, prof, profOn, side, enq, dirHash, verify] {
             // HashSession owns the profiler task slot: it bumps/decrements the
             // active-job counters and issues this task's unique job id, and it
             // is destroyed on every exit path (including a thrown exception).
@@ -226,7 +263,7 @@ void SubmitHashCandidates(const std::vector<ContentCandidate>& candidates, Threa
             // the throw as a task error for the caller.
             try {
                 HashOneCandidateInto(c, offlineSource, index, sourceRoot, destRoot, sink, cancel,
-                                     cache, cacheHits, &session, &verdict, dirHash);
+                                     cache, cacheHits, &session, &verdict, dirHash, verify);
                 if (profOn) {
                     session.verdict = verdict;
                     session.endTick = profiling::QpcNow(); // job execution finish
@@ -249,7 +286,8 @@ void RunHashPhase(const std::vector<ContentCandidate>& candidates, ThreadPool& p
                   const std::wstring& destRoot, ResultSet& out, const std::atomic_bool* cancel,
                   const std::function<void(uint64_t done, uint64_t total)>& onProgress,
                   hashing::HashCache* cache, std::atomic<size_t>& cacheHits,
-                  profiling::HashProfiler* prof, profiling::DirHashTop* dirHash) {
+                  profiling::HashProfiler* prof, profiling::DirHashTop* dirHash,
+                  ContentVerifyLevel verify) {
     ConcurrentSink sink;
     const size_t total = candidates.size();
     size_t done = 0;
@@ -260,7 +298,7 @@ void RunHashPhase(const std::vector<ContentCandidate>& candidates, ThreadPool& p
         std::vector<ContentCandidate> batch(candidates.begin() + done, candidates.begin() + done + n);
         SubmitHashCandidates(batch, pool, offlineSource, index, sourceRoot, destRoot, sink,
                              cancel, cache, cacheHits, nullptr, prof,
-                             profiling::Side::Source, dirHash);
+                             profiling::Side::Source, dirHash, verify);
         pool.waitAll();
         done += n;
         if (onProgress) onProgress(done, total);

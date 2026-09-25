@@ -31,6 +31,8 @@ void AddStats(Stats& target, const Stats& add) {
     target.extraDirs += add.extraDirs;
     target.sizeMismatch += add.sizeMismatch;
     target.contentMismatch += add.contentMismatch;
+    target.identicalPartialFiles += add.identicalPartialFiles;
+    target.contentMismatchPartial += add.contentMismatchPartial;
     target.readErrors += add.readErrors;
     target.accessDenied += add.accessDenied;
     target.changedDuringScan += add.changedDuringScan;
@@ -268,7 +270,7 @@ void ConcurrentComparer::FlushHashCandidates(std::vector<ContentCandidate>& pend
                              offlineSource_ ? fromIndex_ : nullptr, sourceRoot_, destRoot_, sink,
                              cancel_, cache_, cacheHits_, &hashDone_, profile_,
                              static_cast<profiling::Side>(side),
-                             dirTiming_ ? &dirTiming_->hash : nullptr);
+                             dirTiming_ ? &dirTiming_->hash : nullptr, verify_);
         // The submitted tasks count themselves done as they finish; report
         // completion so far so progress keeps moving while the workers are still
         // enumerating.

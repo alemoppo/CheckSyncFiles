@@ -36,6 +36,9 @@ public:
         std::atomic<uint64_t> sizeMismatch{0};
         std::atomic<uint64_t> contentMismatch{0};
 
+        std::atomic<uint64_t> identicalPartialFiles{0};
+        std::atomic<uint64_t> contentMismatchPartial{0};
+
         std::atomic<uint64_t> readErrors{0};
         std::atomic<uint64_t> accessDenied{0};
         std::atomic<uint64_t> changedDuringScan{0};
@@ -69,6 +72,10 @@ public:
         out.stats.extraDirs = stats_.extraDirs.load(std::memory_order_relaxed);
         out.stats.sizeMismatch = stats_.sizeMismatch.load(std::memory_order_relaxed);
         out.stats.contentMismatch = stats_.contentMismatch.load(std::memory_order_relaxed);
+        out.stats.identicalPartialFiles =
+            stats_.identicalPartialFiles.load(std::memory_order_relaxed);
+        out.stats.contentMismatchPartial =
+            stats_.contentMismatchPartial.load(std::memory_order_relaxed);
         out.stats.readErrors = stats_.readErrors.load(std::memory_order_relaxed);
         out.stats.accessDenied = stats_.accessDenied.load(std::memory_order_relaxed);
         out.stats.changedDuringScan = stats_.changedDuringScan.load(std::memory_order_relaxed);

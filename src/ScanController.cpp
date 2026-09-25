@@ -3,6 +3,7 @@
 #include <chrono>
 #include <functional>
 #include <memory>
+#include <random>
 
 #include "Comparison/ConcurrentComparer.h"
 #include "Export/CsvExporter.h"
@@ -93,7 +94,10 @@ void HashSourceIndex(FileIndex& index, const std::wstring& root, ThreadPool& poo
                     slot.skipped = true;
                     return;
                 }
-                if (cache && cache->Lookup(abs, sz, mt, slot.digest)) {
+                // Snapshot capture always reads fully: the full key (100/Edges)
+                // is shared with any run whose plan collapses to a full read.
+                if (cache && cache->Lookup(abs, sz, mt, slot.digest, 100,
+                                           PartialPattern::Edges)) {
                     cacheHits.fetch_add(1, std::memory_order_relaxed);
                     return;
                 }
@@ -114,7 +118,8 @@ void HashSourceIndex(FileIndex& index, const std::wstring& root, ThreadPool& poo
                                  profiling::QpcToSeconds(ft.totalTicks));
                 }
                 if (ok) {
-                    if (cache) cache->Store(abs, sz, mt, slot.digest);
+                    if (cache)
+                        cache->Store(abs, sz, mt, slot.digest, 100, PartialPattern::Edges);
                 } else {
                     slot.skipped = true;
                 }
@@ -161,6 +166,37 @@ ScanReport ScanController::run(const ScanOptions& options) {
     }
 
     ScanMode mode = options.mode;
+
+    // Partial-verification setup: Random is resolved ONCE per run here, before
+    // any enumeration, from a single system-random draw (never a fixed seed,
+    // never file-derived). Only the resolved value travels downstream.
+    const bool verifyWasRandom =
+        (options.verifyLevel.pattern == PartialPattern::Random);
+    PartialPattern verifyResolved = options.verifyLevel.pattern;
+    if (verifyWasRandom && mode == ScanMode::Content) {
+        try {
+            std::random_device rd;
+            verifyResolved =
+                (rd() & 1u) ? PartialPattern::Center : PartialPattern::Edges;
+        } catch (...) {
+            verifyResolved = PartialPattern::Edges; // RNG failure: stay concrete
+        }
+    }
+    // A partial read can only ever match digests produced with the SAME plan
+    // in THIS run. Snapshot-capture digests and index digests are always full,
+    // so partial compare is allowed solely for a live-live Content compare
+    // without capture; every other combination reads fully (correct by
+    // construction, never a false mismatch).
+    const bool partialCompare = (mode == ScanMode::Content) &&
+                                (options.verifyLevel.percent < 100) && !haveSnapshot &&
+                                !haveCompare;
+    // Non-const: the offline no-digest degrade below forces it back to full.
+    ContentVerifyLevel runLevel{partialCompare ? options.verifyLevel.percent : 100,
+                                partialCompare ? verifyResolved : PartialPattern::Edges};
+    report.verify.percentRequested = options.verifyLevel.percent;
+    report.verify.pattern = runLevel.pattern;
+    report.verify.patternRandom = verifyWasRandom;
+    report.verify.percentEffective = runLevel.percent;
 
     // Optional persistent SHA-256 cache (path + size + last-write time).
     std::unique_ptr<hashing::HashCache> cache;
@@ -266,6 +302,10 @@ ScanReport ScanController::run(const ScanOptions& options) {
                 mode = ScanMode::Size; // snapshot has no digests: cannot verify content
                 report.contentDegradedToSize = true;
                 report.modeUsed = mode;
+                // No hashing happens at all: the effective read is full.
+                runLevel = ContentVerifyLevel{100, PartialPattern::Edges};
+                report.verify.pattern = PartialPattern::Edges;
+                report.verify.percentEffective = 100;
             }
         } else {
             report.sourceOk = false;
@@ -429,7 +469,7 @@ ScanReport ScanController::run(const ScanOptions& options) {
                                     sourceFromIndex ? ConcurrentComparer::SourceKind::FromIndex
                                                     : ConcurrentComparer::SourceKind::Live,
                                     sourceFromIndex ? &sourceIndex : nullptr, options.cancel,
-                                    hashProf, &dirTiming);
+                                    hashProf, &dirTiming, runLevel);
 
         const IFileEnumerator::ProgressCallback enumProgress =
             [&](uint64_t files, uint64_t dirs, uint64_t bytes, const std::wstring& path) {
@@ -502,7 +542,8 @@ ScanReport ScanController::run(const ScanOptions& options) {
         std::wstring werr;
         const bool ok = fmt == exporting::ExportFormat::Json
                             ? exporting::WriteJson(options.exportPath, report.results,
-                                                   report.dirTiming, report.hashCacheHits, werr)
+                                                   report.dirTiming, report.hashCacheHits,
+                                                   report.verify, werr)
                             : exporting::WriteCsv(options.exportPath, report.results, werr);
         report.exportWritten = ok;
         report.exportError = std::move(werr);

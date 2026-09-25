@@ -51,7 +51,7 @@ struct Layout {
     int browseX = 0;     // browse button left edge
     int browseW = kBrowseW;
 
-    int y1 = 0, y2 = 0, y3 = 0, y3b = 0, y4 = 0, y5 = 0;
+    int y1 = 0, y2 = 0, y3 = 0, y3b = 0, y3c = 0, y4 = 0, y5 = 0;
     int y6 = 0, y7 = 0, y8 = 0, yList = 0, listBottom = 0, summaryY = 0;
     int metricsY = 0; // dedicated footer row for Tempo / Velocita
 
@@ -75,7 +75,8 @@ Layout ComputeLayout(int W, int H) {
     L.y2 = L.y1 + kFieldH + kGap;
     L.y3 = L.y2 + kFieldH + kGap + 8;
     L.y3b = L.y3 + 30; // back-end selection row
-    L.y4 = L.y3b + 30;
+    L.y3c = L.y3b + 30; // partial-verify pattern/percent row
+    L.y4 = L.y3c + 30;
     L.y5 = L.y4 + 30;
     L.y6 = L.y5 + 40;
     L.y7 = L.y6 + 30;
@@ -471,6 +472,15 @@ std::wstring FormatRateCountW(uint64_t count, double seconds) {
     return buf;
 }
 
+const wchar_t* VerifyPatternName(bv::PartialPattern p) {
+    switch (p) {
+        case bv::PartialPattern::Edges: return L"Edges";
+        case bv::PartialPattern::Center: return L"Center";
+        case bv::PartialPattern::Random: return L"Random";
+    }
+    return L"?";
+}
+
 const wchar_t* StatusName(bv::Status st) {
     switch (st) {
         case bv::Status::Identical: return L"IDENTICO";
@@ -478,6 +488,8 @@ const wchar_t* StatusName(bv::Status st) {
         case bv::Status::Extra: return L"EXTRA";
         case bv::Status::SizeMismatch: return L"DIM_DIVERSA";
         case bv::Status::ContentMismatch: return L"CONTENUTO_DIVERSO";
+        case bv::Status::IdenticalPartial: return L"IDENTICO_PARZIALE";
+        case bv::Status::ContentMismatchPartial: return L"CONTENUTO_DIVERSO_PARZIALE";
         case bv::Status::ReadError: return L"ERRORE_LETTURA";
         case bv::Status::AccessDenied: return L"ACCESSO_NEGATO";
         case bv::Status::ChangedDuringScan: return L"MODIFICATO_DURANTE_SCAN";
@@ -487,9 +499,11 @@ const wchar_t* StatusName(bv::Status st) {
 
 RGBA StatusColor(bv::Status st) {
     switch (st) {
-        case bv::Status::Identical: return kOk;
+        case bv::Status::Identical:
+        case bv::Status::IdenticalPartial: return kOk; // no difference found
         case bv::Status::Missing:
         case bv::Status::ContentMismatch:
+        case bv::Status::ContentMismatchPartial:
         case bv::Status::AccessDenied: return kBad;
         case bv::Status::Extra:
         case bv::Status::SizeMismatch:
@@ -850,6 +864,37 @@ void AppUI::OnMouseDown(int mx, int my) {
                 orch_.setBackend(bes[i].v);
                 dirty_.store(true);
             }
+        }
+    }
+
+    // Partial-verify row: three peer pattern toggles (not a dropdown) plus a
+    // percent stepper with explicit end labels. Applies to Content mode only;
+    // the controller ignores it otherwise. Percent 0 means size comparison
+    // (mapped to Size at scan start); the row geometry below must match the
+    // draw code exactly.
+    {
+        const int pr = 90;
+        for (int i = 0; i < 3; ++i) {
+            const int x = kMargin + 100 + i * pr;
+            const SDL_FRect r{static_cast<float>(x), static_cast<float>(L.y3c + 2),
+                              static_cast<float>(pr - 12), 22.0f};
+            if (hit(mx, my, r)) {
+                orch_.setVerifyPattern(static_cast<PartialPattern>(i));
+                dirty_.store(true);
+            }
+        }
+        const int px0 = kMargin + 100 + 3 * pr + 16;
+        const SDL_FRect rMinus{static_cast<float>(px0 + 118), static_cast<float>(L.y3c + 2),
+                               30.0f, 22.0f};
+        const SDL_FRect rPlus{static_cast<float>(px0 + 118 + 38 + 64 + 8),
+                              static_cast<float>(L.y3c + 2), 30.0f, 22.0f};
+        if (hit(mx, my, rMinus)) {
+            orch_.setVerifyPercent(st.verifyPercent - 5);
+            dirty_.store(true);
+        }
+        if (hit(mx, my, rPlus)) {
+            orch_.setVerifyPercent(st.verifyPercent + 5);
+            dirty_.store(true);
         }
     }
 
@@ -1278,7 +1323,9 @@ std::vector<const bv::FileResult*> AppUI::FilteredRows() const {
             case kFilterExtra: if (p.status == Status::Extra) rows.push_back(&p); break;
             case kFilterSize: if (p.status == Status::SizeMismatch) rows.push_back(&p); break;
             case kFilterContent:
-                if (p.status == Status::ContentMismatch) rows.push_back(&p);
+                if (p.status == Status::ContentMismatch ||
+                    p.status == Status::ContentMismatchPartial)
+                    rows.push_back(&p);
                 break;
             case kFilterErrors:
                 if (p.status == Status::ReadError || p.status == Status::AccessDenied ||
@@ -1381,6 +1428,30 @@ void AppUI::render(const bv::ScanOrchestrator::UiSnapshot& st) {
     for (int i = 0; i < 3; ++i) {
         DrawToggle(renderer_, fontBody_, beNames[i], kMargin + 100 + i * br, L.y3b + 2,
                    br - 12, 22, static_cast<int>(st.backend) == i);
+    }
+
+    // ---- Verifica parziale (Content mode) ----
+    DrawTextVCenter(renderer_, fontBody_, "Verifica:", L.labelX, L.y3c, 26, kTextLo);
+    const char* patNames[3] = {"Edges", "Center", "Random"};
+    const int pr = 90;
+    for (int i = 0; i < 3; ++i) {
+        DrawToggle(renderer_, fontBody_, patNames[i], kMargin + 100 + i * pr, L.y3c + 2,
+                   pr - 8, 22, static_cast<int>(st.verifyPattern) == i);
+    }
+    {
+        const int px0 = kMargin + 100 + 3 * pr + 16;
+        DrawTextVCenter(renderer_, fontBody_, "Solo dimensione", px0, L.y3c, 26, kTextLo);
+        DrawToggle(renderer_, fontBody_, "-", px0 + 118, L.y3c + 2, 30, 22, false);
+        wchar_t pctBuf[16];
+        swprintf(pctBuf, 16, L"%d%%", st.verifyPercent);
+        FillRect(renderer_, px0 + 118 + 38, L.y3c + 2, 64, 22, kPanel);
+        DrawRect(renderer_, px0 + 118 + 38, L.y3c + 2, 64, 22, kBorder);
+        DrawTextCenterIn(renderer_, fontBody_, ToUtf8(pctBuf), px0 + 118 + 38, L.y3c + 2,
+                         64, 22, kTextHi);
+        DrawToggle(renderer_, fontBody_, "+", px0 + 118 + 38 + 64 + 8, L.y3c + 2, 30, 22,
+                   false);
+        DrawTextVCenter(renderer_, fontBody_, "Contenuto completo",
+                        px0 + 118 + 38 + 64 + 8 + 30 + 8, L.y3c, 26, kTextLo);
     }
 
     // ---- Thread ----
@@ -1516,6 +1587,15 @@ void AppUI::render(const bv::ScanOrchestrator::UiSnapshot& st) {
                              FormatRateCountW(uiResults_.stats.sourceFiles,
                                               st.lastSecondsTotal);
         }
+    }
+    // Run-level partial banner (like the offline note above): percent and
+    // pattern EFFECTIVELY used, shown only when the read was really partial.
+    if (st.resultsReady && st.verify.percentEffective < 100) {
+        status += L"   —  Verifica parziale " +
+                  std::to_wstring(st.verify.percentEffective) + L"% (" +
+                  VerifyPatternName(st.verify.pattern) + L")" +
+                  (st.verify.patternRandom ? L" [casuale]" : L"") +
+                  L": IDENTICO_PARZIALE puo differire nelle parti non lette.";
     }
     if (!statusNote.empty()) {
         status += (status == L"Pronto. Specificare sorgente e destinazione." ? L"" : L"   —  ") +
@@ -1886,6 +1966,12 @@ void AppUI::DrawSummary(int summaryY, uint64_t hashingErrors) {
         "   Errori " + Group(st.readErrors + st.accessDenied + st.changedDuringScan);
     if (hashingErrors > 0) {
         s += "   Err.hash " + Group(hashingErrors);
+    }
+    if (st.identicalPartialFiles > 0) {
+        s += "   Ident.parz. " + Group(st.identicalPartialFiles);
+    }
+    if (st.contentMismatchPartial > 0) {
+        s += "   Cont.parz. " + Group(st.contentMismatchPartial);
     }
     DrawText(renderer_, fontBody_, s, kMargin, summaryY, kTextLo);
 }

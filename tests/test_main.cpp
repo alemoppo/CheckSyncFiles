@@ -43,6 +43,7 @@
 #include "Filesystem/PathUtil.h"
 #include "Filesystem/Win32Enumerator.h"
 #include "Hashing/HashCache.h"
+#include "Hashing/PartialRead.h"
 #include "Hashing/Sha256.h"
 #include "Hashing/HashUtil.h"
 #include "Profiling/DirTiming.h"
@@ -604,7 +605,7 @@ TEST("cancel: mid-file hash is aborted by the cancel flag (not a read error)", [
     // No cache entry must have been written for the aborted file: a later lookup
     // cannot return the (incomplete) digest.
     std::array<uint8_t, 32> probe{};
-    CHECK(!cache.Lookup(path, sz, mt, probe));
+    CHECK(!cache.Lookup(path, sz, mt, probe, 100, PartialPattern::Edges));
     CHECK(hits.load() == 0);
 });
 
@@ -3398,8 +3399,8 @@ TEST("cache: persistence round-trip preserves digests and key semantics", [] {
         std::wstring err;
         hashing::HashCache c(file, err);
         CHECK(err.empty());
-        c.Store(L"C:\\a\\b.txt", 100, 12345, d0);
-        c.Store(L"C:\\a\\c.txt", 200, 99999, d1);
+        c.Store(L"C:\\a\\b.txt", 100, 12345, d0, 100, PartialPattern::Edges);
+        c.Store(L"C:\\a\\c.txt", 200, 99999, d1, 100, PartialPattern::Edges);
         CHECK_EQ(c.size(), 2ull);
         CHECK(c.Save(err));
         CHECK(err.empty());
@@ -3410,14 +3411,14 @@ TEST("cache: persistence round-trip preserves digests and key semantics", [] {
     CHECK(err.empty());
     CHECK_EQ(c2.size(), 2ull);
     std::array<uint8_t, 32> got{};
-    CHECK(c2.Lookup(L"C:\\a\\b.txt", 100, 12345, got));
+    CHECK(c2.Lookup(L"C:\\a\\b.txt", 100, 12345, got, 100, PartialPattern::Edges));
     CHECK(got == d0);
-    CHECK(c2.Lookup(L"C:\\a\\c.txt", 200, 99999, got));
+    CHECK(c2.Lookup(L"C:\\a\\c.txt", 200, 99999, got, 100, PartialPattern::Edges));
     CHECK(got == d1);
     // The key is (path, size, mtime): changing any component must miss.
-    CHECK(!c2.Lookup(L"C:\\a\\b.txt", 101, 12345, got));
-    CHECK(!c2.Lookup(L"C:\\a\\b.txt", 100, 12346, got));
-    CHECK(!c2.Lookup(L"C:\\a\\other.txt", 100, 12345, got));
+    CHECK(!c2.Lookup(L"C:\\a\\b.txt", 101, 12345, got, 100, PartialPattern::Edges));
+    CHECK(!c2.Lookup(L"C:\\a\\b.txt", 100, 12346, got, 100, PartialPattern::Edges));
+    CHECK(!c2.Lookup(L"C:\\a\\other.txt", 100, 12345, got, 100, PartialPattern::Edges));
 });
 
 TEST("cache: corrupt file is rejected cleanly and can be rebuilt", [] {
@@ -3433,7 +3434,7 @@ TEST("cache: corrupt file is rejected cleanly and can be rebuilt", [] {
     // The cache is still usable and rewrites a valid file from scratch.
     std::array<uint8_t, 32> d{};
     d[0] = 0xAB;
-    c.Store(L"C:\\x\\y.bin", 7, 42, d);
+    c.Store(L"C:\\x\\y.bin", 7, 42, d, 100, PartialPattern::Edges);
     CHECK(c.Save(err));
     CHECK(err.empty());
 
@@ -3442,7 +3443,7 @@ TEST("cache: corrupt file is rejected cleanly and can be rebuilt", [] {
     CHECK(err2.empty());
     CHECK_EQ(c2.size(), 1ull);
     std::array<uint8_t, 32> got{};
-    CHECK(c2.Lookup(L"C:\\x\\y.bin", 7, 42, got));
+    CHECK(c2.Lookup(L"C:\\x\\y.bin", 7, 42, got, 100, PartialPattern::Edges));
     CHECK(got[0] == 0xAB);
 });
 
@@ -3471,10 +3472,11 @@ TEST("cache: concurrent Lookup/Store from many threads stays consistent", [] {
                 std::array<uint8_t, 32> d{};
                 d[0] = static_cast<uint8_t>(t);
                 d[1] = static_cast<uint8_t>(i & 0xFF);
-                cache.Store(path, size, mtime, d);
+                cache.Store(path, size, mtime, d, 100, PartialPattern::Edges);
 
                 std::array<uint8_t, 32> got{};
-                if (cache.Lookup(path, size, mtime, got) && got == d) {
+                if (cache.Lookup(path, size, mtime, got, 100, PartialPattern::Edges) &&
+                    got == d) {
                     lookupsOk.fetch_add(1, std::memory_order_relaxed);
                 }
             }
@@ -5466,7 +5468,12 @@ TEST("dirtiming: json export carries the slowest_dirs section", [] {
 
     const std::wstring file = MakeTempDir() + L"\\slow.json";
     std::wstring err;
-    CHECK(exporting::WriteJson(file, r, t, 7, err));
+    VerifyInfo v;
+    v.percentRequested = 50;
+    v.percentEffective = 50;
+    v.pattern = PartialPattern::Center;
+    v.patternRandom = true;
+    CHECK(exporting::WriteJson(file, r, t, 7, v, err));
     const std::string bytes = ReadFileBytes(file);
     CHECK(bytes.find("\"problems\":[") != std::string::npos);
     CHECK(bytes.find("\"slowest_dirs\":{") != std::string::npos);
@@ -5474,6 +5481,318 @@ TEST("dirtiming: json export carries the slowest_dirs section", [] {
     CHECK(bytes.find("\"hash_b\":[{\"dir\":\"sub\"") != std::string::npos);
     CHECK(bytes.find("\"hash_cache_hits\":7") != std::string::npos);
     CHECK(bytes.find("\"status\":\"EXTRA\"") != std::string::npos);
+    CHECK(bytes.find("\"verify\":{\"mode\":\"partial\"") != std::string::npos);
+    CHECK(bytes.find("\"percent_requested\":50") != std::string::npos);
+    CHECK(bytes.find("\"pattern\":\"center\"") != std::string::npos);
+    CHECK(bytes.find("\"random\":true") != std::string::npos);
+});
+
+// ---------------------------------------------------------------------------
+// Partial content verification (percent/pattern sampling).
+
+TEST("partial: ComputePartialReadPlan thresholds and block math", [] {
+    using bv::partial::ComputePartialReadPlan;
+    using bv::PartialPattern;
+    const uint64_t MiB = 1048576ull;
+    // Rule 1: at/below 2 MiB always reads fully, any percent/pattern.
+    CHECK(ComputePartialReadPlan(2 * MiB - 1, 50, PartialPattern::Edges).isFullRead);
+    CHECK(ComputePartialReadPlan(2 * MiB, 50, PartialPattern::Center).isFullRead);
+    // Rule 2: percent 100 is always a full read, both patterns.
+    CHECK(ComputePartialReadPlan(10 * MiB, 100, PartialPattern::Edges).isFullRead);
+    CHECK(ComputePartialReadPlan(10 * MiB, 100, PartialPattern::Center).isFullRead);
+    // Edges 100 MiB @50%: 25 MiB head from zero + 25 MiB tail ending at EOF.
+    {
+        const auto p = ComputePartialReadPlan(100 * MiB, 50, PartialPattern::Edges);
+        CHECK(!p.isFullRead);
+        CHECK_EQ(p.off1, 0ull);
+        CHECK_EQ(p.len1, 25 * MiB);
+        CHECK_EQ(p.len2, 25 * MiB);
+        CHECK_EQ(p.off2 + p.len2, 100 * MiB);
+    }
+    // Odd total goes to the head: 100 MiB @51% -> 26 head + 25 tail.
+    {
+        const auto p = ComputePartialReadPlan(100 * MiB, 51, PartialPattern::Edges);
+        CHECK(!p.isFullRead);
+        CHECK_EQ(p.len1, 26 * MiB);
+        CHECK_EQ(p.len2, 25 * MiB);
+        CHECK_EQ(p.off2 + p.len2, 100 * MiB);
+    }
+    // Round-half-up in integers: 3 MiB @50% is 1.5 -> 2 blocks.
+    {
+        const auto p = ComputePartialReadPlan(3 * MiB, 50, PartialPattern::Edges);
+        CHECK(!p.isFullRead);
+        CHECK_EQ(p.len1, MiB);
+        CHECK_EQ(p.len2, MiB);
+        CHECK_EQ(p.off2, 2 * MiB);
+    }
+    // Round down: 3 MiB @49% is 1.47 -> 1 block (head only, no second block).
+    {
+        const auto p = ComputePartialReadPlan(3 * MiB, 49, PartialPattern::Edges);
+        CHECK(!p.isFullRead);
+        CHECK_EQ(p.len1, MiB);
+        CHECK_EQ(p.len2, 0ull);
+    }
+    // Zero guard: 3 MiB @1% is 0.03 -> 1 block, never zero.
+    {
+        const auto p = ComputePartialReadPlan(100 * MiB, 1, PartialPattern::Edges);
+        CHECK(!p.isFullRead);
+        CHECK_EQ(p.len1, MiB);
+        CHECK_EQ(p.len2, 0ull);
+    }
+    // Collapse: 3 MiB @99% is 2.97 -> 3 blocks covering the file -> full.
+    CHECK(ComputePartialReadPlan(3 * MiB, 99, PartialPattern::Edges).isFullRead);
+    CHECK(ComputePartialReadPlan(3 * MiB, 99, PartialPattern::Center).isFullRead);
+    // Center: 10 MiB @40% -> 4 blocks starting at 3 MiB (single block).
+    {
+        const auto p = ComputePartialReadPlan(10 * MiB, 40, PartialPattern::Center);
+        CHECK(!p.isFullRead);
+        CHECK_EQ(p.off1, 3 * MiB);
+        CHECK_EQ(p.len1, 4 * MiB);
+        CHECK_EQ(p.len2, 0ull);
+    }
+    // Center odd side-excess stays BEFORE the centre: 11 MiB, 4 blocks.
+    {
+        const auto p = ComputePartialReadPlan(11 * MiB, 40, PartialPattern::Center);
+        CHECK(!p.isFullRead);
+        CHECK_EQ(p.off1, 4 * MiB);
+        CHECK_EQ(p.len1, 4 * MiB);
+    }
+    // Center on a non-multiple size discretizes like the truncated size.
+    {
+        const auto a = ComputePartialReadPlan(10 * MiB + 12345, 40, PartialPattern::Center);
+        const auto b = ComputePartialReadPlan(10 * MiB, 40, PartialPattern::Center);
+        CHECK_EQ(a.off1, b.off1);
+        CHECK_EQ(a.len1, b.len1);
+    }
+    // Effective level: full plans normalize to 100/Edges whatever was asked.
+    {
+        const auto full = ComputePartialReadPlan(10 * MiB, 100, PartialPattern::Center);
+        const auto e = bv::partial::EffectiveLevel(full, 50, PartialPattern::Center);
+        CHECK_EQ(e.percent, 100);
+        CHECK(e.pattern == PartialPattern::Edges);
+        const auto part = ComputePartialReadPlan(10 * MiB, 50, PartialPattern::Center);
+        const auto e2 = bv::partial::EffectiveLevel(part, 50, PartialPattern::Center);
+        CHECK_EQ(e2.percent, 50);
+        CHECK(e2.pattern == PartialPattern::Center);
+    }
+});
+
+TEST("partial: ComputePartialReadPlan is pure (bit-identical on repeat)", [] {
+    using bv::partial::ComputePartialReadPlan;
+    const auto a = ComputePartialReadPlan(123456789ull, 37, bv::PartialPattern::Edges);
+    const auto b = ComputePartialReadPlan(123456789ull, 37, bv::PartialPattern::Edges);
+    CHECK_EQ(a.off1, b.off1);
+    CHECK_EQ(a.len1, b.len1);
+    CHECK_EQ(a.off2, b.off2);
+    CHECK_EQ(a.len2, b.len2);
+    CHECK(a.isFullRead == b.isFullRead);
+    const auto c = ComputePartialReadPlan(123456789ull, 37, bv::PartialPattern::Center);
+    const auto d = ComputePartialReadPlan(123456789ull, 37, bv::PartialPattern::Center);
+    CHECK_EQ(c.off1, d.off1);
+    CHECK_EQ(c.len1, d.len1);
+});
+
+TEST("partial: MakeKey normalizes percent-100 across patterns (critical)", [] {
+    // The easiest mistake to make by distraction: a full read keyed under the
+    // pattern that happened to be requested with it. Both MUST collide.
+    const auto kFullEdges =
+        hashing::HashCache::MakeKey(L"C:\\f\\a.bin", 100, 12345, 100, PartialPattern::Edges);
+    const auto kFullCenter =
+        hashing::HashCache::MakeKey(L"C:\\f\\a.bin", 100, 12345, 100, PartialPattern::Center);
+    CHECK(kFullEdges == kFullCenter);
+    // ... while a genuinely partial key must stay distinct from the full one.
+    const auto kPart =
+        hashing::HashCache::MakeKey(L"C:\\f\\a.bin", 100, 12345, 50, PartialPattern::Edges);
+    CHECK(kPart != kFullEdges);
+});
+
+namespace {
+
+// Builds the center-difference fixture shared by the Edges/Center end-to-end
+// tests: 4 MiB files, identical edges, different middle.
+void MakeCenterDiffFixture(const std::wstring& dir, std::wstring& src, std::wstring& dst) {
+    src = dir + L"\\src";
+    dst = dir + L"\\dst";
+    fs::create_directories(src);
+    fs::create_directories(dst);
+    const size_t n = 4 * 1024 * 1024;
+    std::string head(1024 * 1024, 'H');
+    std::string midA(2 * 1024 * 1024, 'A');
+    std::string midB(2 * 1024 * 1024, 'B');
+    std::string tail(1024 * 1024, 'T');
+    CHECK(WriteFileBytes(src + L"\\f.bin", (head + midA + tail).c_str(), n));
+    CHECK(WriteFileBytes(dst + L"\\f.bin", (head + midB + tail).c_str(), n));
+}
+
+void RunPartialCompare(const std::wstring& src, const std::wstring& dst, int percent,
+                       PartialPattern pattern, ScanReport& out) {
+    ScanOptions opts;
+    opts.source = src;
+    opts.destination = dst;
+    opts.mode = ScanMode::Content;
+    opts.hashThreads = 2;
+    opts.backend = EnumeratorBackend::Win32;
+    opts.verifyLevel.percent = percent;
+    opts.verifyLevel.pattern = pattern;
+    out = ScanController(false).run(opts);
+}
+
+} // namespace
+
+TEST("partial: Edges misses a center-only difference (expected false negative)", [] {
+    // At 50% Edges samples exactly [0,1 MiB) + [3 MiB,4 MiB): no difference
+    // found. This miss is the CORRECT heuristic behaviour, not a bug.
+    const auto dir = MakeTempDir();
+    std::wstring src, dst;
+    MakeCenterDiffFixture(dir, src, dst);
+    ScanReport r;
+    RunPartialCompare(src, dst, 50, PartialPattern::Edges, r);
+    CHECK(r.sourceOk && r.destinationOk);
+    CHECK_EQ(r.verify.percentEffective, 50);
+    CHECK_EQ(r.results.stats.identicalPartialFiles, 1ull);
+    CHECK_EQ(r.results.stats.identicalFiles, 0ull);
+    CHECK(r.results.problems.empty());
+});
+
+TEST("partial: Center catches the difference Edges misses", [] {
+    const auto dir = MakeTempDir();
+    std::wstring src, dst;
+    MakeCenterDiffFixture(dir, src, dst);
+    ScanReport r;
+    RunPartialCompare(src, dst, 50, PartialPattern::Center, r);
+    CHECK(r.sourceOk && r.destinationOk);
+    CHECK_EQ(r.verify.percentEffective, 50);
+    CHECK(r.verify.pattern == PartialPattern::Center);
+    CHECK_EQ(r.results.stats.contentMismatchPartial, 1ull);
+    CHECK_EQ(r.results.stats.contentMismatch, 0ull);
+    CHECK_EQ(r.results.problems.size(), 1ull);
+    const FileResult& p = r.results.problems[0];
+    CHECK(p.status == Status::ContentMismatchPartial);
+    CHECK_EQ(p.verifiedPercent, 50); // effective, never nominal-or-Random
+    CHECK(p.verifiedPattern == PartialPattern::Center);
+});
+
+TEST("partial: Random resolves once per run and applies uniformly", [] {
+    // Three fully-different files (same size): a mismatch under EITHER
+    // concrete pattern, so every row is stored and its pattern observable.
+    const auto dir = MakeTempDir();
+    const std::wstring src = dir + L"\\src";
+    const std::wstring dst = dir + L"\\dst";
+    fs::create_directories(src);
+    fs::create_directories(dst);
+    const size_t n = 3 * 1024 * 1024;
+    for (int i = 0; i < 3; ++i) {
+        const std::wstring name = L"\\f" + std::to_wstring(i) + L".bin";
+        CHECK(WriteFileBytes(src + name, std::string(n, 'A').c_str(), n));
+        CHECK(WriteFileBytes(dst + name, std::string(n, 'B').c_str(), n));
+    }
+    ScanReport r;
+    RunPartialCompare(src, dst, 50, PartialPattern::Random, r);
+    CHECK(r.sourceOk && r.destinationOk);
+    CHECK(r.verify.patternRandom);
+    CHECK_EQ(r.verify.percentEffective, 50);
+    CHECK_EQ(r.results.problems.size(), 3ull);
+    // Uniformity: one concrete pattern for the whole run, never a mix and
+    // never the Random literal.
+    PartialPattern first = PartialPattern::Random;
+    for (const FileResult& p : r.results.problems) {
+        CHECK(p.status == Status::ContentMismatchPartial);
+        CHECK_EQ(p.verifiedPercent, 50);
+        CHECK(p.verifiedPattern != PartialPattern::Random);
+        if (first == PartialPattern::Random) first = p.verifiedPattern;
+        CHECK(p.verifiedPattern == first);
+    }
+    CHECK(first == r.verify.pattern); // rows agree with the run record
+});
+
+TEST("partial: percent 100 is byte-identical to a full Content run", [] {
+    // Two snapshot captures (default level vs explicit 100/Edges) must embed
+    // bit-identical digests per path: no regression when partial is off.
+    const auto dir = MakeTempDir();
+    const std::wstring src = dir + L"\\src";
+    fs::create_directories(src + L"\\sub");
+    CHECK(WriteFileBytes(src + L"\\sub\\a.txt", "hello world, hello", 18));
+    const size_t big = 3 * 1024 * 1024;
+    CHECK(WriteFileBytes(src + L"\\sub\\big.bin", std::string(big, 'Q').c_str(), big));
+
+    ScanOptions cap1;
+    cap1.source = src;
+    cap1.destination = src;
+    cap1.mode = ScanMode::Content;
+    cap1.hashThreads = 2;
+    cap1.backend = EnumeratorBackend::Win32;
+    cap1.snapshotOut = dir + L"\\s1.bin";
+    CHECK(ScanController(false).run(cap1).snapshotWritten);
+
+    ScanOptions cap2 = cap1;
+    cap2.snapshotOut = dir + L"\\s2.bin";
+    cap2.verifyLevel.percent = 100;
+    cap2.verifyLevel.pattern = PartialPattern::Edges;
+    CHECK(ScanController(false).run(cap2).snapshotWritten);
+
+    FileIndex a(false), b(false);
+    std::wstring err, root;
+    CHECK(indexio::ReadSnapshot(dir + L"\\s1.bin", a, root, err));
+    CHECK(indexio::ReadSnapshot(dir + L"\\s2.bin", b, root, err));
+    CHECK_EQ(a.size(), b.size());
+    size_t compared = 0;
+    for (const auto& kv : a.entries()) {
+        if (kv.second.isDirectory) continue; // directories carry no digest
+        std::array<uint8_t, 32> da{}, db{};
+        CHECK(a.getHash(kv.second.relativePath, da));
+        CHECK_MSG(b.getHash(kv.second.relativePath, db), "same paths in both snapshots");
+        CHECK(da == db);
+        ++compared;
+    }
+    CHECK(compared == 2ull); // both files actually compared, not vacuous
+});
+
+TEST("partial: below-threshold files share the full cache key", [] {
+    // Small files (< 2 MiB) always read fully: a partial-50 run stores under
+    // the 100/Edges key, so a later full run hits the cache for every file.
+    // Separate src/dst trees: with source == destination the two sides share
+    // absolute paths (and cache keys) by construction.
+    const auto dir = MakeTempDir();
+    const std::wstring src = dir + L"\\src";
+    const std::wstring dst = dir + L"\\dst";
+    fs::create_directories(src + L"\\sub");
+    CHECK(WriteFileBytes(src + L"\\sub\\a.txt", "hello world, hello", 18));
+    CHECK(WriteFileBytes(src + L"\\sub\\b.txt", "second file here!", 17));
+    fs::copy(src, dst, fs::copy_options::recursive);
+    const std::wstring cache = MakeTempDir() + L"\\hash.bin";
+
+    ScanOptions run1;
+    run1.source = src;
+    run1.destination = dst;
+    run1.mode = ScanMode::Content;
+    run1.hashThreads = 2;
+    run1.backend = EnumeratorBackend::Win32;
+    run1.hashCacheFile = cache;
+    run1.verifyLevel.percent = 50;
+    run1.verifyLevel.pattern = PartialPattern::Edges;
+    const ScanReport r1 = ScanController(false).run(run1);
+    CHECK_EQ(r1.hashCacheHits, 0ull); // first run: nothing cached yet
+    CHECK_EQ(r1.results.stats.identicalFiles, 2ull); // read fully: full verdicts
+    CHECK_EQ(r1.results.stats.identicalPartialFiles, 0ull);
+
+    ScanOptions run2 = run1;
+    run2.verifyLevel.percent = 100;
+    const ScanReport r2 = ScanController(false).run(run2);
+    CHECK_EQ(r2.results.stats.identicalFiles, 2ull);
+    CHECK_MSG(r2.hashCacheHits == 4ull, "partial-50 digests must be found under the full key");
+    CHECK_EQ(r2.results.stats.readErrors, 0ull);
+});
+
+TEST("partial: full-mode json marks the verify section complete", [] {
+    ResultSet r;
+    profiling::DirTimingReport t;
+    VerifyInfo v; // defaults: full, 100, Edges, not random
+    const std::wstring file = MakeTempDir() + L"\\full.json";
+    std::wstring err;
+    CHECK(exporting::WriteJson(file, r, t, 0, v, err));
+    const std::string bytes = ReadFileBytes(file);
+    CHECK(bytes.find("\"verify\":{\"mode\":\"full\"") != std::string::npos);
+    CHECK(bytes.find("\"percent_requested\":100") != std::string::npos);
 });
 
 // ---------------------------------------------------------------------------

@@ -15,6 +15,8 @@ std::string StatusToken(Status s) {
         case Status::Extra: return "EXTRA";
         case Status::SizeMismatch: return "DIM_DIVERSA";
         case Status::ContentMismatch: return "CONTENUTO_DIVERSO";
+        case Status::IdenticalPartial: return "IDENTICO_PARZIALE";
+        case Status::ContentMismatchPartial: return "CONTENUTO_DIVERSO_PARZIALE";
         case Status::ReadError: return "ERRORE_LETTURA";
         case Status::AccessDenied: return "ACCESSO_NEGATO";
         case Status::ChangedDuringScan: return "MODIFICATO_DURANTE_SCAN";

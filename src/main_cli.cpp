@@ -2,7 +2,8 @@
 //
 // Usage:
 //   bv_cli --source <path> --dest <path> [--mode presence|size]
-//          [--case-sensitive] [--enum auto|win32|mft] [--list-problems [--limit N]] [--help]
+//          [--case-sensitive] [--enum auto|win32|mft] [--list-problems [--limit N]]
+//          [--verify-percent <1-100>] [--verify-pattern edges|center|random] [--help]
 //   bv_cli --source <path> --snapshot-out <file> [--mode content]    (snapshot only)
 //   bv_cli --compare <snapshot> --dest <path> [--mode content]       (offline compare)
 
@@ -31,6 +32,10 @@ const wchar_t* kUsage =
     L"\n"
     L"Opzioni:\n"
     L"  --mode <presence|size|content>   modalita di confronto (default: presence)\n"
+  L"  --verify-percent <1-100>      in modalita content, legge solo questa percentuale\n"
+  L"                               di ogni file (default: 100 = contenuto completo)\n"
+  L"  --verify-pattern <p>          campionamento parziale: edges|center|random\n"
+  L"                               (default: edges; ignorato con percent 100)\n"
     L"  --threads <N>                    thread per la verifica contenuti (default: auto)\n"
     L"  --enum <auto|win32|mft>          backend di enumerazione (default: auto)\n"
     L"  --case-sensitive         confronto percorsi case-sensitive (default: insensibile)\n"
@@ -55,6 +60,8 @@ struct Args {
     size_t limit = 100;
     unsigned int threads = 0; // 0 = auto
     bv::EnumeratorBackend backend = bv::EnumeratorBackend::Auto;
+    int verifyPercent = 100;
+    bv::PartialPattern verifyPattern = bv::PartialPattern::Edges;
     bool progress = false;
     bool help = false;
     std::wstring exportPath;
@@ -92,6 +99,24 @@ bool ParseArgs(int argc, wchar_t** argv, Args& out) {
             else if (b == L"win32") out.backend = bv::EnumeratorBackend::Win32;
             else if (b == L"mft") out.backend = bv::EnumeratorBackend::Mft;
             else { std::wcerr << L"Backend sconosciuto: " << b << L"\n"; return false; }
+        } else if (a == L"--verify-percent" && i + 1 < argc) {
+            const std::wstring v = argv[++i];
+            uint64_t parsed = 0;
+            if (!bv::util::ParseUInt64(v, parsed) || parsed < 1 || parsed > 100) {
+                std::wcerr << L"Valore non valido per --verify-percent (atteso 1-100; "
+                              L"per sola dimensione usare --mode size): " << v << L"\n";
+                return false;
+            }
+            out.verifyPercent = static_cast<int>(parsed);
+        } else if (a == L"--verify-pattern" && i + 1 < argc) {
+            const std::wstring p = argv[++i];
+            if (p == L"edges") out.verifyPattern = bv::PartialPattern::Edges;
+            else if (p == L"center") out.verifyPattern = bv::PartialPattern::Center;
+            else if (p == L"random") out.verifyPattern = bv::PartialPattern::Random;
+            else {
+                std::wcerr << L"Pattern sconosciuto: " << p << L" (attesi edges|center|random)\n";
+                return false;
+            }
         } else if (a == L"--case-sensitive") {
             out.caseSensitive = true;
         } else if (a == L"--list-problems") {
@@ -483,6 +508,15 @@ void PrintHashProfile(const bv::profiling::HashProfileReport& p) {
     }
 }
 
+const wchar_t* PatternLabel(bv::PartialPattern p) {
+    switch (p) {
+        case bv::PartialPattern::Edges: return L"Edges";
+        case bv::PartialPattern::Center: return L"Center";
+        case bv::PartialPattern::Random: return L"Random";
+    }
+    return L"?";
+}
+
 void PrintResults(const bv::ResultSet& r) {
     const bv::Stats& s = r.stats;
     std::wcout << L"\n=== RISULTATO ===\n";
@@ -490,10 +524,12 @@ void PrintResults(const bv::ResultSet& r) {
     std::wcout << L"File destinazione:     " << Group(s.destFiles) << L"\n";
     std::wcout << L"\n";
     std::wcout << L"Identici (file):       " << Group(s.identicalFiles) << L"\n";
+    std::wcout << L"Identici (parziale):   " << Group(s.identicalPartialFiles) << L"\n";
     std::wcout << L"Mancanti (file):       " << Group(s.missingFiles) << L"\n";
     std::wcout << L"Extra (file):          " << Group(s.extraFiles) << L"\n";
     std::wcout << L"Dimensione diversa:    " << Group(s.sizeMismatch) << L"\n";
     std::wcout << L"Contenuto diverso:     " << Group(s.contentMismatch) << L"\n";
+    std::wcout << L"Contenuto div. (parz): " << Group(s.contentMismatchPartial) << L"\n";
     std::wcout << L"Modificati durante scan:" << Group(s.changedDuringScan) << L"\n";
     std::wcout << L"Errori di lettura:     " << Group(s.readErrors) << L"\n";
     std::wcout << L"Accesso negato:        " << Group(s.accessDenied) << L"\n";
@@ -531,6 +567,8 @@ int MainImpl(int argc, wchar_t** argv) {
     options.exportPath = args.exportPath;
     options.exportFormat = args.exportFormat;
     options.hashCacheFile = args.hashCacheFile;
+    options.verifyLevel.percent = args.verifyPercent;
+    options.verifyLevel.pattern = args.verifyPattern;
 
     // Caller-owned profiler: the controller feeds it and copies the aggregates
     // into ScanReport::hashProfile; we keep ownership to read the verbose
@@ -571,9 +609,13 @@ int MainImpl(int argc, wchar_t** argv) {
     }
     std::wcout << L"Modalita:      "
                << (options.mode == bv::ScanMode::Presence ? L"Presenza"
-                   : options.mode == bv::ScanMode::Size ? L"Dimensione"
-                                                        : L"Contenuto")
+                    : options.mode == bv::ScanMode::Size ? L"Dimensione"
+                                                         : L"Contenuto")
                << L"\n";
+    if (options.mode == bv::ScanMode::Content && args.verifyPercent < 100) {
+        std::wcout << L"Verifica:        parziale " << args.verifyPercent << L"% ("
+                   << PatternLabel(args.verifyPattern) << L")\n";
+    }
     std::wcout << L"Case:          " << (options.caseSensitive ? L"sensibile" : L"insensibile") << L"\n";
     std::wcout << L"Backend:       "
                << (args.backend == bv::EnumeratorBackend::Mft
@@ -609,6 +651,17 @@ bv::ScanController controller(options.caseSensitive);
     if (report.usedSnapshot) {
         std::wcout << L"Sorgente offline:     snapshot caricato (" << report.results.stats.sourceFiles
                    << L" voci)\n";
+    }
+    if (report.verify.percentEffective < 100) {
+        std::wcout << L"Verifica parziale:   " << report.verify.percentEffective << L"% ("
+                   << PatternLabel(report.verify.pattern) << L")"
+                   << (report.verify.patternRandom ? L" [pattern scelto casualmente]" : L"")
+                   << L"\n";
+        std::wcout << L"  (euristica: IDENTICO_PARZIALE puo differire nelle parti non lette)\n";
+    } else if (args.verifyPercent < 100) {
+        // Requested partial, but capture/offline/degrade forced a full read.
+        std::wcout << L"Verifica parziale richiesta ma non applicabile a questo run: "
+                      L"lettura completa.\n";
     }
     if (report.snapshotWritten) {
         std::wcout << L"Snapshot salvato:     " << options.snapshotOut << L"\n";
@@ -673,15 +726,21 @@ bv::ScanController controller(options.caseSensitive);
         const auto& problems = report.results.problems;
         const size_t n = std::min(problems.size(), args.limit);
         std::wcout << L"\n=== PROBLEMI (prime " << n << L" di " << problems.size() << L") ===\n";
+        // Indexed by Status value: keep in sync with ComparisonResult.h order.
         const wchar_t* names[] = {
             L"IDENTICO", L"MANCANTE", L"EXTRA", L"DIM_DIVERSA",
-            L"CONTENUTO_DIVERSO", L"ERRORE_LETTURA", L"ACCESSO_NEGATO",
-            L"MODIFICATO_DURANTE_SCAN"};
+            L"CONTENUTO_DIVERSO", L"IDENTICO_PARZIALE", L"CONTENUTO_DIVERSO_PARZIALE",
+            L"ERRORE_LETTURA", L"ACCESSO_NEGATO", L"MODIFICATO_DURANTE_SCAN"};
         for (size_t i = 0; i < n; ++i) {
             const bv::FileResult& p = problems[i];
-            const wchar_t* name = names[static_cast<int>(p.status)];
+            const size_t idx = static_cast<size_t>(p.status);
+            const wchar_t* name = idx < sizeof(names) / sizeof(names[0]) ? names[idx] : L"?";
             std::wcout << name << L"\t" << (p.isDirectory ? L"[dir] " : L"")
                        << p.relativePath;
+            if (p.status == bv::Status::ContentMismatchPartial) {
+                std::wcout << L"  (verifica " << p.verifiedPercent << L"%, "
+                           << PatternLabel(p.verifiedPattern) << L")";
+            }
             if (!p.errorMessage.empty()) std::wcout << L"  (" << p.errorMessage << L")";
             std::wcout << L"\n";
         }

@@ -68,7 +68,8 @@ public:
                     ResultSet& out,
                     const std::atomic_bool* cancel = nullptr,
                     const std::function<void(uint64_t done, uint64_t total)>& onProgress = {},
-                    hashing::HashCache* cache = nullptr);
+                    hashing::HashCache* cache = nullptr,
+                    ContentVerifyLevel verify = ContentVerifyLevel{});
 
     // Number of hash-cache hits of the last runHashing() invocation.
     size_t cacheHits() const { return cacheHits_.load(std::memory_order_relaxed); }

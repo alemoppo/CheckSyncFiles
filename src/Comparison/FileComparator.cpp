@@ -172,11 +172,11 @@ void FileComparator::classifyMatched(FileEntry& src, FileEntry& dst, ResultSet& 
 void FileComparator::runHashing(
     ThreadPool& pool, ResultSet& out, const std::atomic_bool* cancel,
     const std::function<void(uint64_t done, uint64_t total)>& onProgress,
-    hashing::HashCache* cache) {
+    hashing::HashCache* cache, ContentVerifyLevel verify) {
     cacheHits_.store(0, std::memory_order_relaxed);
     const bool offline = sourceRoot_.empty(); // digests live in the index
     RunHashPhase(pendingHashes_, pool, offline, &source_, sourceRoot_, destRoot_, out, cancel,
-                 onProgress, cache, cacheHits_);
+                 onProgress, cache, cacheHits_, nullptr, nullptr, verify);
 }
 
 void FileComparator::recordMissing(ResultSet& out) {

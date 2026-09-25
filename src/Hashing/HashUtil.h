@@ -6,6 +6,7 @@
 #include <string>
 
 #include "Hashing/HashCache.h"
+#include "Hashing/PartialRead.h"
 #include "Hashing/Sha256.h"
 #include "Profiling/DirTiming.h"
 #include "Profiling/HashProfile.h"
@@ -42,7 +43,13 @@ void HashOneSide(const std::wstring& absPath, uint64_t expectedSize, uint64_t ex
                  profiling::HashSession* session = nullptr,
                  profiling::Side side = profiling::Side::Source,
                  const std::atomic_bool* cancel = nullptr,
-                 profiling::DirHashTop* dirHash = nullptr);
+                 profiling::DirHashTop* dirHash = nullptr,
+                 // Partial-read plan (same object for both sides of a file) plus
+                 // the EFFECTIVE level (never nominal, never Random): the cache
+                 // key always uses these effective values. Defaults = full read.
+                 const partial::PartialReadPlan* plan = nullptr,
+                 int effPercent = 100,
+                 PartialPattern effPattern = PartialPattern::Edges);
 
 } // namespace hashing
 } // namespace bv

@@ -1,5 +1,6 @@
 #include "Hashing/Sha256.h"
 
+#include <limits>
 #include <vector>
 
 #include <bcrypt.h>
@@ -61,7 +62,8 @@ HashStatus Sha256FileImpl(const std::wstring& path, std::array<uint8_t, 32>& dig
 template <bool Profile>
 HashStatus Sha256FileFromHandle(HANDLE h, std::array<uint8_t, 32>& digest,
                                 profiling::FileTimings* timings,
-                                const std::atomic_bool* cancel) {
+                                const std::atomic_bool* cancel,
+                                const partial::PartialReadPlan* plan) {
     const uint64_t t0 = profiling::QpcNow();
     const auto finalize = [&](uint64_t readT, uint64_t hashT, uint64_t bytes) {
         if constexpr (Profile) {
@@ -93,36 +95,74 @@ HashStatus Sha256FileFromHandle(HANDLE h, std::array<uint8_t, 32>& digest,
     uint64_t readT = 0;
     uint64_t hashT = 0;
     uint64_t bytes = 0;
-    for (;;) {
+    // One chunk of work, shared by the full and partial loops below (same
+    // ReadFile/BCryptHashData/timing structure). Returns false to stop.
+    // `budget` caps this call's bytes; SIZE_MAX means "to EOF" (full read).
+    const auto streamChunk = [&](uint64_t& budget) {
         if (cancel && cancel->load(std::memory_order_relaxed)) {
-            // Cancel lands: stop streaming now. The whole file was NOT hashed, so
-            // this is neither Ok nor a read error -- the caller must treat it as
-            // "no verdict" (exactly like a job that never started under cancel).
+            // Cancel lands: stop streaming now. The file was NOT fully hashed,
+            // so this is neither Ok nor a read error -- the caller must treat
+            // it as "no verdict" (exactly like a job that never started).
             cancelled = true;
             complete = false;
-            break;
+            return false;
         }
         uint64_t tr0 = 0;
         if constexpr (Profile) tr0 = profiling::QpcNow();
+        DWORD want = static_cast<DWORD>(
+            budget < buf.size() ? budget : static_cast<uint64_t>(buf.size()));
         DWORD read = 0;
-        if (!ReadFile(h, buf.data(), static_cast<DWORD>(buf.size()), &read, nullptr)) {
+        if (!ReadFile(h, buf.data(), want, &read, nullptr)) {
             complete = false;
             if constexpr (Profile) readT += profiling::QpcNow() - tr0;
-            break;
+            return false;
         }
         if constexpr (Profile) {
             readT += profiling::QpcNow() - tr0;
             bytes += read;
         }
-        if (read == 0) break;
+        budget -= read;
+        if (read == 0) return false; // EOF (or budget exhausted with no data)
         uint64_t th0 = 0;
         if constexpr (Profile) th0 = profiling::QpcNow();
         if (!BCRYPT_SUCCESS(BCryptHashData(hash, buf.data(), read, 0))) {
             complete = false;
             if constexpr (Profile) hashT += profiling::QpcNow() - th0;
-            break;
+            return false;
         }
         if constexpr (Profile) hashT += profiling::QpcNow() - th0;
+        return true;
+    };
+
+    if (plan == nullptr || plan->isFullRead) {
+        // Whole-file path, loop bit-for-bit identical to the historical one
+        // (the null check above is the only addition): stream to EOF.
+        uint64_t budget = (std::numeric_limits<uint64_t>::max)();
+        while (budget > 0 && streamChunk(budget)) {
+        }
+    } else {
+        // Partial path: seek to each non-empty planned block and stream
+        // exactly its length, feeding the SAME hash context throughout (one
+        // final digest). A block never assumes a sibling exists: Center
+        // yields a single block (len2 == 0 skips cleanly).
+        const uint64_t offs[2] = {plan->off1, plan->off2};
+        const uint64_t lens[2] = {plan->len1, plan->len2};
+        for (int s = 0; s < 2 && complete && !cancelled; ++s) {
+            uint64_t budget = lens[s];
+            if (budget == 0) continue;
+            LARGE_INTEGER li;
+            li.QuadPart = static_cast<LONGLONG>(offs[s]);
+            if (!SetFilePointerEx(h, li, nullptr, FILE_BEGIN)) {
+                complete = false; // seek past a shrunk file: read error
+                break;
+            }
+            while (budget > 0 && streamChunk(budget)) {
+            }
+            // Stopped early with no error and no cancel: EOF before the
+            // budget ran out (the file shrank mid-read). Like the full loop,
+            // EOF ends everything: hash the prefix actually read.
+            if (complete && !cancelled && budget > 0) break;
+        }
     }
 
     HashStatus result;
@@ -147,10 +187,12 @@ HashStatus Sha256FileFromHandle(HANDLE h, std::array<uint8_t, 32>& digest,
 // in the public header.
 template HashStatus Sha256FileFromHandle<false>(HANDLE, std::array<uint8_t, 32>&,
                                                 profiling::FileTimings*,
-                                                const std::atomic_bool*);
+                                                const std::atomic_bool*,
+                                                const partial::PartialReadPlan*);
 template HashStatus Sha256FileFromHandle<true>(HANDLE, std::array<uint8_t, 32>&,
                                                profiling::FileTimings*,
-                                               const std::atomic_bool*);
+                                               const std::atomic_bool*,
+                                               const partial::PartialReadPlan*);
 
 HashStatus Sha256File(const std::wstring& path, std::array<uint8_t, 32>& digest,
                       profiling::FileTimings* timings, const std::atomic_bool* cancel) {

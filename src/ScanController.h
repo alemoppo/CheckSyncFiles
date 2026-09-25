@@ -116,6 +116,9 @@ struct ScanOptions {
     // is stored in ScanReport::hashProfile. The caller keeps ownership so it can
     // read the verbose per-job records afterwards. Default: profiling off.
     profiling::HashProfiler* hashProfiler = nullptr;
+    // Partial content verification (Content mode only). Default {100, Edges}
+    // reproduces today's full Content behaviour at every existing call site.
+    ContentVerifyLevel verifyLevel;
 };
 
 struct ScanReport {
@@ -128,6 +131,9 @@ struct ScanReport {
     double secondsHashing = 0.0;          // content verification (Phase 3)
     unsigned int hashThreadsUsed = 0;     // hash pool size actually launched (0 = none)
     EnumeratorBackend backendUsed = EnumeratorBackend::Win32; // what actually ran
+
+    // Partial content verification for this run (Content mode only).
+    VerifyInfo verify;
 
     // Phase 5 -----------------------------------------------------------------
     ScanMode modeUsed = ScanMode::Presence; // Content may be degraded to Size

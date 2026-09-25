@@ -1,5 +1,6 @@
 #include "ScanOrchestrator.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <utility>
 
@@ -160,6 +161,16 @@ void ScanOrchestrator::setThreadSel(int sel) {
     threadSel_ = sel;
 }
 
+void ScanOrchestrator::setVerifyPercent(int percent) {
+    std::lock_guard<std::mutex> lk(mtx_);
+    verifyPercent_ = std::max(0, std::min(100, percent));
+}
+
+void ScanOrchestrator::setVerifyPattern(PartialPattern p) {
+    std::lock_guard<std::mutex> lk(mtx_);
+    verifyPattern_ = p;
+}
+
 void ScanOrchestrator::useLiveSource() {
     std::lock_guard<std::mutex> lk(mtx_);
     useSnapshot_ = false;
@@ -211,10 +222,19 @@ bool ScanOrchestrator::startLiveScan() {
     ScanOptions options;
     options.source = source_;
     options.destination = dest_;
-    options.mode = mode_;
+    // Percent 0 in Content mode means "size comparison": 0% of the content
+    // is exactly what Size mode checks, so map it there (the row label says
+    // "Solo dimensione"). The verify level itself stays 1..100 downstream.
+    if (mode_ == ScanMode::Content && verifyPercent_ <= 0) {
+        options.mode = ScanMode::Size;
+    } else {
+        options.mode = mode_;
+    }
     options.caseSensitive = caseSensitive_;
     options.hashThreads = threadToCount();
     options.backend = backend_;
+    options.verifyLevel.percent = std::max(1, verifyPercent_);
+    options.verifyLevel.pattern = verifyPattern_;
     options.cancel = &cancel_;
     options.onProgress = [this](const ScanProgress& p) {
         {
@@ -332,6 +352,9 @@ ScanOrchestrator::UiSnapshot ScanOrchestrator::snapshot() const {
     s.caseSensitive = caseSensitive_;
     s.backend = backend_;
     s.threadSel = threadSel_;
+    s.verifyPercent = verifyPercent_;
+    s.verifyPattern = verifyPattern_;
+    s.verify = verify_;
     s.useSnapshot = useSnapshot_;
     s.snapshotFile = snapshotFile_;
     s.running = running_;
@@ -402,6 +425,7 @@ void ScanOrchestrator::resetForRunLocked() {
     hashingErrors_ = 0;
     hashCacheHits_ = 0;
     dirTiming_ = {};
+    verify_ = {};
     statusNote_.clear();
     lastSnapshotPath_.clear();
 }
@@ -432,6 +456,7 @@ void ScanOrchestrator::workerThread(ScanOptions options) {
         hashingErrors_ = report.hashingErrors;
         hashCacheHits_ = report.hashCacheHits;
         dirTiming_ = report.dirTiming;
+        verify_ = report.verify;
         progress_.phase = ScanPhase::Done;
         progress_.files = results_.stats.sourceFiles;
         progress_.dirs = results_.stats.sourceDirs;

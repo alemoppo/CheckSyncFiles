@@ -8,6 +8,8 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
+#include "Hashing/PartialRead.h"
+
 namespace bv {
 namespace profiling {
 struct FileTimings;
@@ -54,10 +56,18 @@ bool StatFile(const std::wstring& path, uint64_t& size, uint64_t& lastWriteTime)
 // <true> records read/hash/total time around ReadFile / BCryptHashData without
 // changing the loop. Explicitly instantiated for <false> and <true> in
 // Sha256.cpp, so `HashOneSide` can pick either at the call site.
+//
+// `plan` (optional) restricts hashing to the planned blocks: each non-empty
+// block is seeked to and streamed with the same chunk loop, feeding the SAME
+// hash context (one final digest, not one per block). A null plan -- or a plan
+// with isFullRead -- takes the original whole-file loop bit-for-bit (the only
+// addition on that path is the null check itself). Timings keep summing read,
+// hash and bytes over the phases actually read, unchanged in structure.
 template <bool Profile>
 HashStatus Sha256FileFromHandle(HANDLE h, std::array<uint8_t, 32>& digest,
                                 profiling::FileTimings* timings,
-                                const std::atomic_bool* cancel = nullptr);
+                                const std::atomic_bool* cancel = nullptr,
+                                const partial::PartialReadPlan* plan = nullptr);
 
 // Reports the current size and last-write time (FILETIME ticks) of an
 // ALREADY-OPEN handle, reusing exactly the conversion StatFile() performs on

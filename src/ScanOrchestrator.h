@@ -36,6 +36,10 @@ public:
         bool caseSensitive = false;
         EnumeratorBackend backend = EnumeratorBackend::Auto;
         int threadSel = 0; // 0=Auto,1,2,4,8,16
+        int verifyPercent = 100; // 0..100 (0 = size comparison, see startLiveScan)
+        PartialPattern verifyPattern = PartialPattern::Edges;
+        // Last run's verification record (resolved pattern, effective percent).
+        VerifyInfo verify;
         bool useSnapshot = false;
         std::wstring snapshotFile;
 
@@ -82,6 +86,10 @@ public:
     void setCaseSensitive(bool c);
     void setBackend(EnumeratorBackend b);
     void setThreadSel(int sel);
+    // Partial content verification (Content mode): percent 0..100 (0 = size
+    // comparison, mapped to Size at scan start) and sampling pattern.
+    void setVerifyPercent(int percent);
+    void setVerifyPattern(PartialPattern p);
     void useLiveSource();
 
     // Offline mode: the source index is loaded from `file` (the source device
@@ -149,6 +157,9 @@ private:
     bool caseSensitive_ = false;
     EnumeratorBackend backend_ = EnumeratorBackend::Auto;
     int threadSel_ = 0;
+    int verifyPercent_ = 100;
+    PartialPattern verifyPattern_ = PartialPattern::Edges;
+    VerifyInfo verify_;
     bool useSnapshot_ = false;
     std::wstring snapshotFile_;
 
