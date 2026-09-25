@@ -327,8 +327,9 @@ void DrawPickerButton(SDL_Renderer* ren, TTF_Font* font, const SDL_FRect& r, boo
 }
 
 void DrawToggle(SDL_Renderer* ren, TTF_Font* font, const std::string& label,
-                int x, int y, int w, int h, bool active) {
-    FillRect(ren, x, y, w, h, active ? kAccent : kPanel);
+                int x, int y, int w, int h, bool active, bool hover = false) {
+    FillRect(ren, x, y, w, h,
+             hover ? kAccentHover : (active ? kAccent : kPanel));
     DrawRect(ren, x, y, w, h, kBorder);
     DrawTextCenterIn(ren, font, label, x, y, w, h, kTextHi);
 }
@@ -986,7 +987,8 @@ void AppUI::OnMouseDown(int mx, int my) {
         const SDL_FRect rPlus{static_cast<float>(kVerifyPlusX),
                               static_cast<float>(L.y3b + 2),
                               static_cast<float>(kVerifyBtnW), 22.0f};
-        if (hit(mx, my, rMinus)) {
+        // The -/+ fine buttons are disabled at the ends of the range.
+        if (st.verifyPercent > 0 && hit(mx, my, rMinus)) {
             orch_.setVerifyPercent(st.verifyPercent - 1); // fine adjust
             dirty_.store(true);
         }
@@ -995,7 +997,7 @@ void AppUI::OnMouseDown(int mx, int my) {
             sliderDragging_ = true;
             dirty_.store(true);
         }
-        if (hit(mx, my, rPlus)) {
+        if (st.verifyPercent < 100 && hit(mx, my, rPlus)) {
             orch_.setVerifyPercent(st.verifyPercent + 1); // fine adjust
             dirty_.store(true);
         }
@@ -1588,8 +1590,12 @@ void AppUI::render(const bv::ScanOrchestrator::UiSnapshot& st) {
     const char* beNames[3] = {"Auto", "Win32", "MFT"};
     const int br = 90;
     for (int i = 0; i < 3; ++i) {
-        DrawToggle(renderer_, fontBody_, beNames[i], kMargin + 100 + i * br, L.y3 + 2,
-                   br - 12, 22, static_cast<int>(st.backend) == i);
+        const int bx = kMargin + 100 + i * br;
+        const SDL_FRect brc{static_cast<float>(bx), static_cast<float>(L.y3 + 2),
+                            static_cast<float>(br - 12), 22.0f};
+        DrawToggle(renderer_, fontBody_, beNames[i], bx, L.y3 + 2, br - 12, 22,
+                   static_cast<int>(st.backend) == i,
+                   hit(static_cast<int>(mx), static_cast<int>(my), brc));
     }
 
     // ---- Verifica (Size/Content via slider) ----
@@ -1601,8 +1607,12 @@ void AppUI::render(const bv::ScanOrchestrator::UiSnapshot& st) {
     const bool patEnabled = st.verifyPercent > 0 && st.verifyPercent < 100;
     for (int i = 0; i < 3; ++i) {
         if (patEnabled) {
-            DrawToggle(renderer_, fontBody_, patNames[i], kMargin + 100 + i * pr, L.y3b + 2,
-                       pr - 8, 22, static_cast<int>(st.verifyPattern) == i);
+            const int px = kMargin + 100 + i * pr;
+            const SDL_FRect prc{static_cast<float>(px), static_cast<float>(L.y3b + 2),
+                                static_cast<float>(pr - 8), 22.0f};
+            DrawToggle(renderer_, fontBody_, patNames[i], px, L.y3b + 2, pr - 8, 22,
+                       static_cast<int>(st.verifyPattern) == i,
+                       hit(static_cast<int>(mx), static_cast<int>(my), prc));
         } else {
             DrawToggleDisabled(renderer_, fontBody_, patNames[i], kMargin + 100 + i * pr,
                                L.y3b + 2, pr - 8, 22);
@@ -1611,10 +1621,18 @@ void AppUI::render(const bv::ScanOrchestrator::UiSnapshot& st) {
     {
         const int px0 = kVerifyStepX0;
         DrawTextVCenter(renderer_, fontBody_, "Solo dimensione", px0, L.y3b, 26, kTextLo);
-        DrawToggle(renderer_, fontBody_, "-", kVerifyMinusX, L.y3b + 2, kVerifyBtnW, 22,
-                   false);
+        const SDL_FRect minusR{static_cast<float>(kVerifyMinusX),
+                               static_cast<float>(L.y3b + 2),
+                               static_cast<float>(kVerifyBtnW), 22.0f};
         // Slider track with proportional fill, thumb handle and % inside.
         const int pct = std::clamp(st.verifyPercent, 0, 100);
+        if (pct > 0) {
+            DrawToggle(renderer_, fontBody_, "-", kVerifyMinusX, L.y3b + 2, kVerifyBtnW, 22,
+                       false, hit(static_cast<int>(mx), static_cast<int>(my), minusR));
+        } else {
+            DrawToggleDisabled(renderer_, fontBody_, "-", kVerifyMinusX, L.y3b + 2,
+                               kVerifyBtnW, 22);
+        }
         FillRect(renderer_, kVerifySliderX, L.y3b + 2, kVerifySliderW, 22, kPanel);
         const int fillW = (kVerifySliderW * pct) / 100;
         if (fillW > 0) {
@@ -1629,8 +1647,16 @@ void AppUI::render(const bv::ScanOrchestrator::UiSnapshot& st) {
         swprintf(pctBuf, 16, L"%d%%", pct);
         DrawTextCenterIn(renderer_, fontBody_, ToUtf8(pctBuf), kVerifySliderX, L.y3b + 2,
                          kVerifySliderW, 22, kTextHi);
-        DrawToggle(renderer_, fontBody_, "+", kVerifyPlusX, L.y3b + 2, kVerifyBtnW, 22,
-                   false);
+        const SDL_FRect plusR{static_cast<float>(kVerifyPlusX),
+                              static_cast<float>(L.y3b + 2),
+                              static_cast<float>(kVerifyBtnW), 22.0f};
+        if (pct < 100) {
+            DrawToggle(renderer_, fontBody_, "+", kVerifyPlusX, L.y3b + 2, kVerifyBtnW, 22,
+                       false, hit(static_cast<int>(mx), static_cast<int>(my), plusR));
+        } else {
+            DrawToggleDisabled(renderer_, fontBody_, "+", kVerifyPlusX, L.y3b + 2,
+                               kVerifyBtnW, 22);
+        }
         DrawTextVCenter(renderer_, fontBody_, "Contenuto completo",
                         kVerifyPlusX + kVerifyBtnW + 8, L.y3b, 26, kTextLo);
     }
@@ -1795,8 +1821,12 @@ void AppUI::render(const bv::ScanOrchestrator::UiSnapshot& st) {
                                   "Dimensione", "Contenuto", "Errori", "Tempistiche"};
     const int fr = 92;
     for (int i = 0; i < 8; ++i) {
-        DrawToggle(renderer_, fontBody_, filterNames[i], kMargin + i * fr, L.y8,
-                   fr - 8, 26, filter_ == static_cast<uint8_t>(i));
+        const int fx = kMargin + i * fr;
+        const SDL_FRect frc{static_cast<float>(fx), static_cast<float>(L.y8),
+                            static_cast<float>(fr - 8), 26.0f};
+        DrawToggle(renderer_, fontBody_, filterNames[i], fx, L.y8, fr - 8, 26,
+                   filter_ == static_cast<uint8_t>(i),
+                   hit(static_cast<int>(mx), static_cast<int>(my), frc));
     }
 
     // ---- Results list / Tempistiche view ----
@@ -1814,11 +1844,19 @@ void AppUI::render(const bv::ScanOrchestrator::UiSnapshot& st) {
 
 void AppUI::DrawTimings(int yList, int listBottom, const bv::ScanOrchestrator::UiSnapshot& st) {
     const bool running = st.running;
+    float tmx = 0, tmy = 0;
+    SDL_GetMouseState(&tmx, &tmy);
+    const int tix = static_cast<int>(tmx), tiy = static_cast<int>(tmy);
     // A/B side selector (same geometry as the click handler in OnMouseDown).
-    DrawToggle(renderer_, fontBody_, "A", kMargin, yList,
-               kTimingSideW, kTimingSideH, timingSide_ == 0);
+    const SDL_FRect arc{static_cast<float>(kMargin), static_cast<float>(yList),
+                        static_cast<float>(kTimingSideW), static_cast<float>(kTimingSideH)};
+    const SDL_FRect brc{static_cast<float>(kMargin + kTimingSideW + kTimingSideGap),
+                        static_cast<float>(yList),
+                        static_cast<float>(kTimingSideW), static_cast<float>(kTimingSideH)};
+    DrawToggle(renderer_, fontBody_, "A", kMargin, yList, kTimingSideW, kTimingSideH,
+               timingSide_ == 0, hit(tix, tiy, arc));
     DrawToggle(renderer_, fontBody_, "B", kMargin + kTimingSideW + kTimingSideGap, yList,
-               kTimingSideW, kTimingSideH, timingSide_ == 1);
+               kTimingSideW, kTimingSideH, timingSide_ == 1, hit(tix, tiy, brc));
     int y = yList + kTimingSideH + 8;
     const int areaW = winW_ - 2 * kMargin;
 
