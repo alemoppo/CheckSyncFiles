@@ -73,7 +73,9 @@ struct Layout {
     int browseX = 0;     // browse button left edge
     int browseW = kBrowseW;
 
-    int y1 = 0, y2 = 0, y3 = 0, y3b = 0, y4 = 0, y5 = 0;
+    // NOTE: no y4 — the thread-selection row was removed (Auto is resolved
+    // from the IO class); y5 chains directly off y3b to leave no gap.
+    int y1 = 0, y2 = 0, y3 = 0, y3b = 0, y5 = 0;
     int y6 = 0, y7 = 0, y8 = 0, yList = 0, listBottom = 0, summaryY = 0;
     int metricsY = 0; // dedicated footer row for Tempo / Velocita
 
@@ -97,8 +99,7 @@ Layout ComputeLayout(int W, int H) {
     L.y2 = L.y1 + kFieldH + kGap;
     L.y3 = L.y2 + kFieldH + kGap + 8; // back-end selection row
     L.y3b = L.y3 + 30; // partial-verify pattern/percent row
-    L.y4 = L.y3b + 30;
-    L.y5 = L.y4 + 30;
+    L.y5 = L.y3b + 30;
     L.y6 = L.y5 + 40;
     L.y7 = L.y6 + 30;
     L.y8 = L.y7 + 32;
@@ -330,6 +331,15 @@ void DrawToggle(SDL_Renderer* ren, TTF_Font* font, const std::string& label,
     FillRect(ren, x, y, w, h, active ? kAccent : kPanel);
     DrawRect(ren, x, y, w, h, kBorder);
     DrawTextCenterIn(ren, font, label, x, y, w, h, kTextHi);
+}
+
+// Grayed-out toggle for controls that currently make no sense (not clickable).
+// Darker fill + dimmed text, same geometry as DrawToggle.
+void DrawToggleDisabled(SDL_Renderer* ren, TTF_Font* font, const std::string& label,
+                        int x, int y, int w, int h) {
+    FillRect(ren, x, y, w, h, kField);
+    DrawRect(ren, x, y, w, h, kBorder);
+    DrawTextCenterIn(ren, font, label, x, y, w, h, kTextLo);
 }
 
 // Removes the single UTF-16 codepoint immediately before `caret` (handling
@@ -955,11 +965,14 @@ void AppUI::OnMouseDown(int mx, int my) {
     // draw code exactly.
     {
         const int pr = 90;
+        // Grayed out at 0%/100%: the pattern is meaningless there, so clicks
+        // are ignored (mirrors the disabled look in the draw code).
+        const bool patEnabled = st.verifyPercent > 0 && st.verifyPercent < 100;
         for (int i = 0; i < 3; ++i) {
             const int x = kMargin + 100 + i * pr;
             const SDL_FRect r{static_cast<float>(x), static_cast<float>(L.y3b + 2),
                               static_cast<float>(pr - 12), 22.0f};
-            if (hit(mx, my, r)) {
+            if (patEnabled && hit(mx, my, r)) {
                 orch_.setVerifyPattern(static_cast<PartialPattern>(i));
                 dirty_.store(true);
             }
@@ -988,17 +1001,8 @@ void AppUI::OnMouseDown(int mx, int my) {
         }
     }
 
-    // Thread selection.
-    const int tr = 66;
-    for (int i = 0; i < 6; ++i) {
-        const int x = kMargin + 60 + i * tr;
-        const SDL_FRect r{static_cast<float>(x), static_cast<float>(L.y4 + 2),
-                          static_cast<float>(tr - 10), 22.0f};
-        if (hit(mx, my, r)) {
-            orch_.setThreadSel(i);
-            dirty_.store(true);
-        }
-    }
+    // NOTE: no thread-selection widgets. Thread count is Auto (resolved from
+    // the IO class); manual override lives on as engine/CLI `--threads` only.
 
     if (hit(mx, my, L.startBtn) && running) {
         orch_.stop();
@@ -1592,9 +1596,17 @@ void AppUI::render(const bv::ScanOrchestrator::UiSnapshot& st) {
     DrawTextVCenter(renderer_, fontBody_, "Verifica:", L.labelX, L.y3b, 26, kTextLo);
     const char* patNames[3] = {"Edges", "Center", "Random"};
     const int pr = 90;
+    // Pattern only matters for a truly partial read: at 0% (Size) and 100%
+    // (full Content) the toggles are shown grayed out and ignore clicks.
+    const bool patEnabled = st.verifyPercent > 0 && st.verifyPercent < 100;
     for (int i = 0; i < 3; ++i) {
-        DrawToggle(renderer_, fontBody_, patNames[i], kMargin + 100 + i * pr, L.y3b + 2,
-                   pr - 8, 22, static_cast<int>(st.verifyPattern) == i);
+        if (patEnabled) {
+            DrawToggle(renderer_, fontBody_, patNames[i], kMargin + 100 + i * pr, L.y3b + 2,
+                       pr - 8, 22, static_cast<int>(st.verifyPattern) == i);
+        } else {
+            DrawToggleDisabled(renderer_, fontBody_, patNames[i], kMargin + 100 + i * pr,
+                               L.y3b + 2, pr - 8, 22);
+        }
     }
     {
         const int px0 = kVerifyStepX0;
@@ -1623,37 +1635,25 @@ void AppUI::render(const bv::ScanOrchestrator::UiSnapshot& st) {
                         kVerifyPlusX + kVerifyBtnW + 8, L.y3b, 26, kTextLo);
     }
 
-    // ---- Thread ----
-    DrawTextVCenter(renderer_, fontBody_, "Thread:", L.labelX, L.y4, 26, kTextLo);
-    const char* threadNames[6] = {"Auto", "1", "2", "4", "8", "16"};
-    const int tr = 66;
-    for (int i = 0; i < 6; ++i) {
-        DrawToggle(renderer_, fontBody_, threadNames[i], kMargin + 60 + i * tr, L.y4 + 2,
-                   tr - 10, 22, st.threadSel == i);
-    }
-    // Number of hash workers actually launched (resolved "auto" too), live
-    // while the Hashing phase is running.
+    // Hash worker count, display only: live while hashing, last run otherwise.
+    // (Manual thread selection was removed from the GUI; Auto + CLI remain.)
     {
         std::wstring thrInfo;
-        if (st.mode == ScanMode::Content) {
-            if (running) {
-                if (progress.phase == ScanPhase::Hashing) {
-                    if (progress.threads > 0) {
-                        thrInfo = L"→ " + std::to_wstring(progress.threads) + L" thread hash";
-                    } else {
-                        thrInfo = L"(hashing in avvio...)";
-                    }
+        if (running) {
+            if (progress.phase == ScanPhase::Hashing) {
+                if (progress.threads > 0) {
+                    thrInfo = L"→ " + std::to_wstring(progress.threads) + L" thread hash";
+                } else {
+                    thrInfo = L"(hashing in avvio...)";
                 }
-            } else if (st.resultsReady) {
-                thrInfo = L"→ " + std::to_wstring(threadCountUsed) + L" thread hash";
-            } else {
-                thrInfo = L"(auto: stimato al lancio)";
             }
-        } else {
-            thrInfo = L"(hash non usato in questa modalita)";
+        } else if (st.resultsReady) {
+            thrInfo = L"→ " + std::to_wstring(threadCountUsed) + L" thread hash";
         }
-        DrawText(renderer_, fontBody_, ToUtf8(thrInfo), kMargin + 60 + 6 * tr + 8, L.y4 + 4,
-                 kTextLo);
+        if (!thrInfo.empty()) {
+            DrawText(renderer_, fontBody_, ToUtf8(thrInfo), kMargin + 390 + 150 + 8, L.y5 + 4,
+                     kTextLo);
+        }
     }
 
     // ---- Button AVVIA / INTERROMPI (single toggle) ----
