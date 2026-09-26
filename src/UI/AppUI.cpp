@@ -42,11 +42,22 @@ constexpr int kCtxRowH = 26;
 constexpr int kCtxPadX = 12;
 constexpr int kCtxPadY = 6;
 
+// Pattern toggle geometry (shared by hit-test and draw so the hitbox always
+// matches what is drawn): 90px pitch starting at kMargin + 100.
+constexpr int kVerifyPatPitch = 90;
+constexpr int kVerifyPatW = kVerifyPatPitch - 8;
+constexpr int kVerifyPatH = 22;
+inline SDL_FRect VerifyPatRect(int i, int y) {
+    return SDL_FRect{static_cast<float>(kMargin + 100 + i * kVerifyPatPitch),
+                     static_cast<float>(y),
+                     static_cast<float>(kVerifyPatW), static_cast<float>(kVerifyPatH)};
+}
+
 // Verify-percent slider geometry (shared by draw, hit-test and drag so the
 // three can never drift apart). Layout on the y3b row, after the three
-// pattern toggles (3 x 90px starting at kMargin + 100):
+// pattern toggles:
 //   [Solo dimensione] [-] [=== slider 45% ===] [+] [Contenuto completo]
-constexpr int kVerifyStepX0 = kMargin + 100 + 3 * 90 + 16;
+constexpr int kVerifyStepX0 = kMargin + 100 + 3 * kVerifyPatPitch + 16;
 constexpr int kVerifyLblW = 118;
 constexpr int kVerifyBtnW = 28;
 constexpr int kVerifySliderW = 190;
@@ -965,15 +976,11 @@ void AppUI::OnMouseDown(int mx, int my) {
     // (mapped to Size at scan start); the row geometry below must match the
     // draw code exactly.
     {
-        const int pr = 90;
         // Grayed out at 0%/100%: the pattern is meaningless there, so clicks
         // are ignored (mirrors the disabled look in the draw code).
         const bool patEnabled = st.verifyPercent > 0 && st.verifyPercent < 100;
         for (int i = 0; i < 3; ++i) {
-            const int x = kMargin + 100 + i * pr;
-            const SDL_FRect r{static_cast<float>(x), static_cast<float>(L.y3b + 2),
-                              static_cast<float>(pr - 12), 22.0f};
-            if (patEnabled && hit(mx, my, r)) {
+            if (patEnabled && hit(mx, my, VerifyPatRect(i, L.y3b + 2))) {
                 orch_.setVerifyPattern(static_cast<PartialPattern>(i));
                 dirty_.store(true);
             }
@@ -1601,21 +1608,19 @@ void AppUI::render(const bv::ScanOrchestrator::UiSnapshot& st) {
     // ---- Verifica (Size/Content via slider) ----
     DrawTextVCenter(renderer_, fontBody_, "Verifica:", L.labelX, L.y3b, 26, kTextLo);
     const char* patNames[3] = {"Edges", "Center", "Random"};
-    const int pr = 90;
     // Pattern only matters for a truly partial read: at 0% (Size) and 100%
     // (full Content) the toggles are shown grayed out and ignore clicks.
     const bool patEnabled = st.verifyPercent > 0 && st.verifyPercent < 100;
     for (int i = 0; i < 3; ++i) {
+        const SDL_FRect prc = VerifyPatRect(i, L.y3b + 2);
+        const int px = static_cast<int>(prc.x);
         if (patEnabled) {
-            const int px = kMargin + 100 + i * pr;
-            const SDL_FRect prc{static_cast<float>(px), static_cast<float>(L.y3b + 2),
-                                static_cast<float>(pr - 8), 22.0f};
-            DrawToggle(renderer_, fontBody_, patNames[i], px, L.y3b + 2, pr - 8, 22,
-                       static_cast<int>(st.verifyPattern) == i,
+            DrawToggle(renderer_, fontBody_, patNames[i], px, L.y3b + 2, kVerifyPatW,
+                       kVerifyPatH, static_cast<int>(st.verifyPattern) == i,
                        hit(static_cast<int>(mx), static_cast<int>(my), prc));
         } else {
-            DrawToggleDisabled(renderer_, fontBody_, patNames[i], kMargin + 100 + i * pr,
-                               L.y3b + 2, pr - 8, 22);
+            DrawToggleDisabled(renderer_, fontBody_, patNames[i], px, L.y3b + 2, kVerifyPatW,
+                               kVerifyPatH);
         }
     }
     {
