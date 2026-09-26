@@ -46,6 +46,14 @@ PartialPattern ResolveRandomOnce();
 // HashOneCandidateInto for Content. No enumeration, no index, no pool.
 SingleVerifyOutcome VerifySingleFile(const SingleVerifyRequest& req);
 
+// Coherent internal-error outcome for a single verification that threw an
+// unhandled C++ exception: mirrors the pool task-error convention (a throw
+// becomes a read error, never a wrong verdict, never std::terminate). `what`
+// may be nullptr (unknown exception); the message is always recorded, never
+// silent. The GUI consumes it like any ReadError (row replaced, stats fixed),
+// so verifyRunning_ always clears and nothing gets stuck.
+FileResult MakeInternalVerifyError(const SingleVerifyRequest& req, const char* what);
+
 // Applies one single-verify outcome to a live ResultSet (GUI-owned, main
 // thread only): finds the row by relativePath, fixes the verdict counters for
 // the old->new transition, and replaces the row -- or removes it when the new

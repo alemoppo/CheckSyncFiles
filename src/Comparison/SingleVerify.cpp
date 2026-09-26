@@ -81,14 +81,19 @@ FileEntry ToEntry(const std::wstring& rel, const SideStat& st) {
 
 // Error row for a side whose metadata itself was unreadable. Mirrors the
 // errorRoot policy of a full scan: the failed side when the other side is
-// fine, otherwise the destination as the deterministic fallback.
+// fine, otherwise the destination as the deterministic fallback. Preserves
+// the size of whichever side actually produced data (callers pass 0 for the
+// failed side -- never invent one); like Missing/Extra rows, the unknown
+// side keeps the default 0, the project convention for "size unavailable".
 FileResult MetaErrorRow(const std::wstring& rel, bool denied,
-                        const std::wstring& sourceRoot, const std::wstring& destRoot,
-                        bool otherSideOk) {
+                        const std::wstring& failedRoot, const std::wstring& fallbackRoot,
+                        bool otherSideOk, uint64_t sizeSource, uint64_t sizeDest) {
     FileResult r;
     r.status = denied ? Status::AccessDenied : Status::ReadError;
-    r.fullPath = pathutil::MakeAbsolute(otherSideOk ? sourceRoot : destRoot, rel);
+    r.fullPath = pathutil::MakeAbsolute(otherSideOk ? failedRoot : fallbackRoot, rel);
     r.relativePath = rel;
+    r.sizeSource = sizeSource;
+    r.sizeDest = sizeDest;
     r.isDirectory = false;
     r.errorMessage = denied ? L"accesso negato durante la lettura dei metadati"
                             : L"errore di lettura dei metadati del file";
@@ -96,6 +101,21 @@ FileResult MetaErrorRow(const std::wstring& rel, bool denied,
 }
 
 } // namespace
+
+FileResult MakeInternalVerifyError(const SingleVerifyRequest& req, const char* what) {
+    FileResult r;
+    r.status = Status::ReadError;
+    // Both-failed fallback convention: destination side shown.
+    r.fullPath = pathutil::MakeAbsolute(req.destRoot, req.relativePath);
+    r.relativePath = req.relativePath;
+    r.isDirectory = false;
+    std::wstring msg = L"errore interno durante la verifica singola";
+    if (what != nullptr && what[0] != '\0') {
+        msg += L": " + pathutil::FromUtf8(what);
+    }
+    r.errorMessage = std::move(msg);
+    return r;
+}
 
 SingleVerifyOutcome VerifySingleFile(const SingleVerifyRequest& req) {
     SingleVerifyOutcome out;
@@ -117,11 +137,15 @@ SingleVerifyOutcome VerifySingleFile(const SingleVerifyRequest& req) {
         // as a full scan (AccessDenied vs ReadError), no content touched.
         // Reports the first failing side (A first, deterministic).
         if (a.metaError) {
+            // A produced nothing: sizeSource stays 0, sizeDest kept when B
+            // was stat-ed fine.
             out.result = MetaErrorRow(req.relativePath, a.denied, req.sourceRoot,
-                                      req.destRoot, b.present);
+                                      req.destRoot, b.present, 0,
+                                      b.present ? b.size : 0);
         } else {
             out.result = MetaErrorRow(req.relativePath, b.denied, req.destRoot,
-                                      req.sourceRoot, a.present);
+                                      req.sourceRoot, a.present,
+                                      a.present ? a.size : 0, 0);
         }
         return out;
     }

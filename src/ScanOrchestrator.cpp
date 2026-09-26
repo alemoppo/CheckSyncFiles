@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <exception>
 #include <utility>
 
 #define WIN32_LEAN_AND_MEAN
@@ -247,7 +248,20 @@ bool ScanOrchestrator::takeSingleVerifyResult(SingleVerifyOutcome& out) {
 }
 
 void ScanOrchestrator::verifyThread(SingleVerifyRequest req) {
-    SingleVerifyOutcome outcome = VerifySingleFile(req);
+    // An unhandled C++ exception must never cross this thread function
+    // (std::terminate). On throw, publish a coherent internal error instead:
+    // the flag clearing and publish below run unconditionally, so the mutex
+    // is never left held, verifyRunning_ always clears, and the GUI consumes
+    // a normal ReadError outcome.
+    SingleVerifyOutcome outcome;
+    outcome.relativePath = req.relativePath;
+    try {
+        outcome = VerifySingleFile(req);
+    } catch (const std::exception& e) {
+        outcome.result = MakeInternalVerifyError(req, e.what());
+    } catch (...) {
+        outcome.result = MakeInternalVerifyError(req, nullptr);
+    }
     {
         std::lock_guard<std::mutex> lk(mtx_);
         pendingVerify_ = std::move(outcome);

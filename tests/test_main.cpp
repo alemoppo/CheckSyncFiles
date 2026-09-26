@@ -6042,6 +6042,97 @@ TEST("singleverify: apply replaces rows, removes identicals, fixes stats", [] {
     CHECK_EQ(set.stats.sizeMismatch, 1ull);
 });
 
+TEST("singleverify: metadata error preserves the healthy side's size", [] {
+    const auto dir = MakeTempDir();
+    const std::wstring src = dir + L"\\src";
+    const std::wstring dst = dir + L"\\dst";
+    fs::create_directories(src + L"\\sub");
+    fs::create_directories(dst + L"\\sub");
+    CHECK(WriteFileBytes(src + L"\\sub\\f.bin", "content-A", 9));
+    CHECK(WriteFileBytes(dst + L"\\sub\\f.bin", "content-A", 9));
+
+    // Deny listing on B's parent: B's metadata becomes unreadable while A is
+    // fine. Probe first: if the OS does not report ACCESS_DENIED, skip (same
+    // convention as the other icacls tests) instead of asserting blindly.
+    const std::wstring dstSub = dst + L"\\sub";
+    if (!DenyListAccess(dstSub)) {
+        std::cout << "  (icacls non disponibile, test saltato)\n";
+        RestoreAccess(dstSub);
+        return;
+    }
+    ScopeGuard restoreB{[&] { RestoreAccess(dstSub); }};
+    {
+        const DWORD attrs = GetFileAttributesW((dstSub + L"\\f.bin").c_str());
+        if (attrs != INVALID_FILE_ATTRIBUTES || GetLastError() != ERROR_ACCESS_DENIED) {
+            std::cout << "  (ACL denial non applicata, test saltato)\n";
+            return;
+        }
+    }
+    {
+        const bv::SingleVerifyOutcome out =
+            bv::VerifySingleFile(MakeSingleReq(L"sub\\f.bin", src, dst));
+        CHECK(!out.cancelled);
+        CHECK(out.result.status == bv::Status::AccessDenied);
+        CHECK_EQ(out.result.sizeSource, 9ull); // A healthy: preserved
+        CHECK_EQ(out.result.sizeDest, 0ull);   // B failed: default, never invented
+    }
+
+    // Mirror: A denied, B healthy.
+    const std::wstring srcSub = src + L"\\sub";
+    RestoreAccess(dstSub);
+    if (!DenyListAccess(srcSub)) {
+        std::cout << "  (icacls non disponibile, test saltato)\n";
+        RestoreAccess(srcSub);
+        return;
+    }
+    ScopeGuard restoreA{[&] { RestoreAccess(srcSub); }};
+    {
+        const DWORD attrs = GetFileAttributesW((srcSub + L"\\f.bin").c_str());
+        if (attrs != INVALID_FILE_ATTRIBUTES || GetLastError() != ERROR_ACCESS_DENIED) {
+            std::cout << "  (ACL denial non applicata, test saltato)\n";
+            return;
+        }
+    }
+    const bv::SingleVerifyOutcome out =
+        bv::VerifySingleFile(MakeSingleReq(L"sub\\f.bin", src, dst));
+    CHECK(!out.cancelled);
+    CHECK(out.result.status == bv::Status::AccessDenied);
+    CHECK_EQ(out.result.sizeSource, 0ull);
+    CHECK_EQ(out.result.sizeDest, 9ull); // B healthy: preserved
+});
+
+TEST("singleverify: internal worker error is a consumable read error", [] {
+    // Unit contract of the worker catch path (a throw can never be injected
+    // cleanly, so the builder itself is tested): coherent ReadError carrying
+    // the detail, consumable by the GUI like any other outcome.
+    bv::SingleVerifyRequest req;
+    req.relativePath = L"f.bin";
+    req.sourceRoot = L"C:\\src";
+    req.destRoot = L"C:\\dst";
+    const bv::FileResult withWhat = bv::MakeInternalVerifyError(req, "boom");
+    CHECK(withWhat.status == bv::Status::ReadError);
+    CHECK(withWhat.relativePath == L"f.bin");
+    CHECK(withWhat.fullPath == L"C:\\dst\\f.bin"); // both-failed fallback convention
+    CHECK(!withWhat.errorMessage.empty());
+    CHECK(withWhat.errorMessage.find(L"boom") != std::wstring::npos);
+    const bv::FileResult noWhat = bv::MakeInternalVerifyError(req, nullptr);
+    CHECK(noWhat.status == bv::Status::ReadError);
+    CHECK(!noWhat.errorMessage.empty()); // unknown: still explicit, never silent
+
+    // The GUI consumes it like any ReadError: row replaced, stats fixed.
+    bv::ResultSet set;
+    bv::FileResult oldRow;
+    oldRow.status = bv::Status::Missing;
+    oldRow.relativePath = L"f.bin";
+    set.problems.push_back(oldRow);
+    set.stats.missingFiles = 1;
+    CHECK(bv::ApplySingleResult(set, withWhat));
+    CHECK_EQ(set.problems.size(), 1ull);
+    CHECK(set.problems[0].status == bv::Status::ReadError);
+    CHECK_EQ(set.stats.missingFiles, 0ull);
+    CHECK_EQ(set.stats.readErrors, 1ull);
+});
+
 // ---------------------------------------------------------------------------
 // Phase 5: export CSV/JSON, binary snapshot, hash cache, offline compare
 
