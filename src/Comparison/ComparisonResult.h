@@ -79,6 +79,29 @@ struct Stats {
 
     uint64_t bytesSource = 0; // sum of source file sizes
     uint64_t bytesDest = 0;   // sum of destination file sizes
+
+    Stats& operator+=(const Stats& add) {
+        sourceFiles += add.sourceFiles;
+        sourceDirs += add.sourceDirs;
+        destFiles += add.destFiles;
+        destDirs += add.destDirs;
+        identicalFiles += add.identicalFiles;
+        identicalDirs += add.identicalDirs;
+        missingFiles += add.missingFiles;
+        missingDirs += add.missingDirs;
+        extraFiles += add.extraFiles;
+        extraDirs += add.extraDirs;
+        sizeMismatch += add.sizeMismatch;
+        contentMismatch += add.contentMismatch;
+        identicalPartialFiles += add.identicalPartialFiles;
+        contentMismatchPartial += add.contentMismatchPartial;
+        readErrors += add.readErrors;
+        accessDenied += add.accessDenied;
+        changedDuringScan += add.changedDuringScan;
+        bytesSource += add.bytesSource;
+        bytesDest += add.bytesDest;
+        return *this;
+    }
 };
 
 // Run-level partial-verification record: what was requested vs effectively

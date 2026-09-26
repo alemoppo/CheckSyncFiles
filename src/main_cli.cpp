@@ -726,17 +726,13 @@ bv::ScanController controller(options.caseSensitive);
         const auto& problems = report.results.problems;
         const size_t n = std::min(problems.size(), args.limit);
         std::wcout << L"\n=== PROBLEMI (prime " << n << L" di " << problems.size() << L") ===\n";
-        // Indexed by Status value: keep in sync with ComparisonResult.h order.
-        const wchar_t* names[] = {
-            L"IDENTICO", L"MANCANTE", L"EXTRA", L"DIM_DIVERSA",
-            L"CONTENUTO_DIVERSO", L"IDENTICO_PARZIALE", L"CONTENUTO_DIVERSO_PARZIALE",
-            L"ERRORE_LETTURA", L"ACCESSO_NEGATO", L"MODIFICATO_DURANTE_SCAN"};
         for (size_t i = 0; i < n; ++i) {
             const bv::FileResult& p = problems[i];
-            const size_t idx = static_cast<size_t>(p.status);
-            const wchar_t* name = idx < sizeof(names) / sizeof(names[0]) ? names[idx] : L"?";
-            std::wcout << name << L"\t" << (p.isDirectory ? L"[dir] " : L"")
-                       << p.relativePath;
+            // Single source of truth for status tokens (ExportUtil::StatusToken);
+            // widened here because the CLI prints wide strings (tokens are ASCII).
+            const std::string narrow = bv::exporting::StatusToken(p.status);
+            std::wcout << std::wstring(narrow.begin(), narrow.end()) << L"\t"
+                       << (p.isDirectory ? L"[dir] " : L"") << p.relativePath;
             if (p.status == bv::Status::ContentMismatchPartial) {
                 std::wcout << L"  (verifica " << p.verifiedPercent << L"%, "
                            << PatternLabel(p.verifiedPattern) << L")";

@@ -11,28 +11,6 @@ namespace {
 
 using Digest = hashing::Digest;
 
-void AddStats(Stats& target, const Stats& add) {
-    target.sourceFiles += add.sourceFiles;
-    target.sourceDirs += add.sourceDirs;
-    target.destFiles += add.destFiles;
-    target.destDirs += add.destDirs;
-    target.identicalFiles += add.identicalFiles;
-    target.identicalDirs += add.identicalDirs;
-    target.missingFiles += add.missingFiles;
-    target.missingDirs += add.missingDirs;
-    target.extraFiles += add.extraFiles;
-    target.extraDirs += add.extraDirs;
-    target.sizeMismatch += add.sizeMismatch;
-    target.contentMismatch += add.contentMismatch;
-    target.identicalPartialFiles += add.identicalPartialFiles;
-    target.contentMismatchPartial += add.contentMismatchPartial;
-    target.readErrors += add.readErrors;
-    target.accessDenied += add.accessDenied;
-    target.changedDuringScan += add.changedDuringScan;
-    target.bytesSource += add.bytesSource;
-    target.bytesDest += add.bytesDest;
-}
-
 } // namespace
 
 // Hashes both sides of one candidate and folds the outcome into the thread-safe
@@ -306,7 +284,7 @@ void RunHashPhase(const std::vector<ContentCandidate>& candidates, ThreadPool& p
     }
 
     ResultSet s = sink.take();
-    AddStats(out.stats, s.stats);
+    out.stats += s.stats;
     for (FileResult& p : s.problems) out.problems.push_back(std::move(p));
 }
 

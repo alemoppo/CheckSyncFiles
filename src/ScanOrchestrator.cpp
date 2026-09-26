@@ -142,24 +142,9 @@ void ScanOrchestrator::setDestFocus(bool f) {
     destFocus_ = f;
 }
 
-void ScanOrchestrator::setMode(ScanMode m) {
-    std::lock_guard<std::mutex> lk(mtx_);
-    mode_ = m;
-}
-
-void ScanOrchestrator::setCaseSensitive(bool c) {
-    std::lock_guard<std::mutex> lk(mtx_);
-    caseSensitive_ = c;
-}
-
 void ScanOrchestrator::setBackend(EnumeratorBackend b) {
     std::lock_guard<std::mutex> lk(mtx_);
     backend_ = b;
-}
-
-void ScanOrchestrator::setThreadSel(int sel) {
-    std::lock_guard<std::mutex> lk(mtx_);
-    threadSel_ = sel;
 }
 
 void ScanOrchestrator::setVerifyPercent(int percent) {
@@ -429,10 +414,7 @@ ScanOrchestrator::UiSnapshot ScanOrchestrator::snapshot() const {
     s.dest = dest_;
     s.sourceFocus = sourceFocus_;
     s.destFocus = destFocus_;
-    s.mode = mode_;
-    s.caseSensitive = caseSensitive_;
     s.backend = backend_;
-    s.threadSel = threadSel_;
     s.verifyPercent = verifyPercent_;
     s.verifyPattern = verifyPattern_;
     s.verify = verify_;
@@ -445,15 +427,12 @@ ScanOrchestrator::UiSnapshot ScanOrchestrator::snapshot() const {
     s.verifyPath = verifyPath_;
     s.sourceOk = sourceOk_;
     s.destinationOk = destinationOk_;
-    s.notes = notes_;
     s.progress = progress_;
     s.threadCountUsed = threadCountUsed_;
     s.lastSecondsTotal = lastSecondsTotal_;
     s.hashingErrors = hashingErrors_;
     s.hashCacheHits = hashCacheHits_;
-    s.lastSnapshotWritten = lastSnapshotWritten_;
     s.lastUsedSnapshot = lastUsedSnapshot_;
-    s.lastDegraded = lastDegraded_;
     s.statusNote = statusNote_;
     return s;
 }

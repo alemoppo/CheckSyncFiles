@@ -18,28 +18,6 @@ std::wstring CanonicalKey(const std::wstring& relativePath, bool caseSensitive) 
     return caseSensitive ? relativePath : pathutil::FoldForCompare(relativePath);
 }
 
-void AddStats(Stats& target, const Stats& add) {
-    target.sourceFiles += add.sourceFiles;
-    target.sourceDirs += add.sourceDirs;
-    target.destFiles += add.destFiles;
-    target.destDirs += add.destDirs;
-    target.identicalFiles += add.identicalFiles;
-    target.identicalDirs += add.identicalDirs;
-    target.missingFiles += add.missingFiles;
-    target.missingDirs += add.missingDirs;
-    target.extraFiles += add.extraFiles;
-    target.extraDirs += add.extraDirs;
-    target.sizeMismatch += add.sizeMismatch;
-    target.contentMismatch += add.contentMismatch;
-    target.identicalPartialFiles += add.identicalPartialFiles;
-    target.contentMismatchPartial += add.contentMismatchPartial;
-    target.readErrors += add.readErrors;
-    target.accessDenied += add.accessDenied;
-    target.changedDuringScan += add.changedDuringScan;
-    target.bytesSource += add.bytesSource;
-    target.bytesDest += add.bytesDest;
-}
-
 std::unique_ptr<IFileEnumerator> MakeWin32() {
     return std::unique_ptr<IFileEnumerator>(new Win32Enumerator());
 }
@@ -181,7 +159,7 @@ ConcurrentComparer::Result ConcurrentComparer::runImpl(
     }
 
     r.results = sink.take();
-    AddStats(r.results.stats, post.stats);
+    r.results.stats += post.stats;
     for (FileResult& p : post.problems) r.results.problems.push_back(std::move(p));
     sortProblems(r.results);
     activeTable_.store(nullptr, std::memory_order_release);

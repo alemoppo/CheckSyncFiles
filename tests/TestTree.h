@@ -9,10 +9,6 @@
 namespace bv {
 namespace testgen {
 
-struct TreeSpec {
-    std::wstring root; // parent directory; the tree is created directly under it
-};
-
 // Creates a small, well-known fixture with known "expected" outcome when
 // compared against itself (all identical) — see the unit tests.
 // Layout under root:

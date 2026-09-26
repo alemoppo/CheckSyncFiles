@@ -33,10 +33,7 @@ public:
         std::wstring dest;
         bool sourceFocus = false;
         bool destFocus = false;
-        ScanMode mode = ScanMode::Presence;
-        bool caseSensitive = false;
         EnumeratorBackend backend = EnumeratorBackend::Auto;
-        int threadSel = 0; // 0=Auto,1,2,4,8,16
         int verifyPercent = 100; // 0..100 (0 = size comparison, see startLiveScan)
         PartialPattern verifyPattern = PartialPattern::Edges;
         // Last run's verification record (resolved pattern, effective percent).
@@ -56,17 +53,12 @@ public:
         // was cancelled; the UI must then never present the run as completed.
         bool sourceOk = true;
         bool destinationOk = true;
-        // User-facing notes from the last run (e.g. back-end fallbacks, or an
-        // incomplete scan explanation). Empty when there is nothing to say.
-        std::vector<std::wstring> notes;
         ScanProgress progress;
         unsigned int threadCountUsed = 0; // hash workers actually launched
         double lastSecondsTotal = 0.0;    // duration of the last completed scan
         uint64_t hashingErrors = 0;  // worker exceptions during hashing
         uint64_t hashCacheHits = 0;  // persistent-cache hits of the last run
-        bool lastSnapshotWritten = false;
         bool lastUsedSnapshot = false;
-        bool lastDegraded = false;
         std::wstring statusNote;
     };
 
@@ -87,10 +79,10 @@ public:
     void setDest(std::wstring s);
     void setSourceFocus(bool f);
     void setDestFocus(bool f);
-    void setMode(ScanMode m);
-    void setCaseSensitive(bool c);
+    // NOTE: no setMode/setCaseSensitive/setThreadSel — the GUI no longer
+    // exposes those toggles; engine defaults (Content/insensitive/Auto) flow
+    // to ScanOptions, and the CLI sets them directly.
     void setBackend(EnumeratorBackend b);
-    void setThreadSel(int sel);
     // Partial content verification (Content mode): percent 0..100 (0 = size
     // comparison, mapped to Size at scan start) and sampling pattern.
     void setVerifyPercent(int percent);

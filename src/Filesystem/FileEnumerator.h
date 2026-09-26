@@ -22,9 +22,9 @@ struct ScanError {
 };
 
 // Interface implemented by all enumeration back-ends:
-//   - Win32Enumerator : regular FindFirstFile/FindNextFile walk (all filesystems)
+//   - Win32Enumerator : regular FindFirstFile/FindNextFile walk (all filesystems,
+//                       SMB shares included)
 //   - MftEnumerator   : NTFS Master File Table scan (Phase 4)
-//   - NetworkEnumerator : SMB-aware walk, currently = Win32Enumerator
 class IFileEnumerator {
 public:
     using EntryCallback = std::function<bool(FileEntry&&)>; // return false to abort

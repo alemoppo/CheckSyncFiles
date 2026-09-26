@@ -397,7 +397,6 @@ TEST("file index: folded-key collisions are counted for the last-wins policy", [
 
 TEST("identical tree: everything identical, no errors", [] {
     const auto dir = MakeTempDir();
-    ScopeGuard sg{[] {}};
     testgen::CreateFixture(dir);
     const auto r = RunScan(dir, dir, ScanMode::Presence);
     const auto& s = r.results.stats;
@@ -3084,10 +3083,11 @@ TEST("export: json escaping and no BOM", [] {
 
     const std::wstring file = MakeTempDir() + L"\\out.json";
     std::wstring err;
-    CHECK(WriteJson(file, r, err));
+    CHECK(WriteJson(file, r, profiling::DirTimingReport{}, 0ull, VerifyInfo{}, err));
     const std::string bytes = ReadFileBytes(file);
 
-    CHECK(bytes[0] == '['); // no BOM, streaming array
+    CHECK(bytes[0] == '{'); // no BOM, wrapping object
+    CHECK(bytes.find("\"problems\":[") != std::string::npos);
     CHECK(bytes.find("CONTENUTO_DIVERSO") != std::string::npos);
     // JSON escaping: quote, backslash, tab.
     CHECK(bytes.find("dir\\\\qu\\\"ote\\\\path\\tfile.bin") != std::string::npos);
@@ -3097,13 +3097,13 @@ TEST("export: json escaping and no BOM", [] {
     CHECK(wellFormed(bytes));
     CHECK(bytes.find("},\n]") == std::string::npos);
 
-    // Empty problems: still a valid, empty JSON array.
+    // Empty problems: still a valid document with an empty problems array.
     ResultSet empty;
     const std::wstring file2 = MakeTempDir() + L"\\out_empty.json";
-    CHECK(WriteJson(file2, empty, err));
+    CHECK(WriteJson(file2, empty, profiling::DirTimingReport{}, 0ull, VerifyInfo{}, err));
     const std::string bytes2 = ReadFileBytes(file2);
     CHECK(wellFormed(bytes2));
-    CHECK(bytes2.find('{') == std::string::npos);
+    CHECK(bytes2.find("\"problems\":[") != std::string::npos);
 });
 
 TEST("snapshot: index round-trip preserves entries, hashes and case policy", [] {
