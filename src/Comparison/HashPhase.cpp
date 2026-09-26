@@ -33,6 +33,8 @@ void AddStats(Stats& target, const Stats& add) {
     target.bytesDest += add.bytesDest;
 }
 
+} // namespace
+
 // Hashes both sides of one candidate and folds the outcome into the thread-safe
 // `sink`. Safe to call concurrently from any number of pool workers (stats are
 // atomics, problems go through the sink mutex). A task that bails because
@@ -45,9 +47,9 @@ void HashOneCandidateInto(const ContentCandidate& c, bool offlineSource, FileInd
                           ConcurrentSink& sink, const std::atomic_bool* cancel,
                           hashing::HashCache* cache, std::atomic<size_t>& cacheHits,
                           profiling::HashSession* session,
-                          profiling::JobVerdict* verdict = nullptr,
-                          profiling::DirHashTop* dirHash = nullptr,
-                          ContentVerifyLevel verify = ContentVerifyLevel{}) {
+                          profiling::JobVerdict* verdict,
+                          profiling::DirHashTop* dirHash,
+                          ContentVerifyLevel verify) {
     // The read plan is computed ONCE per file from the source size (candidates
     // only exist when both sides share it: ClassifyMatched guarantees
     // sizeSource == sizeDest, otherwise this is SizeMismatch upstream) and the
@@ -77,8 +79,9 @@ void HashOneCandidateInto(const ContentCandidate& c, bool offlineSource, FileInd
         if (!srcOk && dstOk) return sourceRoot;
         return destRoot;
     };
-    const auto reportReadError = [&](bool denied, bool hasSrc, bool hasDst, const Digest& sd,
-                                     const Digest& dd, const std::wstring& root) {
+    const auto reportReadError = [&](bool denied, bool hasSrc, bool hasDst,
+                                     const hashing::Digest& sd, const hashing::Digest& dd,
+                                     const std::wstring& root) {
         if (denied) {
             inc(stats.accessDenied);
         } else {
@@ -111,8 +114,8 @@ void HashOneCandidateInto(const ContentCandidate& c, bool offlineSource, FileInd
     bool changed = false;
     hashing::HashStatus srcStatus = hashing::HashStatus::ReadError;
     hashing::HashStatus dstStatus = hashing::HashStatus::ReadError;
-    Digest srcDigest{};
-    Digest dstDigest{};
+    hashing::Digest srcDigest{};
+    hashing::Digest dstDigest{};
     bool hasSrc = false;
     bool hasDst = false;
     if (offlineSource) {
@@ -218,8 +221,6 @@ void HashOneCandidateInto(const ContentCandidate& c, bool offlineSource, FileInd
     const bool dstOk = (dstStatus == hashing::HashStatus::Ok);
     reportReadError(denied, hasSrc, hasDst, srcDigest, dstDigest, errorRoot(srcOk, dstOk));
 }
-
-} // namespace
 
 void SubmitHashCandidates(const std::vector<ContentCandidate>& candidates, ThreadPool& pool,
                           bool offlineSource, FileIndex* index,

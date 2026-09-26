@@ -11,6 +11,7 @@
 
 #include "Comparison/ComparisonResult.h"
 #include "Comparison/ScanMode.h"
+#include "Comparison/SingleVerify.h"
 #include "ScanController.h"
 
 namespace bv {
@@ -46,6 +47,10 @@ public:
         bool running = false;
         bool resultsReady = false;
         bool cancelled = false; // last run was interrupted by the user
+        // A single-file re-verification is in flight (see requestSingleVerify)
+        // and which relative path it is checking, for status display.
+        bool verifyRunning = false;
+        std::wstring verifyPath;
         // Last run outcome: whether each side was enumerated cleanly (mirrors
         // ScanReport::sourceOk / destinationOk). False when the side failed or
         // was cancelled; the UI must then never present the run as completed.
@@ -97,6 +102,26 @@ public:
     void loadSnapshot(std::wstring file);
     void clearSnapshot();
 
+    // -- Single-file re-verification ("Riscansiona") -------------------------
+    // Raw GUI-side settings for one single-file check. Everything the worker
+    // needs is frozen here at click time; the worker never reads GUI state.
+    struct SingleVerifyParams {
+        std::wstring relativePath; // canonical `a\b`, from the clicked row
+        std::wstring sourceRoot;   // A root frozen with the displayed results
+        std::wstring destRoot;     // B root frozen with the displayed results
+        int percent = 100;         // 0..100, 0 = size comparison
+        PartialPattern pattern = PartialPattern::Edges; // may be Random
+    };
+    // Starts a single-file verification on a dedicated worker (the full-scan
+    // pool may be long gone). Returns false when a full scan or another
+    // single verification is already running. Random is resolved once here,
+    // percent 0 maps to Size here -- the worker is fully deterministic.
+    // The outcome lands in takeSingleVerifyResult().
+    bool requestSingleVerify(const SingleVerifyParams& params);
+    // Takes a finished single-verify outcome (main thread). Returns false
+    // when none is pending; the slot is cleared on take.
+    bool takeSingleVerifyResult(SingleVerifyOutcome& out);
+
     // -- Commands -------------------------------------------------------------
     // startLiveScan handles both the live case (source + destination) and the
     // offline case (snapshot + destination), mirroring the previous UI logic.
@@ -134,6 +159,10 @@ public:
 
 private:
     void workerThread(ScanOptions options);
+    // Dedicated single-verify worker: runs one VerifySingleFile, then
+    // publishes the outcome and clears verifyRunning_ under mtx_. Touches
+    // only its by-value request plus verify* state; never GUI objects.
+    void verifyThread(SingleVerifyRequest req);
     // Stores a progress tick; ticks emitted without a live MatchTable (index
     // build, capture hashing, final Done) carry matchHighWater == 0 and must
     // not wipe the gauges: the previous readings are preserved. Caller holds
@@ -167,6 +196,15 @@ private:
     bool running_ = false;
     std::atomic_bool cancel_{false};
     std::thread worker_;
+    // Single-verify state. verifyCancel_ is deliberately separate from
+    // cancel_: the two never run concurrently, and a full-scan stop must not
+    // be confused with a single-verify stop (nor vice versa).
+    std::atomic_bool verifyCancel_{false};
+    std::thread verifyThread_;
+    bool verifyRunning_ = false;
+    bool verifyReady_ = false;
+    SingleVerifyOutcome pendingVerify_;
+    std::wstring verifyPath_;
     ScanProgress progress_;
     bool resultsReady_ = false;
     ResultSet results_;

@@ -193,10 +193,74 @@ void ScanOrchestrator::clearSnapshot() {
     statusNote_ = L"Modalita online: sorgente da enumerare.";
 }
 
+bool ScanOrchestrator::requestSingleVerify(const SingleVerifyParams& params) {
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        if (running_ || verifyRunning_) return false;
+    }
+    // Never join while holding mtx_ (same deadlock rationale as the scan
+    // starts below): the verify worker's final update takes the lock.
+    if (verifyThread_.joinable()) verifyThread_.join();
+
+    // Freeze everything here, on the calling (GUI) thread: Random resolved
+    // once, percent mapped exactly like startLiveScan (0 = Size). The worker
+    // below is then fully deterministic given this request.
+    SingleVerifyRequest req;
+    req.relativePath = params.relativePath;
+    req.sourceRoot = params.sourceRoot;
+    req.destRoot = params.destRoot;
+    const int percent = std::max(0, std::min(100, params.percent));
+    if (percent <= 0) {
+        req.mode = ScanMode::Size;
+        req.verify = ContentVerifyLevel{};
+    } else {
+        req.mode = ScanMode::Content;
+        req.verify.percent = percent;
+        req.verify.pattern = params.pattern == PartialPattern::Random
+                                 ? ResolveRandomOnce()
+                                 : params.pattern;
+    }
+    req.cache = nullptr; // GUI scans never configure a cache file
+    req.cancel = &verifyCancel_;
+
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        if (running_ || verifyRunning_) return false; // defensive re-check
+        verifyCancel_.store(false);
+        verifyRunning_ = true;
+        verifyReady_ = false;
+        pendingVerify_ = SingleVerifyOutcome{};
+        verifyPath_ = params.relativePath;
+        verifyThread_ = std::thread(&ScanOrchestrator::verifyThread, this, std::move(req));
+    }
+    notify();
+    return true;
+}
+
+bool ScanOrchestrator::takeSingleVerifyResult(SingleVerifyOutcome& out) {
+    std::lock_guard<std::mutex> lk(mtx_);
+    if (!verifyReady_) return false;
+    out = std::move(pendingVerify_);
+    pendingVerify_ = SingleVerifyOutcome{};
+    verifyReady_ = false;
+    return true;
+}
+
+void ScanOrchestrator::verifyThread(SingleVerifyRequest req) {
+    SingleVerifyOutcome outcome = VerifySingleFile(req);
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        pendingVerify_ = std::move(outcome);
+        verifyReady_ = true;
+        verifyRunning_ = false;
+    }
+    notify();
+}
+
 bool ScanOrchestrator::startLiveScan() {
     {
         std::lock_guard<std::mutex> lk(mtx_);
-        if (running_) return false;
+        if (running_ || verifyRunning_) return false;
         if (useSnapshot_) {
             if (snapshotFile_.empty() || dest_.empty()) return false;
         } else if (source_.empty() || dest_.empty()) {
@@ -214,7 +278,7 @@ bool ScanOrchestrator::startLiveScan() {
     if (worker_.joinable()) worker_.join();
 
     std::lock_guard<std::mutex> lk(mtx_);
-    if (running_) return false; // another start won the race (defensive)
+    if (running_ || verifyRunning_) return false; // another start won the race (defensive)
 
     cancel_.store(false);
     resetForRunLocked();
@@ -266,7 +330,7 @@ bool ScanOrchestrator::startLiveScan() {
 bool ScanOrchestrator::startSnapshotScan(const std::wstring& outFile) {
     {
         std::lock_guard<std::mutex> lk(mtx_);
-        if (running_) return false;
+        if (running_ || verifyRunning_) return false;
         if (source_.empty()) {
             statusNote_ = L"Specificare la sorgente prima di creare uno snapshot.";
             return false;
@@ -279,7 +343,7 @@ bool ScanOrchestrator::startSnapshotScan(const std::wstring& outFile) {
     if (worker_.joinable()) worker_.join();
 
     std::lock_guard<std::mutex> lk(mtx_);
-    if (running_) return false; // another start won the race (defensive)
+    if (running_ || verifyRunning_) return false; // another start won the race (defensive)
 
     cancel_.store(false);
     resetForRunLocked();
@@ -315,6 +379,7 @@ bool ScanOrchestrator::startSnapshotScan(const std::wstring& outFile) {
 
 void ScanOrchestrator::stop() {
     cancel_.store(true);
+    verifyCancel_.store(true); // also winds down a single verification, if any
 }
 
 bool ScanOrchestrator::exportCsv(const std::wstring& path) {
@@ -336,9 +401,11 @@ void ScanOrchestrator::shutdown() {
     {
         std::lock_guard<std::mutex> lk(mtx_);
         cancel_.store(true);
+        verifyCancel_.store(true);
     }
-    // Never join while holding mtx_: the worker's final update takes the lock.
+    // Never join while holding mtx_: the workers' final updates take the lock.
     if (worker_.joinable()) worker_.join();
+    if (verifyThread_.joinable()) verifyThread_.join();
 }
 
 ScanOrchestrator::UiSnapshot ScanOrchestrator::snapshot() const {
@@ -360,6 +427,8 @@ ScanOrchestrator::UiSnapshot ScanOrchestrator::snapshot() const {
     s.running = running_;
     s.resultsReady = resultsReady_;
     s.cancelled = cancel_.load();
+    s.verifyRunning = verifyRunning_;
+    s.verifyPath = verifyPath_;
     s.sourceOk = sourceOk_;
     s.destinationOk = destinationOk_;
     s.notes = notes_;
@@ -426,6 +495,10 @@ void ScanOrchestrator::resetForRunLocked() {
     hashCacheHits_ = 0;
     dirTiming_ = {};
     verify_ = {};
+    // A stale single-verify outcome must never apply to the new results.
+    verifyReady_ = false;
+    pendingVerify_ = SingleVerifyOutcome{};
+    verifyPath_.clear();
     statusNote_.clear();
     lastSnapshotPath_.clear();
 }

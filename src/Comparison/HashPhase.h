@@ -51,6 +51,22 @@ namespace bv {
 constexpr size_t kHashBatchSize = 256;      // candidates per submission batch
 constexpr size_t kHashMaxOutstanding = 1024; // cap on submitted-but-not-finished tasks
 
+// Single-pair verification, shared by the batch paths above and by single-file
+// re-verification ("Riscansiona"). Hashes both candidate sides (same plan for
+// A+B, computed once from the source size) and folds the outcome into `sink`:
+// a mismatch/error appends a FileResult, an identical outcome only bumps a
+// stats counter (never stored, same memory-bound convention as ResultSet).
+// Cancelled work produces no outcome at all. See the .cpp for the offline,
+// error-root and partial-read rules, which are unchanged by the caller.
+void HashOneCandidateInto(const ContentCandidate& c, bool offlineSource, FileIndex* index,
+                          const std::wstring& sourceRoot, const std::wstring& destRoot,
+                          ConcurrentSink& sink, const std::atomic_bool* cancel,
+                          hashing::HashCache* cache, std::atomic<size_t>& cacheHits,
+                          profiling::HashSession* session,
+                          profiling::JobVerdict* verdict = nullptr,
+                          profiling::DirHashTop* dirHash = nullptr,
+                          ContentVerifyLevel verify = ContentVerifyLevel{});
+
 void SubmitHashCandidates(const std::vector<ContentCandidate>& candidates, ThreadPool& pool,
                           bool offlineSource, FileIndex* index,
                           const std::wstring& sourceRoot, const std::wstring& destRoot,

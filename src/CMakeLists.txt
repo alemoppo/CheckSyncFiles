@@ -11,6 +11,7 @@ add_library(bv_core STATIC
   Comparison/ConcurrentComparer.cpp
   Comparison/FileComparator.cpp
   Comparison/HashPhase.cpp
+  Comparison/SingleVerify.cpp
   Hashing/HashCache.cpp
   Hashing/HashUtil.cpp
   Hashing/PartialRead.cpp

@@ -169,12 +169,21 @@ private:
     bool resultsOffline_ = false;
 
     // Right-click context menu over a result row ("Apri A/B in Esplora
-    // risorse"). Only the items whose side path exists are shown, so the
-    // menu stores resolved target paths, never row indices.
+    // risorse", "Riscansiona"). Only the items whose side path exists are
+    // shown, so the menu stores resolved target paths (or the row's relative
+    // path for a rescan), never row indices.
     struct CtxMenuItem {
         std::string labelUtf8;
-        std::wstring targetPath;
+        std::wstring targetPath; // explorer target; empty for a rescan item
+        bool isRescan = false;
+        std::wstring relPath; // row identity for a rescan item
     };
+    // Forwards one single-file re-verification to the orchestrator with the
+    // settings frozen at click time. Silently ignored when busy/offline.
+    void RequestSingleVerify(const std::wstring& relPath);
+    // Picks up a finished single-verify outcome (if any) and folds it into
+    // uiResults_ (row replace/remove, stats fix, cache rebuild).
+    void PollSingleVerify();
     bool ctxOpen_ = false;
     int ctxX_ = 0, ctxY_ = 0, ctxW_ = 0, ctxH_ = 0;
     std::vector<CtxMenuItem> ctxItems_;

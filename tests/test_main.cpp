@@ -30,6 +30,7 @@
 #include <thread>
 
 #include "Comparison/ScanMode.h"
+#include "Comparison/SingleVerify.h"
 #include "Comparison/ConcurrentComparer.h"
 #include "Comparison/FileComparator.h"
 #include "Comparison/HashPhase.h"
@@ -5793,6 +5794,252 @@ TEST("partial: full-mode json marks the verify section complete", [] {
     const std::string bytes = ReadFileBytes(file);
     CHECK(bytes.find("\"verify\":{\"mode\":\"full\"") != std::string::npos);
     CHECK(bytes.find("\"percent_requested\":100") != std::string::npos);
+});
+
+// ---------------------------------------------------------------------------
+// Single-file re-verification ("Riscansiona")
+// ---------------------------------------------------------------------------
+
+namespace {
+
+bv::SingleVerifyRequest MakeSingleReq(const std::wstring& rel, const std::wstring& src,
+                                      const std::wstring& dst) {
+    bv::SingleVerifyRequest r;
+    r.relativePath = rel;
+    r.sourceRoot = src;
+    r.destRoot = dst;
+    r.mode = bv::ScanMode::Content;
+    r.verify.percent = 100;
+    r.verify.pattern = bv::PartialPattern::Edges;
+    r.cache = nullptr;
+    r.cancel = nullptr;
+    return r;
+}
+
+} // namespace
+
+TEST("singleverify: missing file created identical is recognized", [] {
+    const std::wstring dir = MakeTempDir();
+    const std::wstring src = dir + L"\\src";
+    const std::wstring dst = dir + L"\\dst";
+    fs::create_directories(src);
+    fs::create_directories(dst);
+    CHECK(WriteFileBytes(src + L"\\f.bin", "content-A", 9));
+    // dst lacks f.bin now; user copies it over (identical).
+    CHECK(WriteFileBytes(dst + L"\\f.bin", "content-A", 9));
+    const bv::SingleVerifyOutcome out = bv::VerifySingleFile(MakeSingleReq(L"f.bin", src, dst));
+    CHECK(!out.cancelled);
+    CHECK(out.result.status == bv::Status::Identical);
+    CHECK(out.result.relativePath == L"f.bin");
+});
+
+TEST("singleverify: missing file created different is a mismatch", [] {
+    const std::wstring dir = MakeTempDir();
+    const std::wstring src = dir + L"\\src";
+    const std::wstring dst = dir + L"\\dst";
+    fs::create_directories(src);
+    fs::create_directories(dst);
+    CHECK(WriteFileBytes(src + L"\\f.bin", "content-A", 9));
+    CHECK(WriteFileBytes(dst + L"\\f.bin", "content-B", 9)); // same size, differs
+    const bv::SingleVerifyOutcome out = bv::VerifySingleFile(MakeSingleReq(L"f.bin", src, dst));
+    CHECK(!out.cancelled);
+    CHECK(out.result.status == bv::Status::ContentMismatch);
+});
+
+TEST("singleverify: replaced file verifies identical at 100%", [] {
+    const std::wstring dir = MakeTempDir();
+    const std::wstring src = dir + L"\\src";
+    const std::wstring dst = dir + L"\\dst";
+    fs::create_directories(src);
+    fs::create_directories(dst);
+    CHECK(WriteFileBytes(src + L"\\f.bin", "content-A", 9));
+    CHECK(WriteFileBytes(dst + L"\\f.bin", "content-B", 9));
+    // User replaces the destination copy with an identical one.
+    CHECK(WriteFileBytes(dst + L"\\f.bin", "content-A", 9));
+    const bv::SingleVerifyOutcome out = bv::VerifySingleFile(MakeSingleReq(L"f.bin", src, dst));
+    CHECK(!out.cancelled);
+    CHECK(out.result.status == bv::Status::Identical);
+});
+
+TEST("singleverify: modified file is detected", [] {
+    const std::wstring dir = MakeTempDir();
+    const std::wstring src = dir + L"\\src";
+    const std::wstring dst = dir + L"\\dst";
+    fs::create_directories(src);
+    fs::create_directories(dst);
+    CHECK(WriteFileBytes(src + L"\\f.bin", "content-A", 9));
+    CHECK(WriteFileBytes(dst + L"\\f.bin", "content-A", 9));
+    // User modifies the destination copy (same size, different bytes).
+    CHECK(WriteFileBytes(dst + L"\\f.bin", "content-Z", 9));
+    const bv::SingleVerifyOutcome out = bv::VerifySingleFile(MakeSingleReq(L"f.bin", src, dst));
+    CHECK(!out.cancelled);
+    CHECK(out.result.status == bv::Status::ContentMismatch);
+});
+
+TEST("singleverify: deleted file becomes missing", [] {
+    const std::wstring dir = MakeTempDir();
+    const std::wstring src = dir + L"\\src";
+    const std::wstring dst = dir + L"\\dst";
+    fs::create_directories(src);
+    fs::create_directories(dst);
+    CHECK(WriteFileBytes(src + L"\\f.bin", "content-A", 9));
+    CHECK(WriteFileBytes(dst + L"\\f.bin", "content-A", 9));
+    std::error_code ec;
+    fs::remove(dst + L"\\f.bin", ec);
+    CHECK(!ec);
+    const bv::SingleVerifyOutcome out = bv::VerifySingleFile(MakeSingleReq(L"f.bin", src, dst));
+    CHECK(!out.cancelled);
+    CHECK(out.result.status == bv::Status::Missing);
+});
+
+TEST("singleverify: size mismatch performs no content hash", [] {
+    const std::wstring dir = MakeTempDir();
+    const std::wstring src = dir + L"\\src";
+    const std::wstring dst = dir + L"\\dst";
+    fs::create_directories(src);
+    fs::create_directories(dst);
+    CHECK(WriteFileBytes(src + L"\\f.bin", "content-A", 9));
+    CHECK(WriteFileBytes(dst + L"\\f.bin", "longer-content-B", 16));
+    std::wstring cacheErr;
+    hashing::HashCache cache(MakeTempDir() + L"\\c.bin", cacheErr);
+    bv::SingleVerifyRequest req = MakeSingleReq(L"f.bin", src, dst);
+    req.cache = &cache; // would gain an entry iff anything were hashed
+    const bv::SingleVerifyOutcome out = bv::VerifySingleFile(req);
+    CHECK(!out.cancelled);
+    CHECK(out.result.status == bv::Status::SizeMismatch);
+    CHECK_EQ(cache.size(), 0ull);
+});
+
+TEST("singleverify: percent honored, not the original scan's", [] {
+    // Center-only difference on 4 MiB files: 50% Edges sees nothing
+    // (IdenticalPartial), 100% sees the difference (ContentMismatch).
+    const std::wstring dir = MakeTempDir();
+    std::wstring src, dst;
+    MakeCenterDiffFixture(dir, src, dst);
+    bv::SingleVerifyRequest half = MakeSingleReq(L"f.bin", src, dst);
+    half.verify.percent = 50;
+    half.verify.pattern = bv::PartialPattern::Edges;
+    const bv::SingleVerifyOutcome oHalf = bv::VerifySingleFile(half);
+    CHECK(!oHalf.cancelled);
+    CHECK(oHalf.result.status == bv::Status::IdenticalPartial);
+    const bv::SingleVerifyOutcome oFull = bv::VerifySingleFile(MakeSingleReq(L"f.bin", src, dst));
+    CHECK(!oFull.cancelled);
+    CHECK(oFull.result.status == bv::Status::ContentMismatch);
+});
+
+TEST("singleverify: pattern honored, center catches what edges miss", [] {
+    const std::wstring dir = MakeTempDir();
+    std::wstring src, dst;
+    MakeCenterDiffFixture(dir, src, dst);
+    bv::SingleVerifyRequest req = MakeSingleReq(L"f.bin", src, dst);
+    req.verify.percent = 50;
+    req.verify.pattern = bv::PartialPattern::Center;
+    const bv::SingleVerifyOutcome out = bv::VerifySingleFile(req);
+    CHECK(!out.cancelled);
+    CHECK(out.result.status == bv::Status::ContentMismatchPartial);
+    CHECK_EQ(out.result.verifiedPercent, 50);
+    CHECK(out.result.verifiedPattern == bv::PartialPattern::Center);
+});
+
+TEST("singleverify: random resolves independently, never literally", [] {
+    for (int i = 0; i < 20; ++i) {
+        const bv::PartialPattern p = bv::ResolveRandomOnce();
+        CHECK(p == bv::PartialPattern::Edges || p == bv::PartialPattern::Center);
+    }
+    // End to end through the orchestrator worker: a Random rescan of two
+    // different files resolves to one concrete pattern (never Random).
+    const std::wstring dir = MakeTempDir();
+    const std::wstring src = dir + L"\\src";
+    const std::wstring dst = dir + L"\\dst";
+    fs::create_directories(src);
+    fs::create_directories(dst);
+    const size_t n = 3 * 1024 * 1024; // above the 2 MiB full-read threshold
+    CHECK(WriteFileBytes(src + L"\\f.bin", std::string(n, 'A').c_str(), n));
+    CHECK(WriteFileBytes(dst + L"\\f.bin", std::string(n, 'B').c_str(), n));
+    bv::ScanOrchestrator orch;
+    bv::ScanOrchestrator::SingleVerifyParams p;
+    p.relativePath = L"f.bin";
+    p.sourceRoot = src;
+    p.destRoot = dst;
+    p.percent = 50;
+    p.pattern = bv::PartialPattern::Random;
+    CHECK(orch.requestSingleVerify(p));
+    bv::SingleVerifyOutcome out;
+    bool got = false;
+    for (int i = 0; i < 400 && !got; ++i) {
+        if (orch.takeSingleVerifyResult(out)) got = true;
+        else std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    CHECK(got);
+    CHECK(!out.cancelled);
+    CHECK(out.result.status == bv::Status::ContentMismatchPartial);
+    CHECK(out.result.verifiedPattern == bv::PartialPattern::Edges ||
+          out.result.verifiedPattern == bv::PartialPattern::Center);
+    CHECK_EQ(out.result.verifiedPercent, 50);
+    {
+        const auto st = orch.snapshot();
+        CHECK(!st.verifyRunning);
+    }
+    orch.shutdown();
+});
+
+TEST("singleverify: both sides gone is a readable error, not a crash", [] {
+    const std::wstring dir = MakeTempDir();
+    const std::wstring src = dir + L"\\src";
+    const std::wstring dst = dir + L"\\dst";
+    fs::create_directories(src);
+    fs::create_directories(dst);
+    const bv::SingleVerifyOutcome out = bv::VerifySingleFile(MakeSingleReq(L"f.bin", src, dst));
+    CHECK(!out.cancelled);
+    CHECK(out.result.status == bv::Status::ReadError);
+});
+
+TEST("singleverify: apply replaces rows, removes identicals, fixes stats", [] {
+    bv::ResultSet set;
+    bv::FileResult oldRow;
+    oldRow.status = bv::Status::Missing;
+    oldRow.relativePath = L"f.bin";
+    oldRow.fullPath = L"C:\\src\\f.bin";
+    oldRow.sizeSource = 9;
+    set.problems.push_back(oldRow);
+    set.stats.missingFiles = 1;
+
+    // Missing -> ContentMismatch: row replaced, counters moved.
+    bv::FileResult fresh;
+    fresh.status = bv::Status::ContentMismatch;
+    fresh.relativePath = L"f.bin";
+    fresh.fullPath = L"C:\\src\\f.bin";
+    CHECK(bv::ApplySingleResult(set, fresh));
+    CHECK_EQ(set.problems.size(), 1ull);
+    CHECK(set.problems[0].status == bv::Status::ContentMismatch);
+    CHECK_EQ(set.stats.missingFiles, 0ull);
+    CHECK_EQ(set.stats.contentMismatch, 1ull);
+
+    // ContentMismatch -> Identical: row removed, identical counted.
+    bv::FileResult done;
+    done.status = bv::Status::Identical;
+    done.relativePath = L"f.bin";
+    CHECK(bv::ApplySingleResult(set, done));
+    CHECK(set.problems.empty());
+    CHECK_EQ(set.stats.contentMismatch, 0ull);
+    CHECK_EQ(set.stats.identicalFiles, 1ull);
+
+    // Stale outcome (row already gone): ignored, stats untouched.
+    CHECK(!bv::ApplySingleResult(set, done));
+    CHECK_EQ(set.stats.identicalFiles, 1ull);
+
+    // Saturating counters: a present-but-uncounted row must not wrap.
+    bv::FileResult orphan;
+    orphan.status = bv::Status::Extra;
+    orphan.relativePath = L"g.bin";
+    set.problems.push_back(orphan);
+    CHECK_EQ(set.stats.extraFiles, 0ull);
+    bv::FileResult fixed;
+    fixed.status = bv::Status::SizeMismatch;
+    fixed.relativePath = L"g.bin";
+    CHECK(bv::ApplySingleResult(set, fixed));
+    CHECK_EQ(set.stats.extraFiles, 0ull);
+    CHECK_EQ(set.stats.sizeMismatch, 1ull);
 });
 
 // ---------------------------------------------------------------------------

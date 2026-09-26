@@ -381,6 +381,9 @@ errori → lato fallito se uno solo, altrimenti destinazione come fallback).
 Con click destro su una riga si apre un menu con "Apri A in Esplora risorse" e/o
 "Apri B in Esplora risorse" (A = sorgente, B = destinazione; compare solo la voce
 il cui percorso esiste), che apre la cartella del file selezionandolo in Explorer.
+La voce "Riscansiona" (solo righe file di scansioni live) riverifica quel singolo
+file con le impostazioni correnti della GUI (percentuale/pattern attuali, non quelli
+della scansione originale) e ne aggiorna la riga, senza rieseguire la scansione.
 Nel confronto offline la sorgente non esiste: le righe lato sorgente mostrano i percorsi
 registrati nello snapshot. Il pulsante SNAPSHOT cattura
 l'indice della sola sorgente in un file binario; ESPORTA CSV salva le voci non identiche

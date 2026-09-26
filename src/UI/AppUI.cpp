@@ -1152,6 +1152,22 @@ void AppUI::OnRightClick(int mx, int my) {
         return;
     }
 
+    // "Riscansiona": single-file re-verification. File rows of live results
+    // only: directories are excluded for now, offline results have no live A
+    // side to verify against, and nothing is offered while a scan or another
+    // single verification is already running.
+    if (!p.isDirectory && !resultsOffline_) {
+        const bv::ScanOrchestrator::UiSnapshot vs = orch_.snapshot();
+        if (!vs.running && !vs.verifyRunning && !resultsSourceRoot_.empty() &&
+            !resultsDestRoot_.empty()) {
+            CtxMenuItem item;
+            item.labelUtf8 = "Riscansiona";
+            item.isRescan = true;
+            item.relPath = p.relativePath;
+            ctxItems_.push_back(std::move(item));
+        }
+    }
+
     // One item per side whose path exists right now; a missing side simply
     // contributes no item (e.g. Missing shows only A, Extra only B). The A
     // side is never offered for offline/snapshot results (see resultsOffline_).
@@ -1201,15 +1217,56 @@ void AppUI::OnContextMenuClick(int mx, int my) {
             break;
         }
     }
+    const bool rescan =
+        hitIdx < ctxItems_.size() && ctxItems_[hitIdx].isRescan;
     std::wstring target;
-    if (hitIdx < ctxItems_.size()) target = ctxItems_[hitIdx].targetPath;
+    std::wstring rel;
+    if (hitIdx < ctxItems_.size()) {
+        target = ctxItems_[hitIdx].targetPath;
+        rel = ctxItems_[hitIdx].relPath;
+    }
     CloseContextMenu();
-    if (!target.empty()) {
+    if (rescan) {
+        // Drain any previous outcome first so two rapid rescans cannot leave
+        // a stale result behind, then forward with settings frozen now.
+        PollSingleVerify();
+        RequestSingleVerify(rel);
+    } else if (!target.empty()) {
         // Re-check: the file may have vanished between menu and click.
         std::error_code ec;
         if (std::filesystem::exists(target, ec) && !ec) OpenInExplorer(target);
     }
     dirty_ = true;
+}
+
+void AppUI::RequestSingleVerify(const std::wstring& rel) {
+    if (rel.empty() || resultsOffline_) return;
+    bv::ScanOrchestrator::UiSnapshot st = orch_.snapshot();
+    if (st.running || st.verifyRunning) return;
+    bv::ScanOrchestrator::SingleVerifyParams params;
+    params.relativePath = rel;
+    params.sourceRoot = resultsSourceRoot_; // frozen with the displayed rows
+    params.destRoot = resultsDestRoot_;
+    params.percent = st.verifyPercent; // current GUI settings, not the run's
+    params.pattern = st.verifyPattern;
+    orch_.requestSingleVerify(params); // false = lost a race, ignore
+    dirty_.store(true);
+}
+
+void AppUI::PollSingleVerify() {
+    bv::SingleVerifyOutcome out;
+    if (!orch_.takeSingleVerifyResult(out)) return;
+    if (out.cancelled) {
+        dirty_.store(true);
+        return;
+    }
+    // Full new result (or Identical removal): fix the row, the counters and
+    // the filtered view. Scroll clamping happens every frame in the list
+    // draw; a vanished current filter entry simply disappears from view.
+    if (bv::ApplySingleResult(uiResults_, out.result)) {
+        rebuildFilteredCache();
+    }
+    dirty_.store(true);
 }
 
 void AppUI::DrawContextMenu() {
@@ -1504,6 +1561,9 @@ void AppUI::render(const bv::ScanOrchestrator::UiSnapshot& st) {
     SDL_RenderClear(renderer_);
 
     syncResultsCache(st);
+    // Fold in a finished single-file re-verification, if any. Same frame,
+    // same main thread: no race with the list draw below.
+    PollSingleVerify();
 
     const Layout L = ComputeLayout(winW_, winH_);
 
@@ -1736,7 +1796,13 @@ void AppUI::render(const bv::ScanOrchestrator::UiSnapshot& st) {
 
     // ---- Status ----
     std::wstring status = L"Pronto. Specificare sorgente e destinazione.";
-    if (running) {
+    // A single-file re-verification never runs together with a full scan
+    // (both entry points refuse it), so the two states are exclusive here.
+    if (st.verifyRunning) {
+        std::wstring shortP = st.verifyPath;
+        if (shortP.size() > 60) shortP = L"..." + shortP.substr(shortP.size() - 57);
+        status = L"Riscansione di " + shortP + L" in corso...";
+    } else if (running) {
         switch (progress.phase) {
             case ScanPhase::EnumerateSource:
                 status = L"Enumerazione sorgente...  (file: " + std::to_wstring(progress.files) +
