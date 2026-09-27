@@ -388,6 +388,25 @@ bool GetStats(const Value* v, Stats& out, std::string& detail) {
     return true;
 }
 
+// Required header fields: missing or wrong-typed is corruption (never a
+// default). Every unchecked Value::find() dereference used to be a null crash
+// on hand-written or truncated-but-valid JSON; all reads go through here.
+bool GetNonNegInt(const Value* obj, const char* key, int64_t& out) {
+    if (!obj || obj->type != Value::Type::Object) return false;
+    const Value* v = obj->find(key);
+    if (!v || v->type != Value::Type::Int || v->integer < 0) return false;
+    out = v->integer;
+    return true;
+}
+
+bool GetBool(const Value* obj, const char* key, bool& out) {
+    if (!obj || obj->type != Value::Type::Object) return false;
+    const Value* v = obj->find(key);
+    if (!v || v->type != Value::Type::Bool) return false;
+    out = v->boolean;
+    return true;
+}
+
 std::string BuildContext(const ScanSession& s, const std::string& journalName,
                          uint64_t journalRecords, uint64_t journalBytes, uint32_t journalCrc) {
     Value root = Value::MakeObject();
@@ -496,7 +515,13 @@ bool ParseContext(const std::string& text, ScanSession& out, SessionError& error
     ScanSession s;
     s.schemaVersion = (uint32_t)schema->integer;
     s.sessionId = root.find("sessionId") ? root.find("sessionId")->asString() : "";
-    s.createdAtUnix = (uint64_t)root.find("createdAt")->asInt();
+    int64_t createdAt = 0;
+    if (!GetNonNegInt(&root, "createdAt", createdAt)) {
+        error = SessionError::CorruptHeader;
+        detail = "missing/invalid createdAt";
+        return false;
+    }
+    s.createdAtUnix = (uint64_t)createdAt;
     if (s.sessionId.empty()) {
         error = SessionError::CorruptHeader;
         detail = "missing sessionId";
@@ -515,7 +540,11 @@ bool ParseContext(const std::string& text, ScanSession& out, SessionError& error
         detail = "bad settings.mode";
         return false;
     }
-    s.settings.caseSensitive = set->find("caseSensitive")->asBool();
+    if (!GetBool(set, "caseSensitive", s.settings.caseSensitive)) {
+        error = SessionError::CorruptHeader;
+        detail = "missing/invalid settings.caseSensitive";
+        return false;
+    }
     s.settings.backend = set->find("backend") ? set->find("backend")->asString() : "";
     if (s.settings.backend.empty()) {
         error = SessionError::CorruptHeader;
@@ -530,10 +559,18 @@ bool ParseContext(const std::string& text, ScanSession& out, SessionError& error
         detail = "bad settings.verify";
         return false;
     }
-    s.settings.verify.percentRequested = (int)ver->find("requested")->asInt();
-    s.settings.verify.percentEffective = (int)ver->find("effective")->asInt();
-    s.settings.verify.patternRandom = ver->find("random")->asBool();
-    s.settings.hashThreads = (unsigned)(set->find("hashThreads")->asInt());
+    int64_t requested = 0, effective = 0, threads = 0;
+    if (!GetNonNegInt(ver, "requested", requested) ||
+        !GetNonNegInt(ver, "effective", effective) ||
+        !GetBool(ver, "random", s.settings.verify.patternRandom) ||
+        !GetNonNegInt(set, "hashThreads", threads)) {
+        error = SessionError::CorruptHeader;
+        detail = "missing/invalid settings.verify";
+        return false;
+    }
+    s.settings.verify.percentRequested = (int)requested;
+    s.settings.verify.percentEffective = (int)effective;
+    s.settings.hashThreads = (unsigned)threads;
     const std::string stName = root.find("state") ? root.find("state")->asString() : "";
     if (stName == "in_progress") s.state = SessionState::InProgress;
     else if (stName == "checkpointed") s.state = SessionState::Checkpointed;
@@ -559,8 +596,14 @@ bool ParseContext(const std::string& text, ScanSession& out, SessionError& error
         detail = "missing checkpoint";
         return false;
     }
-    s.checkpoint.seq = (uint64_t)cp->find("seq")->asInt();
-    s.checkpoint.atUnix = (uint64_t)cp->find("at")->asInt();
+    int64_t seq = 0, at = 0;
+    if (!GetNonNegInt(cp, "seq", seq) || !GetNonNegInt(cp, "at", at)) {
+        error = SessionError::CorruptHeader;
+        detail = "missing/invalid checkpoint";
+        return false;
+    }
+    s.checkpoint.seq = (uint64_t)seq;
+    s.checkpoint.atUnix = (uint64_t)at;
     const Value* j = root.find("journal");
     if (!j || j->type != Value::Type::Object) {
         error = SessionError::CorruptHeader;

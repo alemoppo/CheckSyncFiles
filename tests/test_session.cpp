@@ -22,6 +22,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
+#include "Session/SessionJson.h"
 #include "Session/SessionLogic.h"
 #include "Session/SessionStore.h"
 #include "TestHarness.h"
@@ -402,6 +403,87 @@ TEST("session: missing journal with zero records loads cleanly", [] {
 
 TEST("session: session ids are unique", [] {
     CHECK(GenerateSessionId() != GenerateSessionId());
+});
+
+namespace {
+// Mutable DOM navigation for header-surgery tests (missing/wrong-typed fields).
+json::Value* FindMutable(json::Value& root, const char* key) {
+    if (root.type != json::Value::Type::Object || !root.obj) return nullptr;
+    auto it = root.obj->find(key);
+    return it == root.obj->end() ? nullptr : &it->second;
+}
+} // namespace
+
+TEST("session: valid JSON with a missing required field is corrupt, not a crash", [] {
+    TempDir tmp;
+    const std::wstring base = tmp.path + L"\\sess";
+    ScanSession src = MakeRichSession();
+    std::wstring err;
+    CHECK(SaveSession(base, src, err));
+    const std::string ctx = ReadRawBytes(ContextPath(base));
+    CHECK(!ctx.empty());
+    // Sanity: a parse+write round-trip without changes still loads.
+    {
+        json::Value v;
+        std::string perr;
+        CHECK(json::Parse(ctx, v, perr));
+        CHECK(WriteRawBytes(ContextPath(base), json::Write(v).data(),
+                            json::Write(v).size()));
+        RemoveOne(PrevPath(base)); // no fallback masking below
+        ScanSession reloaded;
+        CHECK(LoadSession(base, reloaded).ok);
+        CHECK(SaveSession(base, src, err)); // restore the valid header
+    }
+    // Each required field dropped individually must fail as CorruptHeader
+    // (previously: null-pointer dereference on several of these).
+    const std::vector<std::vector<std::string>> dropPaths = {
+        {"createdAt"},
+        {"settings", "caseSensitive"},
+        {"settings", "verify", "requested"},
+        {"settings", "verify", "effective"},
+        {"settings", "verify", "random"},
+        {"settings", "hashThreads"},
+        {"checkpoint", "seq"},
+        {"checkpoint", "at"},
+    };
+    for (const auto& path : dropPaths) {
+        json::Value v;
+        std::string perr;
+        CHECK(json::Parse(ctx, v, perr));
+        json::Value* parent = &v;
+        for (size_t i = 0; i + 1 < path.size(); ++i) {
+            parent = FindMutable(*parent, path[i].c_str());
+            CHECK(parent != nullptr);
+        }
+        CHECK(parent->obj->erase(path.back()) == 1u);
+        const std::string slim = json::Write(v);
+        CHECK(WriteRawBytes(ContextPath(base), slim.data(), slim.size()));
+        RemoveOne(PrevPath(base)); // the .prev backup is still good: drop it
+        ScanSession loaded;
+        LoadOutcome o = LoadSession(base, loaded);
+        CHECK(!o.ok);
+        CHECK(o.error == SessionError::CorruptHeader);
+    }
+    // Wrong-typed values are corruption too, not silent defaults.
+    {
+        json::Value v;
+        std::string perr;
+        CHECK(json::Parse(ctx, v, perr));
+        *FindMutable(v, "createdAt") = json::Value::String("yesterday");
+        json::Value* cp = FindMutable(v, "checkpoint");
+        CHECK(cp != nullptr);
+        *FindMutable(*cp, "seq") = json::Value::Int(-5);
+        json::Value* set = FindMutable(v, "settings");
+        CHECK(set != nullptr);
+        *FindMutable(*set, "caseSensitive") = json::Value::Int(1);
+        const std::string bad = json::Write(v);
+        CHECK(WriteRawBytes(ContextPath(base), bad.data(), bad.size()));
+        RemoveOne(PrevPath(base));
+        ScanSession loaded;
+        LoadOutcome o = LoadSession(base, loaded);
+        CHECK(!o.ok);
+        CHECK(o.error == SessionError::CorruptHeader);
+    }
 });
 
 TEST("session: checkpoint trigger predicate", [] {
