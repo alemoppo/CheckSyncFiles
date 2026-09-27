@@ -5,11 +5,25 @@
 namespace bv {
 
 bool ClassifyMatched(const FileEntry& src, const FileEntry& dst, ScanMode mode,
-                      ConcurrentSink& sink, std::vector<ContentCandidate>& candidates,
-                      const std::wstring& destRoot) {
+                     ConcurrentSink& sink, std::vector<ContentCandidate>& candidates,
+                     const std::wstring& destRoot, IRowSink* rowSink) {
     auto& stats = sink.stats();
     const auto inc = [&stats](std::atomic<uint64_t>& c) {
         c.fetch_add(1, std::memory_order_relaxed);
+    };
+    // Finalized-row observer (session capture). Content candidates are NOT
+    // final: they are observed by the hash phase once digests exist.
+    const auto emit = [&](Status verdict, bool isDir) {
+        if (!rowSink) return;
+        ClassifiedRow row;
+        row.relativePath = dst.relativePath;
+        row.hasA = true;
+        row.hasB = true;
+        row.entryA = src;
+        row.entryB = dst;
+        row.verdict = verdict;
+        row.isDirectory = isDir;
+        rowSink->onRow(std::move(row));
     };
 
     const bool srcDir = src.isDirectory;
@@ -17,6 +31,7 @@ bool ClassifyMatched(const FileEntry& src, const FileEntry& dst, ScanMode mode,
 
     if (srcDir && dstDir) {
         inc(stats.identicalDirs);
+        emit(Status::Identical, true);
         return false;
     }
     if (srcDir != dstDir) {
@@ -31,6 +46,7 @@ bool ClassifyMatched(const FileEntry& src, const FileEntry& dst, ScanMode mode,
         r.sizeDest = dst.size;
         r.isDirectory = false;
         sink.addProblem(std::move(r));
+        emit(Status::SizeMismatch, false);
         return false;
     }
 
@@ -44,15 +60,18 @@ bool ClassifyMatched(const FileEntry& src, const FileEntry& dst, ScanMode mode,
         r.sizeDest = d.size;
         r.isDirectory = false;
         sink.addProblem(std::move(r));
+        emit(Status::SizeMismatch, false);
     };
 
     switch (mode) {
         case ScanMode::Presence:
             inc(stats.identicalFiles);
+            emit(Status::Identical, false);
             break;
         case ScanMode::Size:
             if (src.size == dst.size) {
                 inc(stats.identicalFiles);
+                emit(Status::Identical, false);
             } else {
                 recordSizeMismatch(src, dst);
             }

@@ -27,7 +27,7 @@ void HashOneCandidateInto(const ContentCandidate& c, bool offlineSource, FileInd
                           profiling::HashSession* session,
                           profiling::JobVerdict* verdict,
                           profiling::DirHashTop* dirHash,
-                          ContentVerifyLevel verify) {
+                          ContentVerifyLevel verify, IRowSink* rowSink) {
     // The read plan is computed ONCE per file from the source size (candidates
     // only exist when both sides share it: ClassifyMatched guarantees
     // sizeSource == sizeDest, otherwise this is SizeMismatch upstream) and the
@@ -57,6 +57,39 @@ void HashOneCandidateInto(const ContentCandidate& c, bool offlineSource, FileInd
         if (!srcOk && dstOk) return sourceRoot;
         return destRoot;
     };
+    // Candidate fingerprints as entries (candidates are always files; only
+    // size+mtime travel with them, attributes/fileId are unknown here).
+    const auto candidateEntries = [&]() -> std::pair<FileEntry, FileEntry> {
+        FileEntry a;
+        a.relativePath = c.relativePath;
+        a.size = c.sizeSource;
+        a.lastWriteTime = c.srcMtime;
+        FileEntry b;
+        b.relativePath = c.relativePath;
+        b.size = c.sizeDest;
+        b.lastWriteTime = c.dstMtime;
+        return {a, b};
+    };
+    const auto emit = [&](Status verdict, const FileEntry& a, const FileEntry& b, bool hasSrc,
+                          bool hasDst, const hashing::Digest& sd, const hashing::Digest& dd,
+                          int pct, PartialPattern pat) {
+        if (!rowSink) return;
+        ClassifiedRow row;
+        row.relativePath = c.relativePath;
+        row.hasA = true;
+        row.hasB = true;
+        row.entryA = a;
+        row.entryB = b;
+        row.verdict = verdict;
+        row.hasHashA = hasSrc;
+        row.hasHashB = hasDst;
+        row.hashA = sd;
+        row.hashB = dd;
+        row.verifiedPercent = pct;
+        row.verifiedPattern = pat;
+        row.isDirectory = false;
+        rowSink->onRow(std::move(row));
+    };
     const auto reportReadError = [&](bool denied, bool hasSrc, bool hasDst,
                                      const hashing::Digest& sd, const hashing::Digest& dd,
                                      const std::wstring& root) {
@@ -79,6 +112,9 @@ void HashOneCandidateInto(const ContentCandidate& c, bool offlineSource, FileInd
         r.errorMessage = denied ? L"accesso negato durante il calcolo dell'impronta"
                                 : L"errore di lettura durante il calcolo dell'impronta";
         sink.addProblem(std::move(r));
+        const auto entries = candidateEntries();
+        emit(r.status, entries.first, entries.second, hasSrc, hasDst, sd, dd, 100,
+             PartialPattern::Edges);
     };
 
     if (cancel && cancel->load(std::memory_order_relaxed)) {
@@ -147,18 +183,26 @@ void HashOneCandidateInto(const ContentCandidate& c, bool offlineSource, FileInd
         r.isDirectory = false;
         r.errorMessage = L"file modificato durante la scansione (riverificare)";
         sink.addProblem(std::move(r));
+        const auto entries = candidateEntries();
+        emit(Status::ChangedDuringScan, entries.first, entries.second, false, false,
+             hashing::Digest{}, hashing::Digest{}, 100, PartialPattern::Edges);
         return;
     }
 
     if (srcStatus == hashing::HashStatus::Ok && dstStatus == hashing::HashStatus::Ok) {
         if (srcDigest == dstDigest) {
             if (verdict) *verdict = profiling::JobVerdict::Identical;
+            const auto entries = candidateEntries();
             if (plan.isFullRead) {
                 inc(stats.identicalFiles);
+                emit(Status::Identical, entries.first, entries.second, true, true, srcDigest,
+                     dstDigest, 100, PartialPattern::Edges);
             } else {
                 // Verdict IdenticalPartial (section-0 decision): counted in
                 // stats, never stored in problems (memory bound).
                 inc(stats.identicalPartialFiles);
+                emit(Status::IdenticalPartial, entries.first, entries.second, true, true,
+                     srcDigest, dstDigest, eff.percent, eff.pattern);
             }
         } else {
             if (verdict) *verdict = profiling::JobVerdict::ContentMismatch;
@@ -187,6 +231,9 @@ void HashOneCandidateInto(const ContentCandidate& c, bool offlineSource, FileInd
             r.hashSource = srcDigest;
             r.hashDest = dstDigest;
             sink.addProblem(std::move(r));
+            const auto entries = candidateEntries();
+            emit(r.status, entries.first, entries.second, true, true, srcDigest, dstDigest,
+                 r.verifiedPercent, r.verifiedPattern);
         }
         return;
     }
@@ -207,7 +254,7 @@ void SubmitHashCandidates(const std::vector<ContentCandidate>& candidates, Threa
                           hashing::HashCache* cache, std::atomic<size_t>& cacheHits,
                           std::atomic<uint64_t>* hashDone, profiling::HashProfiler* prof,
                           profiling::Side side, profiling::DirHashTop* dirHash,
-                          ContentVerifyLevel verify) {
+                          ContentVerifyLevel verify, IRowSink* rowSink) {
     // Per-job profiling is armed exactly when the profiler is enabled. The
     // enqueue timestamp is captured at the call site for each candidate (the
     // moment this producer hands the task to the pool); the executing worker
@@ -221,7 +268,7 @@ void SubmitHashCandidates(const std::vector<ContentCandidate>& candidates, Threa
         // destroyed as soon as this call returns, and a task can never confuse
         // one candidate with a neighbouring element.
         pool.submit([c, offlineSource, index, &sourceRoot, &destRoot, &sink, cancel, cache,
-                     &cacheHits, hashDone, prof, profOn, side, enq, dirHash, verify] {
+                     &cacheHits, hashDone, prof, profOn, side, enq, dirHash, verify, rowSink] {
             // HashSession owns the profiler task slot: it bumps/decrements the
             // active-job counters and issues this task's unique job id, and it
             // is destroyed on every exit path (including a thrown exception).
@@ -242,7 +289,8 @@ void SubmitHashCandidates(const std::vector<ContentCandidate>& candidates, Threa
             // the throw as a task error for the caller.
             try {
                 HashOneCandidateInto(c, offlineSource, index, sourceRoot, destRoot, sink, cancel,
-                                     cache, cacheHits, &session, &verdict, dirHash, verify);
+                                     cache, cacheHits, &session, &verdict, dirHash, verify,
+                                     rowSink);
                 if (profOn) {
                     session.verdict = verdict;
                     session.endTick = profiling::QpcNow(); // job execution finish

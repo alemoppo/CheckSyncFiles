@@ -373,8 +373,9 @@ bv_cli --source <path> --dest <path> [--mode presence|size|content]
        [--case-sensitive] [--enum auto|win32|mft] [--threads N] [--progress]
        [--list-problems [--limit N]] [--profile-hash] [--profile-hash-jobs N]
        [--verify-percent <1-100>] [--verify-pattern edges|center|random]
-       [--snapshot-out <file>] [--compare <snapshot>] [--hash-cache <file>]
-       [--export <file>] [--export-format csv|json] [--help]
+        [--snapshot-out <file>] [--compare <snapshot>] [--hash-cache <file>]
+        [--session-out <base>] [--resume <base>]
+        [--export <file>] [--export-format csv|json] [--help]
 ```
 
 Examples:
@@ -389,6 +390,10 @@ bv_cli --source D:\Backup --mode content --snapshot-out D:\snap\backup.bin
 
 # offline verification against snapshot (first device not needed)
 bv_cli --compare D:\snap\backup.bin --dest E:\Backup --mode content
+
+# resumable session: save every finalized row, then skip unchanged files
+bv_cli --source D:\Backup --dest E:\Backup --mode content --session-out D:\sess\run1
+bv_cli --source D:\Backup --dest E:\Backup --mode content --resume D:\sess\run1
 ```
 
 ## Test tree generator

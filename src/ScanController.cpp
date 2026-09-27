@@ -1,11 +1,14 @@
 #include "ScanController.h"
 
+#include <algorithm>
 #include <chrono>
 #include <functional>
 #include <memory>
 #include <random>
+#include <unordered_set>
 
 #include "Comparison/ConcurrentComparer.h"
+#include "Comparison/ResumeEnumerators.h"
 #include "Export/CsvExporter.h"
 #include "Export/JsonExporter.h"
 #include "Filesystem/FileIndex.h"
@@ -15,6 +18,9 @@
 #include "Filesystem/Win32Enumerator.h"
 #include "Hashing/HashCache.h"
 #include "Hashing/Sha256.h"
+#include "Session/ResumePlan.h"
+#include "Session/SessionLogic.h"
+#include "Session/SessionStore.h"
 #include "Threading/IoClass.h"
 #include "Threading/ThreadPool.h"
 
@@ -37,6 +43,87 @@ struct HashSlot {
     std::array<uint8_t, 32> digest{};
     bool skipped = false;
 };
+
+// Configuration error report (mirrors the mutual-exclusion return in run()).
+ScanReport ConfigError(ScanMode mode, const std::wstring& message) {
+    ScanReport r;
+    r.backendUsed = EnumeratorBackend::Win32;
+    r.modeUsed = mode;
+    r.sourceOk = false;
+    FileResult fr;
+    fr.status = Status::ReadError;
+    fr.isDirectory = true;
+    fr.errorMessage = message;
+    r.results.problems.push_back(std::move(fr));
+    ++r.results.stats.readErrors;
+    return r;
+}
+
+// Deterministic problem order for merged result sets (mirrors
+// ConcurrentComparer::sortProblems, which is private to the comparer).
+void SortResultProblems(ResultSet& out, bool caseSensitive) {
+    if (out.problems.size() < 2) return;
+    std::vector<std::pair<std::wstring, FileResult>> items;
+    items.reserve(out.problems.size());
+    for (FileResult& r : out.problems) {
+        items.emplace_back(caseSensitive ? r.relativePath
+                                         : pathutil::FoldForCompare(r.relativePath),
+                           std::move(r));
+    }
+    std::sort(items.begin(), items.end(),
+              [](const std::pair<std::wstring, FileResult>& a,
+                 const std::pair<std::wstring, FileResult>& b) { return a.first < b.first; });
+    out.problems.clear();
+    out.problems.reserve(items.size());
+    for (auto& it : items) out.problems.push_back(std::move(it.second));
+}
+
+const char* BackendName(EnumeratorBackend b) {
+    switch (b) {
+        case EnumeratorBackend::Auto: return "auto";
+        case EnumeratorBackend::Win32: return "win32";
+        case EnumeratorBackend::Mft: return "mft";
+    }
+    return "auto";
+}
+
+// Full single-side enumeration with MFT -> Win32 fallback (resume path).
+// Unlike the snapshot-capture block above (kept byte-identical for zero
+// regression risk), enumeration errors are NOT converted to result rows here:
+// the remainder pass re-traverses the same directories through the comparer
+// and rediscovers them itself, so converting here would duplicate every error.
+struct SideBuild {
+    FileIndex::BuildResult build;
+    bool ok = false;
+};
+
+SideBuild BuildSideIndex(FileIndex& idx, const std::wstring& root, bool acceptMft,
+                         profiling::DirListSink* dirSink,
+                         const IFileEnumerator::ProgressCallback& progress,
+                         const std::atomic_bool* cancel) {
+    SideBuild out;
+    if (acceptMft) {
+        MftEnumerator mft;
+        Win32Enumerator win32;
+        mft.setDirListSink(dirSink);
+        win32.setDirListSink(dirSink);
+        if (MftEnumerator::IsSupported(root)) {
+            out.build = idx.build(root, mft, progress, cancel);
+            out.ok = out.build.ok;
+            if (!out.ok) out.build = idx.build(root, win32, progress, cancel);
+            out.ok = out.build.ok;
+        } else {
+            out.build = idx.build(root, win32, progress, cancel);
+            out.ok = out.build.ok;
+        }
+    } else {
+        Win32Enumerator win32;
+        win32.setDirListSink(dirSink);
+        out.build = idx.build(root, win32, progress, cancel);
+        out.ok = out.build.ok;
+    }
+    return out;
+}
 
 } // namespace
 
@@ -153,6 +240,8 @@ ScanReport ScanController::run(const ScanOptions& options) {
     const bool haveCompare = !options.compareFrom.empty();
     const bool haveSnapshot = !options.snapshotOut.empty();
     const bool haveDest = !options.destination.empty();
+    const bool haveResume = !options.resumeFrom.empty();
+    const bool haveSessionOut = !options.sessionOut.empty();
 
     if (haveCompare && haveSnapshot) {
         report.sourceOk = false;
@@ -164,6 +253,14 @@ ScanReport ScanController::run(const ScanOptions& options) {
         ++report.results.stats.readErrors;
         return report;
     }
+    // Phase 1 resume is live-live only, and session capture during a resumed
+    // run is a Fase 2 item: both combinations fail fast with a clear message.
+    if (haveResume && haveCompare)
+        return ConfigError(options.mode, L"--resume e --compare sono mutuamente esclusivi");
+    if (haveResume && haveSnapshot)
+        return ConfigError(options.mode, L"--resume e --snapshot-out sono mutuamente esclusivi");
+    if (haveResume && (options.source.empty() || options.destination.empty()))
+        return ConfigError(options.mode, L"--resume richiede --source e --dest");
 
     ScanMode mode = options.mode;
 
@@ -277,6 +374,15 @@ ScanReport ScanController::run(const ScanOptions& options) {
     // --snapshot-out); a pure live-live scan has no source pass at all.
     const bool sourceFromIndex = haveCompare || haveSnapshot;
     FileIndex sourceIndex(caseSensitive_);
+    // Phase 1 resume state: the loaded session, the fresh full destination
+    // index, per-side enumeration error dirs (force stale), rows reused by the
+    // plan (re-saved on --session-out), and the captured-row sink.
+    session::ScanSession resumeSession;
+    FileIndex destIndex(caseSensitive_);
+    std::vector<std::wstring> resumeErrA;
+    std::vector<std::wstring> resumeErrB;
+    std::vector<session::JournalEntry> sessionReusedEntries;
+    BufferedRowSink rowSink;
 
     // ---------------------------------------------------------------------
     // 1. Source side: load it from a snapshot, or capture it for the snapshot
@@ -440,6 +546,81 @@ ScanReport ScanController::run(const ScanOptions& options) {
         }
     }
 
+    if (haveResume) {
+        // Phase 1 resume: load the session, check compatibility, then
+        // enumerate BOTH sides fully. PlanResume (destination pass) splits the
+        // journal into reusable rows and remainder sets from these indexes.
+        // (Exclusive with haveCompare/haveSnapshot by validation above.)
+        const auto resumeFail = [&](const std::wstring& message) {
+            report.sourceOk = false;
+            FileResult r;
+            r.status = Status::ReadError;
+            r.isDirectory = true;
+            r.errorMessage = message;
+            report.results.problems.push_back(std::move(r));
+            ++report.results.stats.readErrors;
+        };
+        session::LoadOutcome loaded = session::LoadSession(options.resumeFrom, resumeSession);
+        if (!loaded.ok) {
+            resumeFail(L"impossibile caricare la sessione: " +
+                       pathutil::FromUtf8(loaded.detail));
+        } else {
+            session::ScanSettings current;
+            current.mode = options.mode;
+            current.caseSensitive = caseSensitive_;
+            current.backend = BackendName(options.backend);
+            current.verify = report.verify;
+            current.hashThreads = options.hashThreads;
+            session::CompatResult compat =
+                session::CheckResumeCompatible(resumeSession.settings, current);
+            if (!compat.compatible) {
+                resumeFail(L"sessione incompatibile con le impostazioni attuali: " +
+                           pathutil::FromUtf8(compat.reason));
+            } else {
+                const IFileEnumerator::ProgressCallback sourceProgress =
+                    [&](uint64_t files, uint64_t dirs, uint64_t bytes,
+                        const std::wstring& path) {
+                        emitProgress(ScanPhase::EnumerateSource, files, dirs, bytes, path);
+                    };
+                const IFileEnumerator::ProgressCallback destProgress =
+                    [&](uint64_t files, uint64_t dirs, uint64_t bytes,
+                        const std::wstring& path) {
+                        emitProgress(ScanPhase::CompareDestination, files, dirs, bytes, path);
+                    };
+                SideBuild buildA = BuildSideIndex(sourceIndex, options.source, acceptMft,
+                                                  &dirTiming.a, sourceProgress, options.cancel);
+                report.sourceOk = buildA.ok;
+                report.results.stats.sourceFiles = buildA.build.stats.files;
+                report.results.stats.sourceDirs = buildA.build.stats.dirs;
+                report.results.stats.bytesSource = buildA.build.stats.bytes;
+                report.secondsEnumerateSource = NowSeconds() - t1;
+                for (const ScanError& err : buildA.build.errors)
+                    resumeErrA.push_back(err.path);
+                if (options.cancel && options.cancel->load()) report.sourceOk = false;
+                // Enumeration errors above are NOT converted to result rows:
+                // the remainder pass re-traverses the same directories and
+                // rediscovers them (converting here would duplicate them).
+                if (report.sourceOk) {
+                    const double t2 = NowSeconds();
+                    SideBuild buildB =
+                        BuildSideIndex(destIndex, options.destination, acceptMft, &dirTiming.b,
+                                       destProgress, options.cancel);
+                    report.destinationOk = buildB.ok;
+                    report.results.stats.destFiles = buildB.build.stats.files;
+                    report.results.stats.destDirs = buildB.build.stats.dirs;
+                    report.results.stats.bytesDest = buildB.build.stats.bytes;
+                    report.secondsDestinationPass = NowSeconds() - t2;
+                    for (const ScanError& err : buildB.build.errors)
+                        resumeErrB.push_back(err.path);
+                    if (options.cancel && options.cancel->load()) {
+                        report.sourceOk = false;
+                        report.destinationOk = false;
+                    }
+                }
+            }
+        }
+    }
+
     // Distinct paths that folded to the same case-insensitive key were resolved
     // last-wins while building the source index; surface it so the caller can
     // warn the user that a name was dropped.
@@ -449,8 +630,147 @@ ScanReport ScanController::run(const ScanOptions& options) {
     // 2. Destination pass: enumerate + compare against the source, CONCURRENTLY.
     //    When the source was pre-built (offline / snapshot capture) it is fed
     //    from the index; otherwise the two drives are enumerated in parallel.
+    //    A resume instead re-verifies only the remainder sets through filtered
+    //    enumerations and merges the reused journal rows afterwards.
     // ---------------------------------------------------------------------
-    if (haveDest && report.sourceOk && !(options.cancel && options.cancel->load())) {
+    if (haveResume && report.sourceOk && !(options.cancel && options.cancel->load())) {
+        session::ResumeInput input;
+        input.session = &resumeSession;
+        input.currentA = &sourceIndex;
+        input.currentB = &destIndex;
+        input.rootA = options.source;
+        input.rootB = options.destination;
+        input.errorDirsA = resumeErrA;
+        input.errorDirsB = resumeErrB;
+        session::ResumePlan plan(caseSensitive_);
+        std::string planDetail;
+        if (!session::PlanResume(input, plan, planDetail)) {
+            report.sourceOk = false;
+            FileResult r;
+            r.status = Status::ReadError;
+            r.isDirectory = true;
+            r.errorMessage = L"ripresa impossibile: " + pathutil::FromUtf8(planDetail);
+            report.results.problems.push_back(std::move(r));
+            ++report.results.stats.readErrors;
+        } else {
+            report.usedSession = true;
+            report.sessionReused = plan.reused;
+            report.sessionStale = plan.stale;
+            sessionReusedEntries = std::move(plan.reusedEntries);
+            if (plan.remainderA.empty() && plan.remainderB.empty()) {
+                // Nothing changed: the journal IS the result.
+                report.results.stats = plan.reusedStats;
+                report.results.problems = std::move(plan.reusedProblems);
+                SortResultProblems(report.results, caseSensitive_);
+                report.destinationOk = true;
+            } else {
+                ThreadPool hashPool(mode == ScanMode::Content ? resolveHashThreads() : 0);
+                if (mode == ScanMode::Content)
+                    report.hashThreadsUsed = hashPool.threadCount();
+                ConcurrentComparer comparer(caseSensitive_, mode, acceptMft, options.source,
+                                            options.destination,
+                                            ConcurrentComparer::SourceKind::Live, nullptr,
+                                            options.cancel, hashProf, &dirTiming, runLevel);
+                if (haveSessionOut) comparer.setRowSink(&rowSink);
+                // Remainder allow-set for the destination filter (folded keys,
+                // same function the comparer matches on).
+                std::unordered_set<std::wstring> allowedB;
+                for (const auto& kv : plan.remainderB.entries()) {
+                    allowedB.insert(caseSensitive_
+                                        ? kv.second.relativePath
+                                        : pathutil::FoldForCompare(kv.second.relativePath));
+                }
+                ConcurrentComparer::EnumeratorFactory srcFactory = [&plan]() {
+                    return std::unique_ptr<IFileEnumerator>(
+                        new IndexEnumerator(&plan.remainderA));
+                };
+                auto destFactoryFor = [&](bool useMft) {
+                    return [&, useMft]() -> std::unique_ptr<IFileEnumerator> {
+                        std::unique_ptr<IFileEnumerator> inner =
+                            useMft ? std::unique_ptr<IFileEnumerator>(new MftEnumerator())
+                                   : std::unique_ptr<IFileEnumerator>(new Win32Enumerator());
+                        return std::unique_ptr<IFileEnumerator>(
+                            new FilteredEnumerator(std::move(inner), allowedB,
+                                                   caseSensitive_));
+                    };
+                };
+                std::vector<ConcurrentComparer::NamedFactory> srcFs;
+                srcFs.push_back({L"indice sessione", std::move(srcFactory)});
+                std::vector<ConcurrentComparer::NamedFactory> dstFs;
+                if (acceptMft) {
+                    dstFs.push_back({L"MFT", destFactoryFor(true)});
+                    dstFs.push_back({L"Win32", destFactoryFor(false)});
+                } else {
+                    dstFs.push_back({L"Win32", destFactoryFor(false)});
+                }
+
+                const IFileEnumerator::ProgressCallback enumProgress =
+                    [&](uint64_t files, uint64_t dirs, uint64_t bytes,
+                        const std::wstring& path) {
+                        emitProgress(ScanPhase::CompareDestination, files, dirs, bytes, path,
+                                     comparer.matchTable());
+                    };
+                double hashStart = 0.0;
+                double compareHashSeconds = 0.0;
+                bool hashing = false;
+                const auto hashProgress = [&](uint64_t done, uint64_t total) {
+                    if (!hashing) {
+                        hashing = true;
+                        hashStart = NowSeconds();
+                        hashThreadsActive.store(hashPool.threadCount(),
+                                                std::memory_order_relaxed);
+                    }
+                    emitProgress(ScanPhase::Hashing, done, total, 0, L"",
+                                 comparer.matchTable());
+                    if (done >= total) {
+                        hashing = false;
+                        hashThreadsActive.store(0, std::memory_order_relaxed);
+                        compareHashSeconds += NowSeconds() - hashStart;
+                    }
+                };
+
+                ConcurrentComparer::Result cr = comparer.runWithNamedFactories(
+                    std::move(srcFs), std::move(dstFs), hashPool, enumProgress, hashProgress,
+                    cache.get());
+                hashThreadsActive.store(0, std::memory_order_relaxed);
+
+                report.sourceOk =
+                    cr.sourceStatus == ConcurrentComparer::WorkerStatus::Success;
+                report.destinationOk =
+                    cr.destinationStatus == ConcurrentComparer::WorkerStatus::Success;
+                report.results = std::move(cr.results);
+                for (FileResult& p : plan.reusedProblems)
+                    report.results.problems.push_back(std::move(p));
+                report.results.stats += plan.reusedStats;
+                SortResultProblems(report.results, caseSensitive_);
+                report.secondsHashing += compareHashSeconds;
+                report.hashCacheHits += comparer.cacheHits();
+                report.hashingErrors += hashPool.taskErrors();
+                for (std::wstring& n : cr.notes) report.notes.push_back(std::move(n));
+                if (hashProf) {
+                    const ThreadPool::ThreadPoolMetrics m = hashPool.metrics();
+                    hashProf->MergePool(m.maxOutstanding, m.maxQueueDepth,
+                                        m.backpressureWaits, m.backpressureWaitTicks,
+                                        m.waitAllCount, m.waitAllTicks, m.busyTicks,
+                                        m.maxActiveWorkers, m.poolWallTicks, m.submittedTasks,
+                                        m.completedTasks);
+                }
+
+                if (cache) {
+                    std::wstring werr;
+                    if (!cache->Save(werr) && !werr.empty()) {
+                        FileResult r;
+                        r.status = Status::ReadError;
+                        r.isDirectory = true;
+                        r.errorMessage = std::move(werr);
+                        report.results.problems.push_back(std::move(r));
+                        ++report.results.stats.readErrors;
+                    }
+                }
+            }
+        }
+    } else if (!haveResume && haveDest && report.sourceOk &&
+               !(options.cancel && options.cancel->load())) {
         ThreadPool hashPool(mode == ScanMode::Content ? resolveHashThreads() : 0);
         if (mode == ScanMode::Content) report.hashThreadsUsed = hashPool.threadCount();
 
@@ -470,6 +790,9 @@ ScanReport ScanController::run(const ScanOptions& options) {
                                                     : ConcurrentComparer::SourceKind::Live,
                                     sourceFromIndex ? &sourceIndex : nullptr, options.cancel,
                                     hashProf, &dirTiming, runLevel);
+        // Session capture: every finalized row (identicals included) is
+        // observed for the journal. Null otherwise (zero overhead).
+        if (haveSessionOut) comparer.setRowSink(&rowSink);
 
         const IFileEnumerator::ProgressCallback enumProgress =
             [&](uint64_t files, uint64_t dirs, uint64_t bytes, const std::wstring& path) {
@@ -525,6 +848,51 @@ ScanReport ScanController::run(const ScanOptions& options) {
                 ++report.results.stats.readErrors;
             }
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // 2.5 Session capture (Phase 1): persist every finalized row of a fully
+    // successful run so a later --resume can skip unchanged files. The journal
+    // is the reused prefix (resume runs) plus the rows captured live; error
+    // rows from enumeration carry no fingerprints and are rediscovered on
+    // resume instead of being journaled.
+    // ---------------------------------------------------------------------
+    if (haveSessionOut && report.sourceOk && report.destinationOk &&
+        !(options.cancel && options.cancel->load())) {
+        session::ScanSession sess;
+        sess.sessionId = session::GenerateSessionId();
+        sess.createdAtUnix = session::NowUnixSeconds();
+        sess.sourceA = options.source;
+        sess.sourceB = options.destination;
+        sess.settings.mode = options.mode;
+        sess.settings.caseSensitive = caseSensitive_;
+        sess.settings.backend = BackendName(options.backend);
+        sess.settings.verify = report.verify;
+        sess.settings.hashThreads = options.hashThreads;
+        sess.state = session::SessionState::Completed;
+        sess.progressA = {report.results.stats.sourceFiles, report.results.stats.sourceDirs,
+                          report.results.stats.bytesSource};
+        sess.progressB = {report.results.stats.destFiles, report.results.stats.destDirs,
+                          report.results.stats.bytesDest};
+        sess.stats = report.results.stats;
+        sess.checkpoint = {0, sess.createdAtUnix};
+        sess.journal = std::move(sessionReusedEntries);
+        for (ClassifiedRow& row : rowSink.take())
+            sess.journal.push_back(session::ToJournalEntry(row));
+        std::wstring serr;
+        report.sessionSaved = session::SaveSession(options.sessionOut, sess, serr);
+        if (report.sessionSaved) {
+            report.sessionPath = options.sessionOut;
+        } else {
+            FileResult r;
+            r.status = Status::ReadError;
+            r.isDirectory = true;
+            r.errorMessage = L"salvataggio sessione fallito: " + serr;
+            report.results.problems.push_back(std::move(r));
+            ++report.results.stats.readErrors;
+        }
+    } else if (haveSessionOut) {
+        report.notes.push_back(L"sessione non salvata: scansione incompleta o interrotta");
     }
 
     // Publish the slowest-directories tops as plain data (the live profilers

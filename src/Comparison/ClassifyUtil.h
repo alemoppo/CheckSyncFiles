@@ -6,6 +6,7 @@
 
 #include "Comparison/ComparisonResult.h"
 #include "Comparison/ConcurrentSink.h"
+#include "Comparison/RowCapture.h"
 #include "Comparison/ScanMode.h"
 #include "Filesystem/FileEntry.h"
 
@@ -30,8 +31,11 @@ struct ContentCandidate {
 // Returns true when a content candidate was appended (and false otherwise), so
 // the caller can count/drain pending hash work.
 // Thread-safe: callable from the enumeration workers, which share `sink`.
+// `rowSink` (optional, null by default) observes every FINALIZED row with the
+// entries it was computed from (identicals included; content pairs are NOT
+// final here -- they are observed later by the hash phase).
 bool ClassifyMatched(const FileEntry& src, const FileEntry& dst, ScanMode mode,
-                      ConcurrentSink& sink, std::vector<ContentCandidate>& candidates,
-                      const std::wstring& destRoot);
+                     ConcurrentSink& sink, std::vector<ContentCandidate>& candidates,
+                     const std::wstring& destRoot, IRowSink* rowSink = nullptr);
 
 } // namespace bv

@@ -59,14 +59,26 @@ ConcurrentComparer::Result ConcurrentComparer::runWithFactories(
     std::vector<EnumeratorFactory> destFactories, ThreadPool& hashPool,
     const ProgressCallback& onProgress, const HashProgressCallback& onHashProgress,
     hashing::HashCache* cache) {
-    std::vector<EnumeratorStep> src;
-    std::vector<EnumeratorStep> dst;
+    std::vector<NamedFactory> src;
+    std::vector<NamedFactory> dst;
     for (size_t i = 0; i < sourceFactories.size(); ++i) {
         src.push_back({L"factory-" + std::to_wstring(i), std::move(sourceFactories[i])});
     }
     for (size_t i = 0; i < destFactories.size(); ++i) {
         dst.push_back({L"factory-" + std::to_wstring(i), std::move(destFactories[i])});
     }
+    return runWithNamedFactories(std::move(src), std::move(dst), hashPool, onProgress,
+                                 onHashProgress, cache);
+}
+
+ConcurrentComparer::Result ConcurrentComparer::runWithNamedFactories(
+    std::vector<NamedFactory> sourceFactories, std::vector<NamedFactory> destFactories,
+    ThreadPool& hashPool, const ProgressCallback& onProgress,
+    const HashProgressCallback& onHashProgress, hashing::HashCache* cache) {
+    std::vector<EnumeratorStep> src;
+    std::vector<EnumeratorStep> dst;
+    for (auto& f : sourceFactories) src.push_back({std::move(f.name), std::move(f.factory)});
+    for (auto& f : destFactories) dst.push_back({std::move(f.name), std::move(f.factory)});
     return runImpl(std::move(src), std::move(dst), hashPool, onProgress, onHashProgress, cache);
 }
 
@@ -207,7 +219,7 @@ void ConcurrentComparer::onEntry(int side, FileEntry e, MatchTable& table, Concu
         dst = std::move(e);
     }
     const bool addedCandidate = ClassifyMatched(src, dst, mode_, sink, candidates,
-                                                  destRoot_);
+                                                  destRoot_, rowSink_);
     if (addedCandidate) {
         totalCandidates_.fetch_add(1, std::memory_order_relaxed);
         // Once a full batch of same-size pairs has accumulated, push it to the
@@ -248,7 +260,7 @@ void ConcurrentComparer::FlushHashCandidates(std::vector<ContentCandidate>& pend
                              offlineSource_ ? fromIndex_ : nullptr, sourceRoot_, destRoot_, sink,
                              cancel_, cache_, cacheHits_, &hashDone_, profile_,
                              static_cast<profiling::Side>(side),
-                             dirTiming_ ? &dirTiming_->hash : nullptr, verify_);
+                             dirTiming_ ? &dirTiming_->hash : nullptr, verify_, rowSink_);
         // The submitted tasks count themselves done as they finish; report
         // completion so far so progress keeps moving while the workers are still
         // enumerating.
@@ -459,6 +471,22 @@ void ConcurrentComparer::finalizeMissingExtra(MatchTable& table, ResultSet& out)
     sourceKeys.reserve(sourceItems.size());
     for (const auto& it : sourceItems) sourceKeys.push_back(it.first);
 
+    const auto emitSingle = [&](Status verdict, const FileEntry& present, bool isDir) {
+        if (!rowSink_) return;
+        ClassifiedRow row;
+        row.relativePath = present.relativePath;
+        row.verdict = verdict;
+        row.isDirectory = isDir;
+        if (verdict == Status::Missing) {
+            row.hasA = true;
+            row.entryA = present;
+        } else {
+            row.hasB = true;
+            row.entryB = present;
+        }
+        rowSink_->onRow(std::move(row));
+    };
+
     // Missing: present only in source.
     for (const auto& it : sourceItems) {
         const FileEntry& e = it.second;
@@ -473,6 +501,7 @@ void ConcurrentComparer::finalizeMissingExtra(MatchTable& table, ResultSet& out)
             r.sizeSource = e.size;
             r.isDirectory = false;
             out.problems.push_back(std::move(r));
+            emitSingle(Status::Missing, e, false);
         }
     }
     // Report only empty missing directories (children are reported separately).
@@ -486,11 +515,18 @@ void ConcurrentComparer::finalizeMissingExtra(MatchTable& table, ResultSet& out)
         r.relativePath = e.relativePath;
         r.isDirectory = true;
         out.problems.push_back(std::move(r));
+        emitSingle(Status::Missing, e, true);
     }
 
-    // Extra: present only in destination.
+    // Extra: present only in destination. Extra directories whose whole subtree
+    // is already reported are suppressed (same rule as before, applied before
+    // pushing so the row observer only ever sees rows that survive).
     std::vector<std::wstring> extraFolded;
     extraFolded.reserve(destItems.size());
+    for (const auto& it : destItems)
+        extraFolded.push_back(pathutil::FoldForCompare(it.second.relativePath));
+    std::sort(extraFolded.begin(), extraFolded.end());
+    extraFolded.erase(std::unique(extraFolded.begin(), extraFolded.end()), extraFolded.end());
     for (const auto& it : destItems) {
         const FileEntry& e = it.second;
         if (e.isDirectory) {
@@ -498,7 +534,9 @@ void ConcurrentComparer::finalizeMissingExtra(MatchTable& table, ResultSet& out)
         } else {
             ++out.stats.extraFiles;
         }
-        extraFolded.push_back(pathutil::FoldForCompare(e.relativePath));
+        if (e.isDirectory &&
+            pathutil::HasDescendant(extraFolded, pathutil::FoldForCompare(e.relativePath)))
+            continue;
         FileResult r;
         r.status = Status::Extra;
         r.fullPath = pathutil::MakeAbsolute(destRoot_, e.relativePath);
@@ -506,21 +544,7 @@ void ConcurrentComparer::finalizeMissingExtra(MatchTable& table, ResultSet& out)
         r.sizeDest = e.size;
         r.isDirectory = e.isDirectory;
         out.problems.push_back(std::move(r));
-    }
-    // Suppress extra directories whose whole subtree is already reported.
-    if (!extraFolded.empty()) {
-        std::sort(extraFolded.begin(), extraFolded.end());
-        extraFolded.erase(std::unique(extraFolded.begin(), extraFolded.end()),
-                          extraFolded.end());
-        std::vector<FileResult> filtered;
-        filtered.reserve(out.problems.size());
-        for (FileResult& r : out.problems) {
-            const bool redundantDir =
-                r.status == Status::Extra && r.isDirectory &&
-                pathutil::HasDescendant(extraFolded, pathutil::FoldForCompare(r.relativePath));
-            if (!redundantDir) filtered.push_back(std::move(r));
-        }
-        out.problems = std::move(filtered);
+        emitSingle(Status::Extra, e, e.isDirectory);
     }
 }
 

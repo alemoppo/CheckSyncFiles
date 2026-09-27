@@ -13,6 +13,7 @@
 #include "Comparison/ConcurrentSink.h"
 #include "Comparison/HashPhase.h"
 #include "Comparison/MatchTable.h"
+#include "Comparison/RowCapture.h"
 #include "Comparison/ScanMode.h"
 #include "Filesystem/FileEnumerator.h"
 #include "Filesystem/FileIndex.h"
@@ -116,6 +117,21 @@ public:
                             const HashProgressCallback& onHashProgress = {},
                             hashing::HashCache* cache = nullptr);
 
+    // Named back-end step for runWithNamedFactories (user-facing fallback notes
+    // use `name`, e.g. "MFT"/"Win32").
+    struct NamedFactory {
+        std::wstring name;
+        EnumeratorFactory factory;
+    };
+    // Same as above, with explicit step names (used by the resume path, which
+    // wraps live back-ends in filters but must keep production-quality notes).
+    Result runWithNamedFactories(std::vector<NamedFactory> sourceFactories,
+                                 std::vector<NamedFactory> destFactories,
+                                 ThreadPool& hashPool,
+                                 const ProgressCallback& onProgress = {},
+                                 const HashProgressCallback& onHashProgress = {},
+                                 hashing::HashCache* cache = nullptr);
+
     size_t cacheHits() const { return cacheHits_.load(std::memory_order_relaxed); }
     // Live table for progress observation (gauges only, never mutated here):
     // set while the workers run, cleared after join. Valid only between those
@@ -124,6 +140,12 @@ public:
     const MatchTable* matchTable() const {
         return activeTable_.load(std::memory_order_acquire);
     }
+
+    // Finalized-row observer for session capture (see RowCapture.h). Null by
+    // default (zero overhead); when set, every finalized row -- matched pairs
+    // (identicals included), hashed outcomes and Missing/Extra rows -- is
+    // reported with the entries it was computed from. Must outlive run().
+    void setRowSink(IRowSink* sink) { rowSink_ = sink; }
 
 private:
     struct WorkerState {
@@ -223,6 +245,7 @@ private:
     // Serializes onHashProgress_ invocations: both workers and the final drain
     // can emit hash progress from different threads.
     std::mutex hashProgressMutex_;
+    IRowSink* rowSink_ = nullptr; // optional finalized-row observer (session capture)
     profiling::HashProfiler* profile_ = nullptr; // optional content-hash profiler
     profiling::RunDirTiming* dirTiming_ = nullptr; // optional slowest-dirs sinks
     ContentVerifyLevel verify_; // resolved run level (default: full Content)

@@ -46,6 +46,8 @@ const wchar_t* kUsage =
     L"  --export-format <csv|json>  formato di esportazione esplicito\n"
     L"  --snapshot-out <file>    salva l'indice della sorgente (con hash in modalita content)\n"
     L"  --compare <snapshot>     confronta --dest contro uno snapshot (niente --source)\n"
+    L"  --session-out <base>     salva una sessione ripristinabile (<base>.bvss + <base>.bvj)\n"
+    L"  --resume <base>          riprende una sessione: riusa le righe invariate, riverifica il resto\n"
     L"  --hash-cache <file>      riusa le impronte SHA-256 non scaricate (percorso+dim+data)\n"
     L"  --profile-hash           raccoglie e stampa le statistiche del profilo hash\n"
     L"  --profile-hash-jobs      come sopra e in piu' una riga per ogni file hashato\n"
@@ -68,6 +70,8 @@ struct Args {
     bv::exporting::ExportFormat exportFormat = bv::exporting::ExportFormat::Auto;
     std::wstring snapshotOut;
     std::wstring compareFrom;
+    std::wstring sessionOut;
+    std::wstring resumeFrom;
     std::wstring hashCacheFile;
     bool profileHash = false;
     bool profileHashJobs = false;
@@ -142,6 +146,10 @@ bool ParseArgs(int argc, wchar_t** argv, Args& out) {
             out.snapshotOut = argv[++i];
         } else if (a == L"--compare" && i + 1 < argc) {
             out.compareFrom = argv[++i];
+        } else if (a == L"--session-out" && i + 1 < argc) {
+            out.sessionOut = argv[++i];
+        } else if (a == L"--resume" && i + 1 < argc) {
+            out.resumeFrom = argv[++i];
         } else if (a == L"--hash-cache" && i + 1 < argc) {
             out.hashCacheFile = argv[++i];
         } else if (a == L"--profile-hash") {
@@ -158,6 +166,20 @@ bool ParseArgs(int argc, wchar_t** argv, Args& out) {
     }
     if (out.help) return true;
 
+    if (!out.resumeFrom.empty()) {
+        if (!out.compareFrom.empty()) {
+            std::wcerr << L"Errore: --resume e --compare sono mutuamente esclusivi.\n\n";
+            return false;
+        }
+        if (!out.snapshotOut.empty()) {
+            std::wcerr << L"Errore: --resume e --snapshot-out sono mutuamente esclusivi.\n\n";
+            return false;
+        }
+        if (out.source.empty() || out.dest.empty()) {
+            std::wcerr << L"Errore: --resume richiede --source e --dest.\n\n";
+            return false;
+        }
+    }
     if (!out.compareFrom.empty()) {
         if (!out.source.empty()) {
             std::wcerr << L"Errore: con --compare non si usa --source (la sorgente e lo snapshot).\n\n";
@@ -564,6 +586,8 @@ int MainImpl(int argc, wchar_t** argv) {
     options.backend = args.backend;
     options.snapshotOut = args.snapshotOut;
     options.compareFrom = args.compareFrom;
+    options.sessionOut = args.sessionOut;
+    options.resumeFrom = args.resumeFrom;
     options.exportPath = args.exportPath;
     options.exportFormat = args.exportFormat;
     options.hashCacheFile = args.hashCacheFile;
@@ -603,6 +627,12 @@ int MainImpl(int argc, wchar_t** argv) {
     }
     if (!args.snapshotOut.empty()) {
         std::wcout << L"Snapshot out:  " << args.snapshotOut << L"\n";
+    }
+    if (!args.sessionOut.empty()) {
+        std::wcout << L"Sessione out:  " << args.sessionOut << L"\n";
+    }
+    if (!args.resumeFrom.empty()) {
+        std::wcout << L"Ripresa da:    " << args.resumeFrom << L"\n";
     }
     if (!args.hashCacheFile.empty()) {
         std::wcout << L"Cache hash:    " << args.hashCacheFile << L"\n";
@@ -665,6 +695,13 @@ bv::ScanController controller(options.caseSensitive);
     }
     if (report.snapshotWritten) {
         std::wcout << L"Snapshot salvato:     " << options.snapshotOut << L"\n";
+    }
+    if (report.usedSession) {
+        std::wcout << L"Sessione ripresa:     " << Group(report.sessionReused) << L" righe riusate, "
+                   << Group(report.sessionStale) << L" riverificate\n";
+    }
+    if (report.sessionSaved) {
+        std::wcout << L"Sessione salvata:     " << report.sessionPath << L"\n";
     }
     if (report.contentDegradedToSize) {
         std::wcout << L"ATTENZIONE: lo snapshot non contiene impronte SHA-256: la verifica\n"

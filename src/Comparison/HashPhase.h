@@ -9,6 +9,7 @@
 #include "Comparison/ClassifyUtil.h"
 #include "Comparison/ComparisonResult.h"
 #include "Comparison/ConcurrentSink.h"
+#include "Comparison/RowCapture.h"
 #include "Filesystem/FileIndex.h"
 #include "Hashing/HashCache.h"
 #include "Profiling/DirTiming.h"
@@ -58,6 +59,8 @@ constexpr size_t kHashMaxOutstanding = 1024; // cap on submitted-but-not-finishe
 // stats counter (never stored, same memory-bound convention as ResultSet).
 // Cancelled work produces no outcome at all. See the .cpp for the offline,
 // error-root and partial-read rules, which are unchanged by the caller.
+// `rowSink` (optional, null by default) observes every finalized row with the
+// candidate fingerprints and any digests produced (identicals included).
 void HashOneCandidateInto(const ContentCandidate& c, bool offlineSource, FileIndex* index,
                           const std::wstring& sourceRoot, const std::wstring& destRoot,
                           ConcurrentSink& sink, const std::atomic_bool* cancel,
@@ -65,7 +68,8 @@ void HashOneCandidateInto(const ContentCandidate& c, bool offlineSource, FileInd
                           profiling::HashSession* session,
                           profiling::JobVerdict* verdict = nullptr,
                           profiling::DirHashTop* dirHash = nullptr,
-                          ContentVerifyLevel verify = ContentVerifyLevel{});
+                          ContentVerifyLevel verify = ContentVerifyLevel{},
+                          IRowSink* rowSink = nullptr);
 
 void SubmitHashCandidates(const std::vector<ContentCandidate>& candidates, ThreadPool& pool,
                           bool offlineSource, FileIndex* index,
@@ -78,7 +82,8 @@ void SubmitHashCandidates(const std::vector<ContentCandidate>& candidates, Threa
                           profiling::DirHashTop* dirHash = nullptr,
                           // Resolved run level (never Random): partial reads apply
                           // only when the controller allowed them for this run.
-                          ContentVerifyLevel verify = ContentVerifyLevel{});
+                          ContentVerifyLevel verify = ContentVerifyLevel{},
+                          IRowSink* rowSink = nullptr);
 
 // Legacy whole-phase entry point (serial comparator): hashes `candidates` in
 // bounded batches of kHashBatchSize and folds the outcomes into `out`.

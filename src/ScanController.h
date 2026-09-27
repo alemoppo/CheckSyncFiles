@@ -119,6 +119,16 @@ struct ScanOptions {
     // Partial content verification (Content mode only). Default {100, Edges}
     // reproduces today's full Content behaviour at every existing call site.
     ContentVerifyLevel verifyLevel;
+    // Phase 1: resumable sessions ------------------------------------------------
+    // Capture a resumable session of this run to `sessionOut` (base path: the
+    // store writes <base>.bvss + <base>.bvj). Saved only when both sides
+    // succeed; the journal then holds every finalized row of the run.
+    std::wstring sessionOut;
+    // Resume a previous session from `resumeFrom` (base path): rows whose
+    // files are unchanged are reused, the rest is re-verified live.
+    // Live-live only: mutually exclusive with `compareFrom` and (Phase 1)
+    // with `snapshotOut`.
+    std::wstring resumeFrom;
 };
 
 struct ScanReport {
@@ -163,6 +173,13 @@ struct ScanReport {
     // walkA / hashA stay empty; only B is timed. No timings are stored in
     // snapshots.
     profiling::DirTimingReport dirTiming;
+
+    // Phase 1: resumable sessions ------------------------------------------------
+    bool usedSession = false;   // this run resumed a previous session
+    uint64_t sessionReused = 0; // journaled rows reused as-is
+    uint64_t sessionStale = 0;  // journaled rows routed to re-verification
+    bool sessionSaved = false;  // a session file was written for this run
+    std::wstring sessionPath;   // base path it was written to
 };
 
 // Orchestrates a comparison run:
