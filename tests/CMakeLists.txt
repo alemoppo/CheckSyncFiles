@@ -4,7 +4,7 @@ add_library(bv_testtree STATIC
 target_include_directories(bv_testtree PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} ../src)
 target_link_libraries(bv_testtree PUBLIC bv_core)
 
-add_executable(bv_tests test_main.cpp)
+add_executable(bv_tests test_main.cpp test_session.cpp)
 target_link_libraries(bv_tests PRIVATE bv_testtree)
 
 if(BUILD_TESTGEN)

@@ -18,6 +18,9 @@ add_library(bv_core STATIC
   Hashing/Sha256.cpp
   Profiling/DirTiming.cpp
   Profiling/HashProfile.cpp
+  Session/SessionJson.cpp
+  Session/SessionLogic.cpp
+  Session/SessionStore.cpp
   ScanController.cpp
   ScanOrchestrator.cpp
   Threading/ThreadPool.cpp
