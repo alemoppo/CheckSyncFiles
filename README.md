@@ -351,7 +351,13 @@ re-running the full scan. In offline comparison the source does not exist: sourc
 registered paths from the snapshot. The SNAPSHOT button captures the source index into a binary file;
 EXPORT CSV saves non-identical entries of the last scan (native Windows save dialogs). LOAD SNAP.
 opens a selection dialog and verifies **only the destination** against the snapshot (the source is not
-read): a second click or choosing a source with Browse returns to online mode.
+read): a second click or choosing a source with Browse returns to online mode. SESSIONE arms saving a
+resumable session (`<base>.bvss` + `<base>.bvj`, default name derived from the source) at the end of the
+next runs, with periodic checkpoints every 1000 rows / 30 s while armed; a second click disarms it.
+RIPRENDI arms resuming a previous session (open dialog for a `.bvss` file): unchanged files are reused
+and only the rest is re-verified (live roots still required); a second click disarms it. Snapshot and
+resume arming are mutually exclusive. Cancelling a run with SESSIONE armed still saves whatever was
+finalized (`Interrupted` state), resumable later.
 
 ### With Visual Studio / MSVC and CMake (Windows 11)
 

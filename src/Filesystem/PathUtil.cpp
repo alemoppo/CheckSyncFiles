@@ -1,6 +1,8 @@
 #include "PathUtil.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <cwctype>
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -60,6 +62,43 @@ std::wstring FoldForCompare(const std::wstring& s) {
         if (c >= L'a' && c <= L'z') c = static_cast<wchar_t>(c - L'a' + L'A');
     }
     return out;
+}
+
+std::wstring SanitizeFilePrefix(const std::wstring& source, size_t maxChars) {
+    const std::wstring raw = source.substr(0, maxChars);
+    std::wstring out;
+    out.reserve(raw.size());
+    bool lastWasGap = false;
+    for (wchar_t c : raw) {
+        const bool keep = (c == L'-' || c == L'_' || c == L'.' || iswalnum(c) != 0);
+        if (keep) {
+            out.push_back(c);
+            lastWasGap = false;
+        } else if (!lastWasGap) {
+            out.push_back(L'_');
+            lastWasGap = true;
+        }
+    }
+    if (out.empty()) return L"backup";
+    return out;
+}
+
+std::wstring MakeSessionBaseName(const std::wstring& source, int day, int month, int year,
+                                 int hour, int minute) {
+    std::wstring prefix = SanitizeFilePrefix(source, 7);
+    while (!prefix.empty() && prefix.back() == L'_') prefix.pop_back();
+    if (prefix.empty()) prefix = L"backup";
+    wchar_t stamp[32];
+    swprintf(stamp, 32, L"%02d_%02d_%04d_%02d_%02d", day, month, year, hour, minute);
+    return prefix + L"_" + stamp;
+}
+
+std::wstring MakeSessionBaseNameNow(const std::wstring& source) {
+    SYSTEMTIME st{};
+    GetLocalTime(&st);
+    return MakeSessionBaseName(source, static_cast<int>(st.wDay), static_cast<int>(st.wMonth),
+                               static_cast<int>(st.wYear), static_cast<int>(st.wHour),
+                               static_cast<int>(st.wMinute));
 }
 
 bool HasDescendant(const std::vector<std::wstring>& keys, const std::wstring& dirKey) {

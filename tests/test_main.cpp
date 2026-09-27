@@ -51,6 +51,7 @@
 #include "Profiling/HashProfile.h"
 #include "ScanController.h"
 #include "ScanOrchestrator.h"
+#include "Session/SessionStore.h"
 #include "TestHarness.h"
 #include "TestTree.h"
 #include "Threading/ThreadPool.h"
@@ -241,6 +242,33 @@ TEST("pathutil: case folding is ASCII + invariant", [] {
     CHECK(FoldForCompare(L"foto") == L"FOTO");
     CHECK(FoldForCompare(L"FoTo\\a.JpG") == L"FOTO\\A.JPG");
     CHECK(FoldForCompare(L"") == L"");
+});
+
+TEST("pathutil: session base name is prefix + timestamp without extension", [] {
+    using bv::pathutil::MakeSessionBaseName;
+    using bv::pathutil::MakeSessionBaseNameNow;
+    using bv::pathutil::SanitizeFilePrefix;
+    CHECK(SanitizeFilePrefix(L"D:\\Backup", 7) == L"D_Back");
+    CHECK(SanitizeFilePrefix(L"", 7) == L"backup");
+    CHECK(MakeSessionBaseName(L"D:\\Backup", 27, 9, 2026, 14, 5) ==
+          L"D_Back_27_09_2026_14_05");
+    CHECK(MakeSessionBaseName(L"", 1, 2, 2026, 3, 4) == L"backup_01_02_2026_03_04");
+    // No extension and no forbidden filename characters survive.
+    const std::wstring now = MakeSessionBaseNameNow(L"D:\\My|Docs*");
+    CHECK(!now.empty());
+    for (wchar_t c : now) {
+        CHECK(c != L'<');
+        CHECK(c != L'>');
+        CHECK(c != L':');
+        CHECK(c != L'"');
+        CHECK(c != L'/');
+        CHECK(c != L'\\');
+        CHECK(c != L'|');
+        CHECK(c != L'?');
+        CHECK(c != L'*');
+        CHECK(c != L' ');
+        CHECK(c != L'.'); // no extension separator in a session base
+    }
 });
 
 // ---------------------------------------------------------------------------
@@ -5080,6 +5108,93 @@ TEST("orchestrator: successful live scan exposes both sides as ok", [] {
     CHECK(!st.cancelled);
     CHECK(st.sourceOk);
     CHECK(st.destinationOk);
+});
+
+TEST("orchestrator: session-out run saves a loadable session", [] {
+    const std::wstring dir = MakeTempDir();
+    const std::wstring src = dir + L"\\src";
+    const std::wstring dst = dir + L"\\dst";
+    bv::testgen::CreateFixture(src);
+    std::error_code ec;
+    fs::copy(fs::path(src), fs::path(dst), fs::copy_options::recursive, ec);
+    CHECK(!ec);
+    const std::wstring base = dir + L"\\sess";
+
+    bv::ScanOrchestrator orch;
+    orch.setSource(src);
+    orch.setDest(dst);
+    orch.setSessionOut(base);
+    CHECK(orch.snapshot().sessionOut == base);
+    CHECK(orch.startLiveScan());
+    CHECK_MSG(WaitForRunDone(orch, 30000), "session run did not finish");
+
+    const auto st = orch.snapshot();
+    CHECK(st.resultsReady);
+    CHECK(st.sourceOk);
+    CHECK(st.destinationOk);
+    CHECK(st.lastSessionSaved);
+    bv::session::ScanSession loaded;
+    const bv::session::LoadOutcome o = bv::session::LoadSession(base, loaded);
+    CHECK(o.ok);
+    CHECK(!loaded.journal.empty());
+});
+
+TEST("orchestrator: resume run reuses rows and matches the first run", [] {
+    const std::wstring dir = MakeTempDir();
+    const std::wstring src = dir + L"\\src";
+    const std::wstring dst = dir + L"\\dst";
+    bv::testgen::CreateFixture(src);
+    std::error_code ec;
+    fs::copy(fs::path(src), fs::path(dst), fs::copy_options::recursive, ec);
+    CHECK(!ec);
+    const std::wstring base = dir + L"\\sess";
+
+    bv::ScanOrchestrator first;
+    first.setSource(src);
+    first.setDest(dst);
+    first.setSessionOut(base);
+    CHECK(first.startLiveScan());
+    CHECK_MSG(WaitForRunDone(first, 30000), "first session run did not finish");
+    CHECK(first.snapshot().lastSessionSaved);
+    const bv::ResultSet firstResults = first.results();
+
+    bv::ScanOrchestrator second;
+    second.setSource(src);
+    second.setDest(dst);
+    second.loadResumeSession(base + L".bvss");
+    CHECK(second.snapshot().useResume);
+    CHECK(second.startLiveScan());
+    CHECK_MSG(WaitForRunDone(second, 30000), "resume run did not finish");
+
+    const auto st = second.snapshot();
+    CHECK(st.resultsReady);
+    CHECK(st.lastUsedSession);
+    CHECK(st.lastSessionReused > 0u);
+    const bv::ResultSet secondResults = second.results();
+    CHECK(secondResults.stats.identicalFiles == firstResults.stats.identicalFiles);
+    CHECK(secondResults.problems.size() == firstResults.problems.size());
+});
+
+TEST("orchestrator: snapshot and resume arming are mutually exclusive", [] {
+    bv::ScanOrchestrator orch;
+    orch.loadSnapshot(L"C:\\x.bin");
+    CHECK(orch.snapshot().useSnapshot);
+    orch.loadResumeSession(L"C:\\y.bvss");
+    CHECK(!orch.snapshot().useSnapshot);
+    CHECK(orch.snapshot().useResume);
+    // The store suffix is stripped: dialogs return the picked file, the store
+    // wants the base.
+    CHECK(orch.snapshot().resumeFile == L"C:\\y");
+    orch.loadSnapshot(L"C:\\z.bin");
+    CHECK(orch.snapshot().useSnapshot);
+    CHECK(!orch.snapshot().useResume);
+    orch.setSessionOut(L"C:\\s");
+    CHECK(orch.snapshot().sessionOut == L"C:\\s");
+    orch.clearSessionOut();
+    CHECK(orch.snapshot().sessionOut.empty());
+    orch.loadResumeSession(L"C:\\y.bvss");
+    orch.clearResume();
+    CHECK(!orch.snapshot().useResume);
 });
 
 TEST("orchestrator: failed source is exposed as incomplete, not successful", [] {

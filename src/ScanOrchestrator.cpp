@@ -168,6 +168,8 @@ void ScanOrchestrator::loadSnapshot(std::wstring file) {
     std::lock_guard<std::mutex> lk(mtx_);
     snapshotFile_ = std::move(file);
     useSnapshot_ = true;
+    useResume_ = false; // mutually exclusive modes
+    resumeFile_.clear();
     source_.clear(); // the device is no longer needed
     statusNote_ = L"Sorgente da snapshot. Impostare la destinazione e premere AVVIA.";
 }
@@ -177,6 +179,49 @@ void ScanOrchestrator::clearSnapshot() {
     useSnapshot_ = false;
     snapshotFile_.clear();
     statusNote_ = L"Modalita online: sorgente da enumerare.";
+}
+
+namespace {
+
+// The session store appends its own suffixes (.bvss/.bvj) to the base path,
+// but file dialogs return the picked file WITH its suffix: accept both forms
+// by stripping a trailing ".bvss".
+std::wstring StripSessionSuffix(std::wstring path) {
+    constexpr wchar_t kSuffix[] = L".bvss";
+    constexpr size_t kLen = sizeof(kSuffix) / sizeof(wchar_t) - 1;
+    if (path.size() > kLen && path.compare(path.size() - kLen, kLen, kSuffix) == 0)
+        path.resize(path.size() - kLen);
+    return path;
+}
+
+} // namespace
+
+void ScanOrchestrator::setSessionOut(std::wstring base) {
+    std::lock_guard<std::mutex> lk(mtx_);
+    sessionOut_ = StripSessionSuffix(std::move(base));
+    statusNote_ = L"Sessione armata: salvataggio a fine scansione.";
+}
+
+void ScanOrchestrator::clearSessionOut() {
+    std::lock_guard<std::mutex> lk(mtx_);
+    sessionOut_.clear();
+    statusNote_.clear();
+}
+
+void ScanOrchestrator::loadResumeSession(std::wstring file) {
+    std::lock_guard<std::mutex> lk(mtx_);
+    resumeFile_ = StripSessionSuffix(std::move(file));
+    useResume_ = true;
+    useSnapshot_ = false; // mutually exclusive modes
+    snapshotFile_.clear();
+    statusNote_ = L"Ripresa armata: le righe invariate saranno riusate.";
+}
+
+void ScanOrchestrator::clearResume() {
+    std::lock_guard<std::mutex> lk(mtx_);
+    useResume_ = false;
+    resumeFile_.clear();
+    statusNote_.clear();
 }
 
 bool ScanOrchestrator::requestSingleVerify(const SingleVerifyParams& params) {
@@ -260,6 +305,7 @@ bool ScanOrchestrator::startLiveScan() {
     {
         std::lock_guard<std::mutex> lk(mtx_);
         if (running_ || verifyRunning_) return false;
+        if (useSnapshot_ && useResume_) return false; // mutually exclusive
         if (useSnapshot_) {
             if (snapshotFile_.empty() || dest_.empty()) return false;
         } else if (source_.empty() || dest_.empty()) {
@@ -298,6 +344,13 @@ bool ScanOrchestrator::startLiveScan() {
     options.backend = backend_;
     options.verifyLevel.percent = std::max(1, verifyPercent_);
     options.verifyLevel.pattern = verifyPattern_;
+    // Phase 3: session capture (periodic checkpoints while armed) and resume.
+    options.sessionOut = sessionOut_;
+    if (useResume_) options.resumeFrom = resumeFile_;
+    if (!sessionOut_.empty()) {
+        options.checkpointRows = 1000;
+        options.checkpointSecs = 30;
+    }
     options.cancel = &cancel_;
     options.onProgress = [this](const ScanProgress& p) {
         {
@@ -420,6 +473,13 @@ ScanOrchestrator::UiSnapshot ScanOrchestrator::snapshot() const {
     s.verify = verify_;
     s.useSnapshot = useSnapshot_;
     s.snapshotFile = snapshotFile_;
+    s.sessionOut = sessionOut_;
+    s.useResume = useResume_;
+    s.resumeFile = resumeFile_;
+    s.lastUsedSession = lastUsedSession_;
+    s.lastSessionSaved = lastSessionSaved_;
+    s.lastSessionReused = lastSessionReused_;
+    s.lastSessionStale = lastSessionStale_;
     s.running = running_;
     s.resultsReady = resultsReady_;
     s.cancelled = cancel_.load();
@@ -528,6 +588,11 @@ void ScanOrchestrator::workerThread(ScanOptions options) {
         progress_.dirs = results_.stats.sourceDirs;
         lastSnapshotWritten_ = report.snapshotWritten;
         lastUsedSnapshot_ = report.usedSnapshot;
+        lastUsedSession_ = report.usedSession;
+        lastSessionSaved_ = report.sessionSaved;
+        lastSessionPath_ = report.sessionPath;
+        lastSessionReused_ = report.sessionReused;
+        lastSessionStale_ = report.sessionStale;
         lastDegraded_ = report.contentDegradedToSize;
         sourceOk_ = report.sourceOk;
         destinationOk_ = report.destinationOk;
@@ -539,6 +604,15 @@ void ScanOrchestrator::workerThread(ScanOptions options) {
         } else if (lastUsedSnapshot_) {
             statusNote_ = L"Sorgente caricata da snapshot (" +
                           std::to_wstring(results_.stats.sourceFiles) + L" voci).";
+        } else if (lastSessionSaved_ && lastUsedSession_) {
+            statusNote_ = L"Sessione ripresa (" + std::to_wstring(lastSessionReused_) +
+                          L" riusate, " + std::to_wstring(lastSessionStale_) +
+                          L" riverificate) e salvata: " + lastSessionPath_;
+        } else if (lastSessionSaved_) {
+            statusNote_ = L"Sessione salvata: " + lastSessionPath_;
+        } else if (lastUsedSession_) {
+            statusNote_ = L"Sessione ripresa (" + std::to_wstring(lastSessionReused_) +
+                          L" riusate, " + std::to_wstring(lastSessionStale_) + L" riverificate).";
         } else if (!cancel_.load() && (!report.sourceOk || !report.destinationOk)) {
             // A side could not be scanned completely: surface the reason (the
             // comparer's notes, e.g. "albero incompleto") instead of an empty

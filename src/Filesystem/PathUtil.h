@@ -38,5 +38,19 @@ bool HasDescendant(const std::vector<std::wstring>& keys, const std::wstring& di
 std::string ToUtf8(const std::wstring& w);
 std::wstring FromUtf8(const std::string& s);
 
+// Sanitizes the first `maxChars` characters of `source` for use inside a file
+// name: every character that is not a letter, digit, '-', '_' or '.' becomes
+// '_', collapsing consecutive replacements into a single '_'. Returns
+// L"backup" when nothing usable remains (empty source or only specials).
+std::wstring SanitizeFilePrefix(const std::wstring& source, size_t maxChars);
+
+// Default session base name (no extension; the session store appends
+// .bvss/.bvj): <prefix>_<DD>_<MM>_<YYYY>_<HH>_<mm>, with trailing '_' of the
+// prefix trimmed so the separator is exactly one '_'.
+std::wstring MakeSessionBaseName(const std::wstring& source, int day, int month, int year,
+                                 int hour, int minute);
+// Same with the current local day/month/year/hour/minute.
+std::wstring MakeSessionBaseNameNow(const std::wstring& source);
+
 } // namespace pathutil
 } // namespace bv

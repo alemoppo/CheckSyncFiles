@@ -40,6 +40,16 @@ public:
         VerifyInfo verify;
         bool useSnapshot = false;
         std::wstring snapshotFile;
+        // Phase 3: resumable sessions (see Session/ScanSession.h). `sessionOut`
+        // (empty = off) arms session capture for the next runs; `useResume` +
+        // `resumeFile` resume a previous session instead of verifying everything.
+        std::wstring sessionOut;
+        bool useResume = false;
+        std::wstring resumeFile;
+        bool lastUsedSession = false;  // last run resumed a session
+        bool lastSessionSaved = false; // last run wrote a session file
+        uint64_t lastSessionReused = 0;
+        uint64_t lastSessionStale = 0;
 
         bool running = false;
         bool resultsReady = false;
@@ -91,8 +101,20 @@ public:
 
     // Offline mode: the source index is loaded from `file` (the source device
     // is not touched). `clearSnapshot` switches back to a live source.
+    // Arming a snapshot clears a previously armed resume (mutually exclusive).
     void loadSnapshot(std::wstring file);
     void clearSnapshot();
+    // Session capture: `setSessionOut` arms saving a resumable session
+    // (<base>.bvss + <base>.bvj) at the end of the next runs (periodic
+    // checkpoints every 1000 rows / 30 s while armed); `clearSessionOut`
+    // disarms it.
+    void setSessionOut(std::wstring base);
+    void clearSessionOut();
+    // Resume mode: the next runs reuse the rows of the session at `file`
+    // whose files are unchanged (live roots still required). Arming a resume
+    // clears a previously armed snapshot (mutually exclusive).
+    void loadResumeSession(std::wstring file);
+    void clearResume();
 
     // -- Single-file re-verification ("Riscansiona") -------------------------
     // Raw GUI-side settings for one single-file check. Everything the worker
@@ -183,6 +205,14 @@ private:
     VerifyInfo verify_;
     bool useSnapshot_ = false;
     std::wstring snapshotFile_;
+    std::wstring sessionOut_;
+    bool useResume_ = false;
+    std::wstring resumeFile_;
+    bool lastUsedSession_ = false;
+    bool lastSessionSaved_ = false;
+    uint64_t lastSessionReused_ = 0;
+    uint64_t lastSessionStale_ = 0;
+    std::wstring lastSessionPath_;
 
     // Run state.
     bool running_ = false;

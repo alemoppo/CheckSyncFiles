@@ -94,6 +94,8 @@ struct Layout {
     SDL_FRect sourceBrowse, destBrowse;
 
     SDL_FRect startBtn, snapBtn, exportBtn, caricaBtn;
+    // Phase 3: session capture arming + resume (right of CARICA SNAP.).
+    SDL_FRect sessionBtn, resumeBtn;
 };
 
 Layout ComputeLayout(int W, int H) {
@@ -132,6 +134,8 @@ Layout ComputeLayout(int W, int H) {
     L.snapBtn = {static_cast<float>(kMargin + 130), static_cast<float>(L.y5), 120.0f, 30.0f};
     L.exportBtn = {static_cast<float>(kMargin + 260), static_cast<float>(L.y5), 120.0f, 30.0f};
     L.caricaBtn = {static_cast<float>(kMargin + 390), static_cast<float>(L.y5), 150.0f, 30.0f};
+    L.sessionBtn = {static_cast<float>(kMargin + 550), static_cast<float>(L.y5), 120.0f, 30.0f};
+    L.resumeBtn = {static_cast<float>(kMargin + 680), static_cast<float>(L.y5), 130.0f, 30.0f};
     return L;
 }
 
@@ -1039,6 +1043,14 @@ void AppUI::OnMouseDown(int mx, int my) {
         onLoadSnapshot();
         dirty_.store(true);
     }
+    if (hit(mx, my, L.sessionBtn) && !running) {
+        onArmSession();
+        dirty_.store(true);
+    }
+    if (hit(mx, my, L.resumeBtn) && !running) {
+        onLoadResumeSession();
+        dirty_.store(true);
+    }
 
     // Filters (7 problem views + the Tempistiche timings view).
     const int fr = 92;
@@ -1505,6 +1517,52 @@ void AppUI::onLoadSnapshot() {
     dirty_.store(true);
 }
 
+void AppUI::onArmSession() {
+    if (orch_.snapshot().running) return;
+
+    if (!orch_.snapshot().sessionOut.empty()) {
+        // Second click: disarm session capture.
+        orch_.clearSessionOut();
+        dirty_.store(true);
+        return;
+    }
+
+    std::wstring file;
+    const std::wstring defBase =
+        bv::pathutil::MakeSessionBaseNameNow(orch_.snapshot().source);
+    if (!BrowseSaveFile(file, defBase.c_str())) {
+        return; // user cancelled the dialog
+    }
+
+    orch_.setSessionOut(file);
+    dirty_.store(true);
+}
+
+void AppUI::onLoadResumeSession() {
+    if (orch_.snapshot().running) return;
+
+    if (orch_.snapshot().useResume) {
+        // Second click: back to a plain live comparison.
+        orch_.clearResume();
+        dirty_.store(true);
+        return;
+    }
+
+    if (orch_.snapshot().sourceFocus || orch_.snapshot().destFocus) {
+        orch_.setSourceFocus(false);
+        orch_.setDestFocus(false);
+        SDL_StopTextInput(window_);
+    }
+
+    std::wstring file;
+    if (!BrowseOpenFile(file, L"Sessione BVSS (*.bvss)", L"*.bvss")) {
+        return; // user cancelled the dialog
+    }
+
+    orch_.loadResumeSession(file);
+    dirty_.store(true);
+}
+
 void AppUI::syncResultsCache(const bv::ScanOrchestrator::UiSnapshot& st) {
     if (st.resultsReady && !resultsReadySeen_) {
         uiResults_ = orch_.results();
@@ -1742,8 +1800,8 @@ void AppUI::render(const bv::ScanOrchestrator::UiSnapshot& st) {
             thrInfo = L"→ " + std::to_wstring(threadCountUsed) + L" thread hash";
         }
         if (!thrInfo.empty()) {
-            DrawText(renderer_, fontBody_, ToUtf8(thrInfo), kMargin + 390 + 150 + 8, L.y5 + 4,
-                     kTextLo);
+            DrawText(renderer_, fontBody_, ToUtf8(thrInfo),
+                     static_cast<int>(L.resumeBtn.x + L.resumeBtn.w + 8), L.y5 + 4, kTextLo);
         }
     }
 
@@ -1791,6 +1849,40 @@ void AppUI::render(const bv::ScanOrchestrator::UiSnapshot& st) {
         DrawTextCenterIn(renderer_, fontBold_, ToUtf8(carLab),
                          static_cast<int>(L.caricaBtn.x), static_cast<int>(L.caricaBtn.y),
                          static_cast<int>(L.caricaBtn.w), static_cast<int>(L.caricaBtn.h),
+                         kTextHi);
+    }
+
+    // ---- Buttons SESSIONE (arm capture) / RIPRENDI (arm resume) ----
+    // Toggle semantics mirror CARICA SNAP.: highlighted + basename when armed.
+    const bool armedSession = !st.sessionOut.empty();
+    const bool overSession = !running && hit(static_cast<int>(mx), static_cast<int>(my),
+                                             L.sessionBtn);
+    FillRect(renderer_, static_cast<int>(L.sessionBtn.x), static_cast<int>(L.sessionBtn.y),
+             static_cast<int>(L.sessionBtn.w), static_cast<int>(L.sessionBtn.h),
+             overSession ? kAccentHover : (armedSession ? kAccent : kPanel));
+    DrawRect(renderer_, static_cast<int>(L.sessionBtn.x), static_cast<int>(L.sessionBtn.y),
+             static_cast<int>(L.sessionBtn.w), static_cast<int>(L.sessionBtn.h), kBorder);
+    {
+        std::wstring sesLab = armedSession ? BaseName(st.sessionOut) : L"SESSIONE";
+        if (sesLab.size() > 11) sesLab = L"..." + sesLab.substr(sesLab.size() - 8);
+        DrawTextCenterIn(renderer_, fontBold_, ToUtf8(sesLab),
+                         static_cast<int>(L.sessionBtn.x), static_cast<int>(L.sessionBtn.y),
+                         static_cast<int>(L.sessionBtn.w), static_cast<int>(L.sessionBtn.h),
+                         kTextHi);
+    }
+    const bool overResume = !running && hit(static_cast<int>(mx), static_cast<int>(my),
+                                            L.resumeBtn);
+    FillRect(renderer_, static_cast<int>(L.resumeBtn.x), static_cast<int>(L.resumeBtn.y),
+             static_cast<int>(L.resumeBtn.w), static_cast<int>(L.resumeBtn.h),
+             overResume ? kAccentHover : (st.useResume ? kAccent : kPanel));
+    DrawRect(renderer_, static_cast<int>(L.resumeBtn.x), static_cast<int>(L.resumeBtn.y),
+             static_cast<int>(L.resumeBtn.w), static_cast<int>(L.resumeBtn.h), kBorder);
+    {
+        std::wstring resLab = st.useResume ? BaseName(st.resumeFile) : L"RIPRENDI";
+        if (resLab.size() > 12) resLab = L"..." + resLab.substr(resLab.size() - 9);
+        DrawTextCenterIn(renderer_, fontBold_, ToUtf8(resLab),
+                         static_cast<int>(L.resumeBtn.x), static_cast<int>(L.resumeBtn.y),
+                         static_cast<int>(L.resumeBtn.w), static_cast<int>(L.resumeBtn.h),
                          kTextHi);
     }
 
@@ -1862,6 +1954,13 @@ void AppUI::render(const bv::ScanOrchestrator::UiSnapshot& st) {
                   VerifyPatternName(st.verify.pattern) + L")" +
                   (st.verify.patternRandom ? L" [casuale]" : L"") +
                   L": IDENTICO_PARZIALE puo differire nelle parti non lette.";
+    }
+    // Armed session/resume indicators while idle (post-run outcomes already
+    // arrive through statusNote from the orchestrator).
+    if (!running && !st.verifyRunning && !st.resultsReady) {
+        if (st.useResume) status += L"   —  Ripresa da " + BaseName(st.resumeFile) + L".";
+        if (!st.sessionOut.empty())
+            status += L"   —  Sessione verso " + BaseName(st.sessionOut) + L".";
     }
     if (!statusNote.empty()) {
         status += (status == L"Pronto. Specificare sorgente e destinazione." ? L"" : L"   —  ") +

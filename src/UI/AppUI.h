@@ -65,6 +65,11 @@ private:
     bool isPointerOverList(float wx, float wy);
     void startScanFromUi();
     void onLoadSnapshot();
+    // Phase 3: arm/disarm session capture (save dialog for the <base>.bvss +
+    // <base>.bvj pair, second click disarms) and resume (open dialog for a
+    // .bvss file, second click disarms). Toggle semantics mirror onLoadSnapshot.
+    void onArmSession();
+    void onLoadResumeSession();
     // Copies the finished results out of the orchestrator once per run, so the
     // render loop never re-copies a large problem list on every repaint.
     void syncResultsCache(const bv::ScanOrchestrator::UiSnapshot& st);
