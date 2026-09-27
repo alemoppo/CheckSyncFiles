@@ -129,6 +129,14 @@ struct ScanOptions {
     // Live-live only: mutually exclusive with `compareFrom` and (Phase 1)
     // with `snapshotOut`.
     std::wstring resumeFrom;
+    // Phase 2: periodic checkpoints --------------------------------------------
+    // While a session is captured (`sessionOut` set), flush journaled rows to
+    // disk every `checkpointRows` rows and/or every `checkpointSecs` seconds
+    // (0 = that trigger disabled; both zero = checkpointing off, single save
+    // at the end). A crash then loses at most one interval of work. Inert
+    // without `sessionOut`.
+    uint64_t checkpointRows = 0;
+    uint64_t checkpointSecs = 0;
 };
 
 struct ScanReport {

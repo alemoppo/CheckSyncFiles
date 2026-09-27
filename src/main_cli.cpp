@@ -48,6 +48,8 @@ const wchar_t* kUsage =
     L"  --compare <snapshot>     confronta --dest contro uno snapshot (niente --source)\n"
     L"  --session-out <base>     salva una sessione ripristinabile (<base>.bvss + <base>.bvj)\n"
     L"  --resume <base>          riprende una sessione: riusa le righe invariate, riverifica il resto\n"
+    L"  --checkpoint-rows <N>    checkpoint ogni N righe (richiede --session-out)\n"
+    L"  --checkpoint-secs <N>    checkpoint ogni N secondi (richiede --session-out)\n"
     L"  --hash-cache <file>      riusa le impronte SHA-256 non scaricate (percorso+dim+data)\n"
     L"  --profile-hash           raccoglie e stampa le statistiche del profilo hash\n"
     L"  --profile-hash-jobs      come sopra e in piu' una riga per ogni file hashato\n"
@@ -72,6 +74,8 @@ struct Args {
     std::wstring compareFrom;
     std::wstring sessionOut;
     std::wstring resumeFrom;
+    uint64_t checkpointRows = 0;
+    uint64_t checkpointSecs = 0;
     std::wstring hashCacheFile;
     bool profileHash = false;
     bool profileHashJobs = false;
@@ -150,6 +154,18 @@ bool ParseArgs(int argc, wchar_t** argv, Args& out) {
             out.sessionOut = argv[++i];
         } else if (a == L"--resume" && i + 1 < argc) {
             out.resumeFrom = argv[++i];
+        } else if (a == L"--checkpoint-rows" && i + 1 < argc) {
+            const std::wstring v = argv[++i];
+            if (!bv::util::ParseUInt64(v, out.checkpointRows)) {
+                std::wcerr << L"Valore non valido per --checkpoint-rows: " << v << L"\n";
+                return false;
+            }
+        } else if (a == L"--checkpoint-secs" && i + 1 < argc) {
+            const std::wstring v = argv[++i];
+            if (!bv::util::ParseUInt64(v, out.checkpointSecs)) {
+                std::wcerr << L"Valore non valido per --checkpoint-secs: " << v << L"\n";
+                return false;
+            }
         } else if (a == L"--hash-cache" && i + 1 < argc) {
             out.hashCacheFile = argv[++i];
         } else if (a == L"--profile-hash") {
@@ -179,6 +195,10 @@ bool ParseArgs(int argc, wchar_t** argv, Args& out) {
             std::wcerr << L"Errore: --resume richiede --source e --dest.\n\n";
             return false;
         }
+    }
+    if ((out.checkpointRows > 0 || out.checkpointSecs > 0) && out.sessionOut.empty()) {
+        std::wcerr << L"Errore: --checkpoint-rows/--checkpoint-secs richiedono --session-out.\n\n";
+        return false;
     }
     if (!out.compareFrom.empty()) {
         if (!out.source.empty()) {
@@ -588,6 +608,8 @@ int MainImpl(int argc, wchar_t** argv) {
     options.compareFrom = args.compareFrom;
     options.sessionOut = args.sessionOut;
     options.resumeFrom = args.resumeFrom;
+    options.checkpointRows = args.checkpointRows;
+    options.checkpointSecs = args.checkpointSecs;
     options.exportPath = args.exportPath;
     options.exportFormat = args.exportFormat;
     options.hashCacheFile = args.hashCacheFile;

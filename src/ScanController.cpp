@@ -5,6 +5,7 @@
 #include <functional>
 #include <memory>
 #include <random>
+#include <thread>
 #include <unordered_set>
 
 #include "Comparison/ConcurrentComparer.h"
@@ -383,6 +384,120 @@ ScanReport ScanController::run(const ScanOptions& options) {
     std::vector<std::wstring> resumeErrB;
     std::vector<session::JournalEntry> sessionReusedEntries;
     BufferedRowSink rowSink;
+    // Phase 2 checkpoint state (only when checkpointOn below). The pump thread
+    // periodically moves captured rows into checkpointPending and appends them
+    // to the session files; the final save appends the tail the same way, so
+    // memory stays bounded by the checkpoint interval instead of the tree.
+    const bool checkpointOn =
+        haveSessionOut && (options.checkpointRows > 0 || options.checkpointSecs > 0);
+    Stats checkpointStats;
+    std::vector<session::JournalEntry> checkpointPending;
+    uint64_t checkpointSeq = 0;
+    bool checkpointBootstrapped = false; // session files exist yet
+    bool checkpointUsed = false;         // pump ran (incremental final applies)
+    std::string checkpointSessionId;
+    uint64_t checkpointCreatedAt = 0;
+    std::atomic<size_t> checkpointTakenTotal{0};
+    std::atomic<size_t> checkpointTakenAtMark{0};
+    std::atomic<uint64_t> checkpointLastSecs{session::NowUnixSeconds()};
+    std::atomic_bool checkpointRequest{false};
+    std::atomic_bool checkpointStop{false};
+    std::mutex checkpointMutex;
+    std::wstring checkpointError; // first checkpoint failure (reported as note)
+    std::thread checkpointThread;
+
+    // Moves captured rows into the session files (serialized by
+    // checkpointMutex; called from the pump thread and once from the main
+    // thread after join). The first call bootstraps via SaveSession, later
+    // ones append. Failures keep the rows queued for the next attempt and are
+    // sticky-reported once; they never fail the scan itself.
+    auto doCheckpoint = [&](session::SessionState state) -> bool {
+        std::lock_guard<std::mutex> lock(checkpointMutex);
+        if (checkpointSessionId.empty()) {
+            checkpointSessionId = session::GenerateSessionId();
+            checkpointCreatedAt = session::NowUnixSeconds();
+        }
+        for (ClassifiedRow& row : rowSink.take()) {
+            checkpointTakenTotal.fetch_add(1, std::memory_order_relaxed);
+            session::JournalEntry e = session::ToJournalEntry(row);
+            session::AccumulateJournalStats(checkpointStats, e, row.hasA,
+                                            row.entryA.isDirectory, row.entryA.size, row.hasB,
+                                            row.entryB.isDirectory, row.entryB.size);
+            checkpointPending.push_back(std::move(e));
+        }
+        checkpointTakenAtMark.store(checkpointTakenTotal.load(std::memory_order_relaxed),
+                                    std::memory_order_relaxed);
+        checkpointLastSecs.store(session::NowUnixSeconds(), std::memory_order_relaxed);
+        if (checkpointPending.empty()) return true; // nothing new: no I/O
+        session::ScanSession ctx;
+        ctx.sessionId = checkpointSessionId;
+        ctx.createdAtUnix = checkpointCreatedAt;
+        ctx.sourceA = options.source;
+        ctx.sourceB = options.destination;
+        ctx.settings.mode = options.mode;
+        ctx.settings.caseSensitive = caseSensitive_;
+        ctx.settings.backend = BackendName(options.backend);
+        ctx.settings.verify = report.verify;
+        ctx.settings.hashThreads = options.hashThreads;
+        ctx.state = state;
+        ctx.progressA = {checkpointStats.sourceFiles, checkpointStats.sourceDirs,
+                         checkpointStats.bytesSource};
+        ctx.progressB = {checkpointStats.destFiles, checkpointStats.destDirs,
+                         checkpointStats.bytesDest};
+        ctx.stats = checkpointStats;
+        ctx.checkpoint = {checkpointSeq, session::NowUnixSeconds()};
+        std::wstring werr;
+        bool ok = false;
+        if (!checkpointBootstrapped) {
+            ctx.journal = checkpointPending; // copy: kept on failure for retry
+            ok = session::SaveSession(options.sessionOut, ctx, werr);
+        } else {
+            ok = session::AppendJournal(options.sessionOut, ctx, checkpointPending, werr);
+        }
+        if (!ok) {
+            if (checkpointError.empty()) checkpointError = werr;
+            return false;
+        }
+        checkpointPending.clear();
+        checkpointBootstrapped = true;
+        ++checkpointSeq;
+        return true;
+    };
+
+    // Background pump: every 100 ms, flush when requested (row-count trigger
+    // from the progress callbacks) or when the time interval elapsed. Stops on
+    // request or cancellation; the final save is the main thread's job.
+    auto pumpMain = [&]() {
+        while (!checkpointStop.load(std::memory_order_relaxed)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            if (checkpointStop.load(std::memory_order_relaxed)) break;
+            if (options.cancel && options.cancel->load(std::memory_order_relaxed)) break;
+            const size_t total = checkpointTakenTotal.load(std::memory_order_relaxed) +
+                                 rowSink.size();
+            const size_t sinceMark =
+                total - checkpointTakenAtMark.load(std::memory_order_relaxed);
+            if (checkpointRequest.exchange(false, std::memory_order_relaxed) ||
+                session::ShouldCheckpoint(sinceMark, options.checkpointRows,
+                                          session::NowUnixSeconds(),
+                                          checkpointLastSecs.load(std::memory_order_relaxed),
+                                          options.checkpointSecs)) {
+                doCheckpoint(session::SessionState::Checkpointed);
+            }
+        }
+    };
+
+    // Row-count trigger for the progress callbacks (cheap: one atomic load and
+    // a flag store; the pump thread does the file I/O).
+    auto maybeRequestCheckpoint = [&]() {
+        if (!checkpointOn) return;
+        const size_t total =
+            checkpointTakenTotal.load(std::memory_order_relaxed) + rowSink.size();
+        if (session::ShouldCheckpoint(
+                total - checkpointTakenAtMark.load(std::memory_order_relaxed),
+                options.checkpointRows, session::NowUnixSeconds(),
+                checkpointLastSecs.load(std::memory_order_relaxed), options.checkpointSecs))
+            checkpointRequest.store(true, std::memory_order_relaxed);
+    };
 
     // ---------------------------------------------------------------------
     // 1. Source side: load it from a snapshot, or capture it for the snapshot
@@ -672,6 +787,15 @@ ScanReport ScanController::run(const ScanOptions& options) {
                                             ConcurrentComparer::SourceKind::Live, nullptr,
                                             options.cancel, hashProf, &dirTiming, runLevel);
                 if (haveSessionOut) comparer.setRowSink(&rowSink);
+                if (checkpointOn) {
+                    // Reused rows enter the pending queue so the incremental
+                    // final save contains the whole journal.
+                    checkpointPending = std::move(sessionReusedEntries);
+                    checkpointStats = plan.reusedStats;
+                    checkpointUsed = true;
+                    checkpointStop.store(false, std::memory_order_relaxed);
+                    checkpointThread = std::thread(pumpMain);
+                }
                 // Remainder allow-set for the destination filter (folded keys,
                 // same function the comparer matches on).
                 std::unordered_set<std::wstring> allowedB;
@@ -707,6 +831,7 @@ ScanReport ScanController::run(const ScanOptions& options) {
                 const IFileEnumerator::ProgressCallback enumProgress =
                     [&](uint64_t files, uint64_t dirs, uint64_t bytes,
                         const std::wstring& path) {
+                        maybeRequestCheckpoint();
                         emitProgress(ScanPhase::CompareDestination, files, dirs, bytes, path,
                                      comparer.matchTable());
                     };
@@ -714,6 +839,7 @@ ScanReport ScanController::run(const ScanOptions& options) {
                 double compareHashSeconds = 0.0;
                 bool hashing = false;
                 const auto hashProgress = [&](uint64_t done, uint64_t total) {
+                    maybeRequestCheckpoint();
                     if (!hashing) {
                         hashing = true;
                         hashStart = NowSeconds();
@@ -733,6 +859,10 @@ ScanReport ScanController::run(const ScanOptions& options) {
                     std::move(srcFs), std::move(dstFs), hashPool, enumProgress, hashProgress,
                     cache.get());
                 hashThreadsActive.store(0, std::memory_order_relaxed);
+                if (checkpointOn) {
+                    checkpointStop.store(true, std::memory_order_relaxed);
+                    if (checkpointThread.joinable()) checkpointThread.join();
+                }
 
                 report.sourceOk =
                     cr.sourceStatus == ConcurrentComparer::WorkerStatus::Success;
@@ -793,9 +923,15 @@ ScanReport ScanController::run(const ScanOptions& options) {
         // Session capture: every finalized row (identicals included) is
         // observed for the journal. Null otherwise (zero overhead).
         if (haveSessionOut) comparer.setRowSink(&rowSink);
+        if (checkpointOn) {
+            checkpointUsed = true;
+            checkpointStop.store(false, std::memory_order_relaxed);
+            checkpointThread = std::thread(pumpMain);
+        }
 
         const IFileEnumerator::ProgressCallback enumProgress =
             [&](uint64_t files, uint64_t dirs, uint64_t bytes, const std::wstring& path) {
+                maybeRequestCheckpoint();
                 emitProgress(ScanPhase::CompareDestination, files, dirs, bytes, path,
                              comparer.matchTable());
             };
@@ -803,6 +939,7 @@ ScanReport ScanController::run(const ScanOptions& options) {
         double compareHashSeconds = 0.0;
         bool hashing = false;
         const auto hashProgress = [&](uint64_t done, uint64_t total) {
+            maybeRequestCheckpoint();
             if (!hashing) {
                 hashing = true;
                 hashStart = NowSeconds();
@@ -819,6 +956,10 @@ ScanReport ScanController::run(const ScanOptions& options) {
         ConcurrentComparer::Result cr = comparer.run(hashPool, enumProgress, hashProgress,
                                                      cache.get());
         hashThreadsActive.store(0, std::memory_order_relaxed);
+        if (checkpointOn) {
+            checkpointStop.store(true, std::memory_order_relaxed);
+            if (checkpointThread.joinable()) checkpointThread.join();
+        }
 
         if (!sourceFromIndex) {
             report.sourceOk = cr.sourceStatus == ConcurrentComparer::WorkerStatus::Success;
@@ -857,8 +998,9 @@ ScanReport ScanController::run(const ScanOptions& options) {
     // rows from enumeration carry no fingerprints and are rediscovered on
     // resume instead of being journaled.
     // ---------------------------------------------------------------------
-    if (haveSessionOut && report.sourceOk && report.destinationOk &&
-        !(options.cancel && options.cancel->load())) {
+    // Full-session context for the one-shot save path (stats/progress from the
+    // final report; the journal is filled by the caller).
+    auto buildFinalSession = [&](session::SessionState state) {
         session::ScanSession sess;
         sess.sessionId = session::GenerateSessionId();
         sess.createdAtUnix = session::NowUnixSeconds();
@@ -869,31 +1011,86 @@ ScanReport ScanController::run(const ScanOptions& options) {
         sess.settings.backend = BackendName(options.backend);
         sess.settings.verify = report.verify;
         sess.settings.hashThreads = options.hashThreads;
-        sess.state = session::SessionState::Completed;
+        sess.state = state;
         sess.progressA = {report.results.stats.sourceFiles, report.results.stats.sourceDirs,
                           report.results.stats.bytesSource};
         sess.progressB = {report.results.stats.destFiles, report.results.stats.destDirs,
                           report.results.stats.bytesDest};
         sess.stats = report.results.stats;
-        sess.checkpoint = {0, sess.createdAtUnix};
-        sess.journal = std::move(sessionReusedEntries);
-        for (ClassifiedRow& row : rowSink.take())
-            sess.journal.push_back(session::ToJournalEntry(row));
-        std::wstring serr;
-        report.sessionSaved = session::SaveSession(options.sessionOut, sess, serr);
-        if (report.sessionSaved) {
-            report.sessionPath = options.sessionOut;
+        sess.checkpoint = {checkpointSeq, sess.createdAtUnix};
+        return sess;
+    };
+
+    if (haveSessionOut && report.sourceOk && report.destinationOk &&
+        !(options.cancel && options.cancel->load())) {
+        if (checkpointUsed) {
+            // Incremental final: the pump already flushed the prefix; append
+            // the tail and mark the session completed (bounded memory: flushed
+            // rows were freed after each append).
+            if (doCheckpoint(session::SessionState::Completed)) {
+                report.sessionSaved = true;
+                report.sessionPath = options.sessionOut;
+            } else {
+                FileResult r;
+                r.status = Status::ReadError;
+                r.isDirectory = true;
+                r.errorMessage = L"salvataggio sessione fallito: " + checkpointError;
+                report.results.problems.push_back(std::move(r));
+                ++report.results.stats.readErrors;
+            }
         } else {
-            FileResult r;
-            r.status = Status::ReadError;
-            r.isDirectory = true;
-            r.errorMessage = L"salvataggio sessione fallito: " + serr;
-            report.results.problems.push_back(std::move(r));
-            ++report.results.stats.readErrors;
+            session::ScanSession sess = buildFinalSession(session::SessionState::Completed);
+            sess.journal = std::move(sessionReusedEntries);
+            for (ClassifiedRow& row : rowSink.take())
+                sess.journal.push_back(session::ToJournalEntry(row));
+            std::wstring serr;
+            report.sessionSaved = session::SaveSession(options.sessionOut, sess, serr);
+            if (report.sessionSaved) {
+                report.sessionPath = options.sessionOut;
+            } else {
+                FileResult r;
+                r.status = Status::ReadError;
+                r.isDirectory = true;
+                r.errorMessage = L"salvataggio sessione fallito: " + serr;
+                report.results.problems.push_back(std::move(r));
+                ++report.results.stats.readErrors;
+            }
         }
     } else if (haveSessionOut) {
-        report.notes.push_back(L"sessione non salvata: scansione incompleta o interrotta");
+        // Best-effort interrupted save (Phase 2): finalized rows survive
+        // cancellation and can be resumed later. Cancelled hash tasks produce
+        // no rows by construction, so everything journaled is complete.
+        const bool cancelled = options.cancel && options.cancel->load(std::memory_order_relaxed);
+        bool interruptedSaved = false;
+        if (cancelled) {
+            if (checkpointUsed) {
+                if (!checkpointPending.empty() || rowSink.size() > 0)
+                    interruptedSaved = doCheckpoint(session::SessionState::Interrupted);
+            } else {
+                std::vector<ClassifiedRow> rows = rowSink.take();
+                if (!sessionReusedEntries.empty() || !rows.empty()) {
+                    session::ScanSession sess =
+                        buildFinalSession(session::SessionState::Interrupted);
+                    sess.journal = std::move(sessionReusedEntries);
+                    for (ClassifiedRow& row : rows)
+                        sess.journal.push_back(session::ToJournalEntry(row));
+                    std::wstring serr;
+                    interruptedSaved = session::SaveSession(options.sessionOut, sess, serr);
+                    if (!interruptedSaved)
+                        report.notes.push_back(L"salvataggio interrotto fallito: " + serr);
+                }
+            }
+        }
+        if (interruptedSaved) {
+            report.sessionSaved = true;
+            report.sessionPath = options.sessionOut;
+            report.notes.push_back(L"sessione interrotta salvata: riprendere con --resume");
+        } else {
+            report.notes.push_back(L"sessione non salvata: scansione incompleta o interrotta");
+        }
     }
+    if (checkpointUsed && !checkpointError.empty())
+        report.notes.push_back(L"avvisi checkpoint: " + checkpointError);
 
     // Publish the slowest-directories tops as plain data (the live profilers
     // hold a mutex and never cross the report boundary). Done before the

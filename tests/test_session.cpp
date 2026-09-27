@@ -404,6 +404,24 @@ TEST("session: session ids are unique", [] {
     CHECK(GenerateSessionId() != GenerateSessionId());
 });
 
+TEST("session: checkpoint trigger predicate", [] {
+    // Row-count trigger (0 disables).
+    CHECK(!ShouldCheckpoint(9, 10, 1000, 0, 0));
+    CHECK(ShouldCheckpoint(10, 10, 1000, 0, 0));
+    CHECK(ShouldCheckpoint(25, 10, 1000, 0, 0));
+    CHECK(!ShouldCheckpoint(1000000, 0, 1000, 0, 0));
+    // Time trigger (0 disables; boundary is inclusive).
+    CHECK(!ShouldCheckpoint(0, 0, 29, 0, 30));
+    CHECK(ShouldCheckpoint(0, 0, 30, 0, 30));
+    CHECK(ShouldCheckpoint(0, 0, 61, 31, 30));
+    CHECK(!ShouldCheckpoint(0, 0, 1000, 0, 0));
+    // Clock skew (now < last) never triggers.
+    CHECK(!ShouldCheckpoint(0, 0, 50, 100, 30));
+    // Either trigger suffices.
+    CHECK(ShouldCheckpoint(10, 10, 0, 0, 3600));
+    CHECK(ShouldCheckpoint(0, 100, 3600, 0, 3600));
+});
+
 TEST("session: benchmark 100k journal round-trip", [] {
     TempDir tmp;
     const std::wstring dir = tmp.path;

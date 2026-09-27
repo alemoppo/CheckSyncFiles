@@ -71,5 +71,12 @@ bool PlanResume(const ResumeInput& in, ResumePlan& out, std::string& detail);
 // Converts a captured row into a journal entry (session save path).
 JournalEntry ToJournalEntry(const ClassifiedRow& row);
 
+// Adds one journaled row's stats contributions with engine-compatible counting
+// (mirrors onEntry + ClassifyMatched + hash outcomes + finalizeMissingExtra).
+// Side presence/types/sizes are caller-provided: current entries at plan time,
+// captured-row data at checkpoint time. The verdict counters come from `e`.
+void AccumulateJournalStats(Stats& st, const JournalEntry& e, bool hasA, bool aIsDir,
+                            uint64_t aSize, bool hasB, bool bIsDir, uint64_t bSize);
+
 } // namespace session
 } // namespace bv

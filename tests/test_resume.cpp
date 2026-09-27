@@ -4,9 +4,12 @@
 // Soundness invariant checked throughout: a resumed run produces results
 // IDENTICAL to a fresh run over the same trees (same stats, same problems).
 
+#include <atomic>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <iostream>
+#include <random>
 #include <string>
 
 #define WIN32_LEAN_AND_MEAN
@@ -103,7 +106,8 @@ bool ProblemsEqual(const std::vector<FileResult>& a, const std::vector<FileResul
 ScanReport RunScan(const std::wstring& src, const std::wstring& dst, ScanMode mode,
                    const std::wstring& sessionOut = L"",
                    const std::wstring& resumeFrom = L"", int verifyPercent = 100,
-                   PartialPattern pattern = PartialPattern::Edges) {
+                   PartialPattern pattern = PartialPattern::Edges, uint64_t checkpointRows = 0,
+                   uint64_t checkpointSecs = 0, unsigned threads = 0) {
     ScanOptions opts;
     opts.source = src;
     opts.destination = dst;
@@ -112,6 +116,9 @@ ScanReport RunScan(const std::wstring& src, const std::wstring& dst, ScanMode mo
     opts.resumeFrom = resumeFrom;
     opts.verifyLevel.percent = verifyPercent;
     opts.verifyLevel.pattern = pattern;
+    opts.checkpointRows = checkpointRows;
+    opts.checkpointSecs = checkpointSecs;
+    opts.hashThreads = threads;
     return ScanController(false).run(opts);
 }
 
@@ -386,6 +393,148 @@ TEST("resume: partial verify round-trips under identical settings", [] {
     // Random is resolved per run, so only the deterministic pattern is used here.
     ScanReport fresh = RunScan(src, dst, ScanMode::Content, L"", L"", 50, PartialPattern::Edges);
     CHECK(StatsEqual(resumed.results.stats, fresh.results.stats));
+});
+
+TEST("resume: aggressive checkpointing stays correct under race", [] {
+    // checkpointRows=1 maximizes pump/final interleaving. Loop several times:
+    // correctness must hold whether or not the background thread fires.
+    for (int iter = 0; iter < 5; ++iter) {
+        TempDir tmp;
+        const std::wstring src = MakeTwinTrees(tmp.path);
+        const std::wstring dst = tmp.path + L"\\dst";
+        const std::wstring base = tmp.path + L"\\sess";
+        ScanReport r = RunScan(src, dst, ScanMode::Content, base, L"", 100,
+                               PartialPattern::Edges, 1 /*checkpointRows*/);
+        CHECK(r.sourceOk);
+        CHECK(r.destinationOk);
+        CHECK(r.sessionSaved);
+        ScanReport fresh = RunScan(src, dst, ScanMode::Content);
+        CHECK(StatsEqual(r.results.stats, fresh.results.stats));
+        CHECK(ProblemsEqual(r.results.problems, fresh.results.problems));
+        ScanSession loaded;
+        LoadOutcome o = LoadSession(base, loaded);
+        CHECK(o.ok);
+        CHECK(!o.journalTruncated);
+        CHECK(loaded.state == SessionState::Completed);
+        CHECK(o.journalRecovered == loaded.journal.size());
+        CHECK(!loaded.journal.empty());
+    }
+});
+
+TEST("resume: cancelled run saves an interrupted session that resumes cleanly", [] {
+    TempDir tmp;
+    const std::wstring src = MakeTwinTrees(tmp.path);
+    const std::wstring dst = tmp.path + L"\\dst";
+    const std::wstring base = tmp.path + L"\\sess";
+    // Cancel once hashing starts: matched rows already exist, pending hash
+    // verdicts are dropped by construction (never fabricated).
+    std::atomic_bool cancel{false};
+    int progressCalls = 0;
+    ScanOptions opts;
+    opts.source = src;
+    opts.destination = dst;
+    opts.mode = ScanMode::Content;
+    opts.sessionOut = base;
+    opts.cancel = &cancel;
+    opts.onProgress = [&](const ScanProgress& p) {
+        ++progressCalls;
+        if (p.phase == ScanPhase::Hashing || progressCalls > 30) cancel.store(true);
+    };
+    ScanReport interrupted = ScanController(false).run(opts);
+    CHECK(progressCalls > 0);
+    CHECK(interrupted.sessionSaved);
+    ScanSession loaded;
+    LoadOutcome o = LoadSession(base, loaded);
+    CHECK(o.ok);
+    CHECK(!o.journalTruncated);
+    CHECK(loaded.state == SessionState::Interrupted);
+    CHECK(!loaded.journal.empty());
+    // Resume the interrupted session: must equal a fresh uninterrupted run.
+    ScanReport resumed = RunScan(src, dst, ScanMode::Content, L"", base);
+    CHECK(resumed.sourceOk);
+    CHECK(resumed.destinationOk);
+    CHECK(resumed.usedSession);
+    ScanReport fresh = RunScan(src, dst, ScanMode::Content);
+    CHECK(StatsEqual(resumed.results.stats, fresh.results.stats));
+    CHECK(ProblemsEqual(resumed.results.problems, fresh.results.problems));
+});
+
+TEST("resume: periodic checkpoints fire mid-run", [] {
+    // Long enough run (>150ms anywhere) that the 100ms pump wakes at least
+    // once mid-run: checkpoint.seq >= 2 proves a periodic AppendJournal ran
+    // before the incremental final save (seq == 1 would mean final-only).
+    TempDir tmp;
+    const std::wstring src = tmp.path + L"\\src";
+    const std::wstring dst = tmp.path + L"\\dst";
+    fs::create_directories(fs::path(src));
+    // Real (non-sparse) content so hashing takes longer than the 100ms pump
+    // slice: sparse files hash in milliseconds and the run would end before
+    // the pump ever wakes.
+    std::string chunk(65536, '\0');
+    {
+        std::mt19937 rng(12345);
+        for (char& c : chunk) c = static_cast<char>(rng() & 0xFF);
+    }
+    for (int i = 0; i < 24; ++i) {
+        wchar_t name[32];
+        swprintf(name, 32, L"big%02d.bin", i);
+        std::ofstream f(fs::path(src + L"\\" + name), std::ios::binary | std::ios::trunc);
+        CHECK(static_cast<bool>(f));
+        for (int k = 0; k < 192; ++k) f.write(chunk.data(), chunk.size()); // 12 MiB
+        f.flush();
+        CHECK(static_cast<bool>(f));
+    }
+    std::error_code ec;
+    fs::copy(fs::path(src), fs::path(dst), fs::copy_options::recursive, ec);
+    CHECK(!ec);
+    const std::wstring base = tmp.path + L"\\sess";
+    // Single hash thread stretches the run well past the 100ms pump slice on
+    // any hardware (576 MiB hashed serially), so periodic checkpoints must fire.
+    ScanReport r = RunScan(src, dst, ScanMode::Content, base, L"", 100,
+                           PartialPattern::Edges, 5 /*checkpointRows*/, 0, 1 /*threads*/);
+    CHECK(r.sourceOk);
+    CHECK(r.destinationOk);
+    CHECK(r.sessionSaved);
+    ScanSession loaded;
+    LoadOutcome o = LoadSession(base, loaded);
+    CHECK(o.ok);
+    CHECK(!o.journalTruncated);
+    CHECK(loaded.state == SessionState::Completed);
+    CHECK(loaded.checkpoint.seq >= 2u);
+    CHECK(o.journalRecovered == loaded.journal.size());
+    CHECK(!loaded.journal.empty());
+    ScanReport fresh = RunScan(src, dst, ScanMode::Content);
+    CHECK(StatsEqual(r.results.stats, fresh.results.stats));
+    CHECK(ProblemsEqual(r.results.problems, fresh.results.problems));
+});
+
+TEST("resume: checkpoint overhead is bounded (informational)", [] {
+    TempDir tmp;
+    const std::wstring src = tmp.path + L"\\src";
+    const std::wstring dst = tmp.path + L"\\dst";
+    CHECK(testgen::CreateStressTree(src, 600) == 600u);
+    std::error_code ec;
+    fs::copy(fs::path(src), fs::path(dst), fs::copy_options::recursive, ec);
+    CHECK(!ec);
+    const std::wstring base = tmp.path + L"\\sess";
+    const auto t0 = std::chrono::steady_clock::now();
+    ScanReport plain = RunScan(src, dst, ScanMode::Content);
+    const auto t1 = std::chrono::steady_clock::now();
+    ScanReport checked =
+        RunScan(src, dst, ScanMode::Content, base, L"", 100, PartialPattern::Edges, 60);
+    const auto t2 = std::chrono::steady_clock::now();
+    CHECK(checked.sessionSaved);
+    CHECK(StatsEqual(checked.results.stats, plain.results.stats));
+    CHECK(ProblemsEqual(checked.results.problems, plain.results.problems));
+    ScanSession loaded;
+    CHECK(LoadSession(base, loaded).ok);
+    const auto plainMs = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
+    const auto checkedMs = std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count();
+    const uint64_t ncp = loaded.checkpoint.seq > 0 ? loaded.checkpoint.seq : 1;
+    std::cout << "  [bench] checkpoint overhead: plain " << plainMs << " ms, checkpointed "
+              << checkedMs << " ms over " << ncp << " checkpoints (~"
+              << (checkedMs > plainMs ? (checkedMs - plainMs) / ncp : 0) << " ms/checkpoint)\n";
+    CHECK(checkedMs < 4 * plainMs + 5000);
 });
 
 TEST("resume: hand-crafted error rows are re-verified, never reused", [] {

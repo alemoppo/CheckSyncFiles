@@ -90,6 +90,15 @@ uint64_t NowUnixSeconds() {
                                      .count());
 }
 
+bool ShouldCheckpoint(size_t rowsSinceCheckpoint, uint64_t rowsEvery, uint64_t nowSecs,
+                      uint64_t lastCheckpointSecs, uint64_t secsEvery) {
+    if (rowsEvery > 0 && rowsSinceCheckpoint >= rowsEvery) return true;
+    if (secsEvery > 0 && nowSecs >= lastCheckpointSecs &&
+        nowSecs - lastCheckpointSecs >= secsEvery)
+        return true;
+    return false;
+}
+
 const char* SessionStateName(SessionState s) {
     switch (s) {
         case SessionState::InProgress: return "in_progress";

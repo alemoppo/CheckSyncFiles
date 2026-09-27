@@ -49,5 +49,11 @@ uint64_t NowUnixSeconds();
 
 const char* SessionStateName(SessionState s);
 
+// Pure checkpoint-trigger predicate (Phase 2): true when a checkpoint is due
+// by row count (rowsEvery == 0 disables) or by elapsed time (secsEvery == 0
+// disables). All time values in the same unit (seconds).
+bool ShouldCheckpoint(size_t rowsSinceCheckpoint, uint64_t rowsEvery, uint64_t nowSecs,
+                      uint64_t lastCheckpointSecs, uint64_t secsEvery);
+
 } // namespace session
 } // namespace bv

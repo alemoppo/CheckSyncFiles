@@ -375,8 +375,16 @@ bv_cli --source <path> --dest <path> [--mode presence|size|content]
        [--verify-percent <1-100>] [--verify-pattern edges|center|random]
         [--snapshot-out <file>] [--compare <snapshot>] [--hash-cache <file>]
         [--session-out <base>] [--resume <base>]
+        [--checkpoint-rows <N>] [--checkpoint-secs <N>]
         [--export <file>] [--export-format csv|json] [--help]
 ```
+
+During a long scan with `--session-out`, `--checkpoint-rows N` and/or
+`--checkpoint-secs N` flush finalized rows to the session files periodically,
+so a crash, reboot or cancellation loses at most one interval of work; the
+interrupted session stays resumable with `--resume`. Cancelling a run with an
+active `--session-out` still saves whatever was finalized (`Interrupted`
+state).
 
 Examples:
 

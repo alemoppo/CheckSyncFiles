@@ -30,27 +30,29 @@ bool UnderAnyErrorDir(const std::wstring& rel, const std::vector<std::wstring>& 
     return false;
 }
 
+} // namespace
+
 // Mirrors the engine's per-entry + per-verdict counting (onEntry +
 // ClassifyMatched + hash outcomes + finalizeMissingExtra) so merged stats are
 // indistinguishable from a fresh run's. Side file/dir/byte counts come from
-// the CURRENT entries (exact per-side types, including file/dir SizeMismatch
-// pairs); the verdict counters come from the journaled verdict.
-void AccumulateReuseStats(Stats& st, const JournalEntry& e, const FileEntry& curA, bool hasA,
-                          const FileEntry& curB, bool hasB) {
+// the caller-provided observations (exact per-side types, including file/dir
+// SizeMismatch pairs); the verdict counters come from the journaled verdict.
+void AccumulateJournalStats(Stats& st, const JournalEntry& e, bool hasA, bool aIsDir,
+                            uint64_t aSize, bool hasB, bool bIsDir, uint64_t bSize) {
     if (hasA) {
-        if (curA.isDirectory) {
+        if (aIsDir) {
             ++st.sourceDirs;
         } else {
             ++st.sourceFiles;
-            st.bytesSource += curA.size;
+            st.bytesSource += aSize;
         }
     }
     if (hasB) {
-        if (curB.isDirectory) {
+        if (bIsDir) {
             ++st.destDirs;
         } else {
             ++st.destFiles;
-            st.bytesDest += curB.size;
+            st.bytesDest += bSize;
         }
     }
     switch (e.verdict) {
@@ -75,6 +77,8 @@ void AccumulateReuseStats(Stats& st, const JournalEntry& e, const FileEntry& cur
         case Status::ChangedDuringScan: break; // never reused (see PlanResume)
     }
 }
+
+namespace {
 
 // Rebuilds the display row for a reused non-identical entry. Roots follow the
 // engine's fullPath convention (Missing -> source, Extra/SizeMismatch ->
@@ -240,7 +244,8 @@ bool PlanResume(const ResumeInput& in, ResumePlan& out, std::string& detail) {
         }
         ++plan.reused;
         plan.reusedEntries.push_back(e);
-        AccumulateReuseStats(plan.reusedStats, e, curA, expectA, curB, expectB);
+        AccumulateJournalStats(plan.reusedStats, e, expectA, curA.isDirectory, curA.size,
+                               expectB, curB.isDirectory, curB.size);
         if (e.verdict != Status::Identical && e.verdict != Status::IdenticalPartial)
             plan.reusedProblems.push_back(ReusedFileResult(e, in.rootA, in.rootB));
     }
