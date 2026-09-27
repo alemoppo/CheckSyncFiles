@@ -370,7 +370,8 @@ The code uses only standard C++17 + Win32 APIs.
 
 ```text
 bv_cli --source <path> --dest <path> [--mode presence|size|content]
-       [--case-sensitive] [--enum auto|win32|mft] [--list-problems [--limit N]]
+       [--case-sensitive] [--enum auto|win32|mft] [--threads N] [--progress]
+       [--list-problems [--limit N]] [--profile-hash] [--profile-hash-jobs N]
        [--verify-percent <1-100>] [--verify-pattern edges|center|random]
        [--snapshot-out <file>] [--compare <snapshot>] [--hash-cache <file>]
        [--export <file>] [--export-format csv|json] [--help]
@@ -412,28 +413,33 @@ src/
   UI/AppUI.{h,cpp}        SDL3 GUI (render, input, scan thread)
   UI/Utf.{h,cpp}          UTF-8/16 conversion for SDL
   Threading/ThreadPool.{h,cpp}, IoClass.h
-  Filesystem/
-    FileEntry.h           entry record
-    FileIndex.h/.cpp      in-memory index (case policy)
-    FileIndexSerializer.h/.cpp  binary BVSI snapshot (Phase 5)
-    FileEnumerator.h      scanner interface
-    Win32Enumerator.cpp   FindFirstFile/Win32 enumeration
-    MftEnumerator.cpp     raw NTFS MFT enumeration (Phase 4)
-    PathUtil.h/.cpp       path normalization, \\?\ prefix, case folding
-  Comparison/
-    ScanMode.h            Presence / Size / Content
-    ComparisonResult.h    Status, FileResult (with fullPath: dest for Extra, source for Missing,
-                          failed side for errors), Stats, ResultSet
-    FileComparator.h/.cpp live and offline comparison (Phase 5)
   Hashing/
     Sha256.cpp            SHA-256 CNG/BCrypt (Phase 3)
     HashCache.h/.cpp      persistent SHA-256 cache (Phase 5)
-  Export/
-    ExportUtil.h/.cpp     token, CSV/JSON escaping, hex digest, format inference
-    CsvExporter.h/.cpp    CSV export (UTF-8 BOM) (Phase 5)
-    JsonExporter.h/.cpp   streaming JSON export (Phase 5)
+    HashUtil.h            hash computation utilities
+    PartialRead.h         partial content read planning (Phase 5)
+    ConcurrentComparer.h  concurrent comparison shard management
+  Comparison/
+    ScanMode.h            Presence / Size / Content
+    ComparisonResult.h    Status, FileResult (with fullPath: dest for Extra,
+                          source for Missing, failed side for errors),
+                          Stats, ResultSet
+    FileComparator.h/.cpp live and offline comparison (Phase 5)
+    ConcurrentComparer.h  per-shard concurrent comparison orchestration
+    MatchTable.h          live match table with throttle, backpressure,
+                          cancellation and pending/peak tracking
+  ScanOrchestrator.h/.cpp scan lifecycle: start/finish/cancel/reap workers
+  Util/
+    StrictNumbers.h       strict numeric parsing, overflow protection
 tests/
   TestHarness.h, TestTree.h/.cpp, test_main.cpp
+  test_hash.cpp           hash unit tests (Phase 3)
+  test_orchestrator.cpp   orchestrator test suite (Phase 5)
+  test_pathutil.cpp       path utility unit tests
+  test_index.cpp          file index case-policy unit tests
+  test_threadpool.cpp     thread pool unit tests
+  test_scan.cpp           enumeration and compare unit tests
+  test_mft.cpp            MFT synthetic parser and merge unit tests (Phase 4)
 tools/
   testgen.cpp, mftbench.cpp, mftprobe.cpp, mftdiag.cpp
 ```
