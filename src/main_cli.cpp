@@ -183,15 +183,17 @@ bool ParseArgs(int argc, wchar_t** argv, Args& out) {
     if (out.help) return true;
 
     if (!out.resumeFrom.empty()) {
+        // Offline resume (--compare): source from the snapshot, like --compare.
         if (!out.compareFrom.empty()) {
-            std::wcerr << L"Errore: --resume e --compare sono mutuamente esclusivi.\n\n";
-            return false;
-        }
-        if (!out.snapshotOut.empty()) {
-            std::wcerr << L"Errore: --resume e --snapshot-out sono mutuamente esclusivi.\n\n";
-            return false;
-        }
-        if (out.source.empty() || out.dest.empty()) {
+            if (!out.source.empty()) {
+                std::wcerr << L"Errore: con --compare non si usa --source.\n\n";
+                return false;
+            }
+            if (out.dest.empty()) {
+                std::wcerr << L"Errore: --resume con --compare richiede --dest.\n\n";
+                return false;
+            }
+        } else if (out.source.empty() || out.dest.empty()) {
             std::wcerr << L"Errore: --resume richiede --source e --dest.\n\n";
             return false;
         }

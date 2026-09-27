@@ -18,6 +18,7 @@
 #include "Filesystem/PathUtil.h"
 #include "Filesystem/Win32Enumerator.h"
 #include "Hashing/HashCache.h"
+#include "Hashing/HashUtil.h"
 #include "Hashing/Sha256.h"
 #include "Session/ResumePlan.h"
 #include "Session/SessionLogic.h"
@@ -254,14 +255,15 @@ ScanReport ScanController::run(const ScanOptions& options) {
         ++report.results.stats.readErrors;
         return report;
     }
-    // Phase 1 resume is live-live only, and session capture during a resumed
-    // run is a Fase 2 item: both combinations fail fast with a clear message.
-    if (haveResume && haveCompare)
-        return ConfigError(options.mode, L"--resume e --compare sono mutuamente esclusivi");
-    if (haveResume && haveSnapshot)
-        return ConfigError(options.mode, L"--resume e --snapshot-out sono mutuamente esclusivi");
-    if (haveResume && (options.source.empty() || options.destination.empty()))
-        return ConfigError(options.mode, L"--resume richiede --source e --dest");
+    // Phase 4: resume combines with snapshot capture (refresh the snapshot
+    // from the current source while verifying) and with offline compare
+    // (source from a snapshot, destination live). A resume always needs the
+    // destination; the live source is needed unless the source comes from a
+    // snapshot.
+    if (haveResume && options.destination.empty())
+        return ConfigError(options.mode, L"--resume richiede --dest");
+    if (haveResume && !haveCompare && options.source.empty())
+        return ConfigError(options.mode, L"--resume richiede --source");
 
     ScanMode mode = options.mode;
 
@@ -662,10 +664,12 @@ ScanReport ScanController::run(const ScanOptions& options) {
     }
 
     if (haveResume) {
-        // Phase 1 resume: load the session, check compatibility, then
-        // enumerate BOTH sides fully. PlanResume (destination pass) splits the
-        // journal into reusable rows and remainder sets from these indexes.
-        // (Exclusive with haveCompare/haveSnapshot by validation above.)
+        // Phase 4 resume: load the session, check compatibility, then provide
+        // both sides as full indexes. The live source is enumerated here,
+        // unless it already came from a snapshot (offline resume) or was
+        // captured above (resume + snapshot-out). The destination is always
+        // enumerated live. PlanResume (destination pass) splits the journal
+        // into reusable rows and remainder sets from these indexes.
         const auto resumeFail = [&](const std::wstring& message) {
             report.sourceOk = false;
             FileResult r;
@@ -702,20 +706,9 @@ ScanReport ScanController::run(const ScanOptions& options) {
                         const std::wstring& path) {
                         emitProgress(ScanPhase::CompareDestination, files, dirs, bytes, path);
                     };
-                SideBuild buildA = BuildSideIndex(sourceIndex, options.source, acceptMft,
-                                                  &dirTiming.a, sourceProgress, options.cancel);
-                report.sourceOk = buildA.ok;
-                report.results.stats.sourceFiles = buildA.build.stats.files;
-                report.results.stats.sourceDirs = buildA.build.stats.dirs;
-                report.results.stats.bytesSource = buildA.build.stats.bytes;
-                report.secondsEnumerateSource = NowSeconds() - t1;
-                for (const ScanError& err : buildA.build.errors)
-                    resumeErrA.push_back(err.path);
-                if (options.cancel && options.cancel->load()) report.sourceOk = false;
-                // Enumeration errors above are NOT converted to result rows:
-                // the remainder pass re-traverses the same directories and
-                // rediscovers them (converting here would duplicate them).
-                if (report.sourceOk) {
+                // The destination is always enumerated live: resume needs the
+                // current fingerprints on side B.
+                const auto buildDest = [&]() {
                     const double t2 = NowSeconds();
                     SideBuild buildB =
                         BuildSideIndex(destIndex, options.destination, acceptMft, &dirTiming.b,
@@ -731,6 +724,28 @@ ScanReport ScanController::run(const ScanOptions& options) {
                         report.sourceOk = false;
                         report.destinationOk = false;
                     }
+                };
+                if (haveCompare || haveSnapshot) {
+                    // sourceIndex is already ready: loaded from the snapshot
+                    // (offline) or captured above (which also hashed it when
+                    // requested). Only the destination still needs a pass.
+                    if (report.sourceOk) buildDest();
+                } else {
+                    SideBuild buildA =
+                        BuildSideIndex(sourceIndex, options.source, acceptMft, &dirTiming.a,
+                                       sourceProgress, options.cancel);
+                    report.sourceOk = buildA.ok;
+                    report.results.stats.sourceFiles = buildA.build.stats.files;
+                    report.results.stats.sourceDirs = buildA.build.stats.dirs;
+                    report.results.stats.bytesSource = buildA.build.stats.bytes;
+                    report.secondsEnumerateSource = NowSeconds() - t1;
+                    for (const ScanError& err : buildA.build.errors)
+                        resumeErrA.push_back(err.path);
+                    if (options.cancel && options.cancel->load()) report.sourceOk = false;
+                    // Enumeration errors above are NOT converted to result rows:
+                    // the remainder pass re-traverses the same directories and
+                    // rediscovers them (converting here would duplicate them).
+                    if (report.sourceOk) buildDest();
                 }
             }
         }
@@ -749,11 +764,14 @@ ScanReport ScanController::run(const ScanOptions& options) {
     //    enumerations and merges the reused journal rows afterwards.
     // ---------------------------------------------------------------------
     if (haveResume && report.sourceOk && !(options.cancel && options.cancel->load())) {
+        // Offline resume (--compare): the source device is absent; display
+        // roots come from the snapshot, like the offline pass above.
+        const std::wstring& resumeSourceRoot = haveCompare ? loadedRoot : options.source;
         session::ResumeInput input;
         input.session = &resumeSession;
         input.currentA = &sourceIndex;
         input.currentB = &destIndex;
-        input.rootA = options.source;
+        input.rootA = resumeSourceRoot;
         input.rootB = options.destination;
         input.errorDirsA = resumeErrA;
         input.errorDirsB = resumeErrB;
@@ -782,10 +800,22 @@ ScanReport ScanController::run(const ScanOptions& options) {
                 ThreadPool hashPool(mode == ScanMode::Content ? resolveHashThreads() : 0);
                 if (mode == ScanMode::Content)
                     report.hashThreadsUsed = hashPool.threadCount();
-                ConcurrentComparer comparer(caseSensitive_, mode, acceptMft, options.source,
-                                            options.destination,
-                                            ConcurrentComparer::SourceKind::Live, nullptr,
-                                            options.cancel, hashProf, &dirTiming, runLevel);
+                if (haveCompare) {
+                    // Offline resume: the source device is absent, so remainder
+                    // digests come from the snapshot index (full-read
+                    // semantics, like the offline pass).
+                    for (const auto& kv : plan.remainderA.entries()) {
+                        hashing::Digest d{};
+                        if (sourceIndex.getHash(kv.second.relativePath, d))
+                            plan.remainderA.setHash(kv.second.relativePath, d);
+                    }
+                }
+                ConcurrentComparer comparer(
+                    caseSensitive_, mode, acceptMft, resumeSourceRoot, options.destination,
+                    haveCompare ? ConcurrentComparer::SourceKind::FromIndex
+                                : ConcurrentComparer::SourceKind::Live,
+                    haveCompare ? &plan.remainderA : nullptr, options.cancel, hashProf,
+                    &dirTiming, runLevel);
                 if (haveSessionOut) comparer.setRowSink(&rowSink);
                 if (checkpointOn) {
                     // Reused rows enter the pending queue so the incremental
@@ -804,10 +834,6 @@ ScanReport ScanController::run(const ScanOptions& options) {
                                         ? kv.second.relativePath
                                         : pathutil::FoldForCompare(kv.second.relativePath));
                 }
-                ConcurrentComparer::EnumeratorFactory srcFactory = [&plan]() {
-                    return std::unique_ptr<IFileEnumerator>(
-                        new IndexEnumerator(&plan.remainderA));
-                };
                 auto destFactoryFor = [&](bool useMft) {
                     return [&, useMft]() -> std::unique_ptr<IFileEnumerator> {
                         std::unique_ptr<IFileEnumerator> inner =
@@ -819,7 +845,16 @@ ScanReport ScanController::run(const ScanOptions& options) {
                     };
                 };
                 std::vector<ConcurrentComparer::NamedFactory> srcFs;
-                srcFs.push_back({L"indice sessione", std::move(srcFactory)});
+                if (!haveCompare) {
+                    ConcurrentComparer::EnumeratorFactory srcFactory = [&plan]() {
+                        return std::unique_ptr<IFileEnumerator>(
+                            new IndexEnumerator(&plan.remainderA));
+                    };
+                    srcFs.push_back({L"indice sessione", std::move(srcFactory)});
+                }
+                // Offline resume: the source side is fed from the remainder
+                // index by runIndexWorker (sourceKind FromIndex); srcFs stays
+                // empty and unused.
                 std::vector<ConcurrentComparer::NamedFactory> dstFs;
                 if (acceptMft) {
                     dstFs.push_back({L"MFT", destFactoryFor(true)});

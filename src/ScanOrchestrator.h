@@ -50,6 +50,10 @@ public:
         bool lastSessionSaved = false; // last run wrote a session file
         uint64_t lastSessionReused = 0;
         uint64_t lastSessionStale = 0;
+        // Checkpoint knobs applied to armed session runs (0 = that trigger
+        // off; both 0 = save at the end only). Defaults: 1000 rows / 30 s.
+        uint64_t checkpointRows = 1000;
+        uint64_t checkpointSecs = 30;
 
         bool running = false;
         bool resultsReady = false;
@@ -115,6 +119,9 @@ public:
     // clears a previously armed snapshot (mutually exclusive).
     void loadResumeSession(std::wstring file);
     void clearResume();
+    // Checkpoint intervals for armed session runs (0 disables that trigger).
+    void setCheckpointRows(uint64_t n);
+    void setCheckpointSecs(uint64_t n);
 
     // -- Single-file re-verification ("Riscansiona") -------------------------
     // Raw GUI-side settings for one single-file check. Everything the worker
@@ -208,6 +215,8 @@ private:
     std::wstring sessionOut_;
     bool useResume_ = false;
     std::wstring resumeFile_;
+    uint64_t checkpointRows_ = 1000;
+    uint64_t checkpointSecs_ = 30;
     bool lastUsedSession_ = false;
     bool lastSessionSaved_ = false;
     uint64_t lastSessionReused_ = 0;

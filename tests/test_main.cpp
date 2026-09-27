@@ -5125,6 +5125,12 @@ TEST("orchestrator: session-out run saves a loadable session", [] {
     orch.setDest(dst);
     orch.setSessionOut(base);
     CHECK(orch.snapshot().sessionOut == base);
+    CHECK(orch.snapshot().checkpointRows == 1000u);
+    CHECK(orch.snapshot().checkpointSecs == 30u);
+    orch.setCheckpointRows(100);
+    orch.setCheckpointSecs(0);
+    CHECK(orch.snapshot().checkpointRows == 100u);
+    CHECK(orch.snapshot().checkpointSecs == 0u);
     CHECK(orch.startLiveScan());
     CHECK_MSG(WaitForRunDone(orch, 30000), "session run did not finish");
 

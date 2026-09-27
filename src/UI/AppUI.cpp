@@ -67,6 +67,39 @@ constexpr int kVerifySliderX = kVerifyMinusX + kVerifyBtnW + 8;
 constexpr int kVerifyPlusX = kVerifySliderX + kVerifySliderW + 8;
 constexpr int kVerifyCtlH = 22;
 
+// Checkpoint interval ladders (Phase 4): click -/+ to cycle fixed steps
+// (0 = that trigger off; both 0 = save at the end only). No text input.
+constexpr uint64_t kCkptRowsLadder[] = {0, 100, 500, 1000, 2500, 5000, 10000, 25000};
+constexpr size_t kCkptRowsN = sizeof(kCkptRowsLadder) / sizeof(kCkptRowsLadder[0]);
+constexpr uint64_t kCkptSecsLadder[] = {0, 10, 30, 60, 120, 300};
+constexpr size_t kCkptSecsN = sizeof(kCkptSecsLadder) / sizeof(kCkptSecsLadder[0]);
+uint64_t StepLadder(uint64_t cur, const uint64_t* ladder, size_t n, int dir) {
+    if (dir > 0) {
+        for (size_t i = 0; i < n; ++i)
+            if (ladder[i] > cur) return ladder[i];
+        return ladder[n - 1];
+    }
+    for (size_t i = n; i-- > 0;)
+        if (ladder[i] < cur) return ladder[i];
+    return ladder[0];
+}
+
+// Checkpoint row geometry (label + two -/value/+ steppers + hint).
+constexpr int kCkptX0 = kMargin + 110;
+constexpr int kCkptBtnW = 28;
+constexpr int kCkptGap = 6;
+constexpr int kCkptRowsValW = 70;
+constexpr int kCkptRowsMinusX = kCkptX0;
+constexpr int kCkptRowsValX = kCkptRowsMinusX + kCkptBtnW + kCkptGap;
+constexpr int kCkptRowsPlusX = kCkptRowsValX + kCkptRowsValW + kCkptGap;
+constexpr int kCkptSecsLblX = kCkptRowsPlusX + kCkptBtnW + 16;
+constexpr int kCkptSecsMinusX = kCkptSecsLblX + 34;
+constexpr int kCkptSecsValW = 60;
+constexpr int kCkptSecsValX = kCkptSecsMinusX + kCkptBtnW + kCkptGap;
+constexpr int kCkptSecsPlusX = kCkptSecsValX + kCkptSecsValW + kCkptGap;
+constexpr int kCkptHintX = kCkptSecsPlusX + kCkptBtnW + 16;
+constexpr int kCkptCtlH = 22;
+
 // Slider pixel -> 0..100 percent (clamped, rounded).
 int SliderPercentFromX(int mx) {
     const double frac =
@@ -87,6 +120,7 @@ struct Layout {
     // NOTE: no y4 — the thread-selection row was removed (Auto is resolved
     // from the IO class); y5 chains directly off y3b to leave no gap.
     int y1 = 0, y2 = 0, y3 = 0, y3b = 0, y5 = 0;
+    int yCkpt = 0; // Phase 4: checkpoint interval steppers (session armed)
     int y6 = 0, y7 = 0, y8 = 0, yList = 0, listBottom = 0, summaryY = 0;
     int metricsY = 0; // dedicated footer row for Tempo / Velocita
 
@@ -113,7 +147,8 @@ Layout ComputeLayout(int W, int H) {
     L.y3 = L.y2 + kFieldH + kGap + 8; // back-end selection row
     L.y3b = L.y3 + 30; // partial-verify pattern/percent row
     L.y5 = L.y3b + 30;
-    L.y6 = L.y5 + 40;
+    L.yCkpt = L.y5 + 40;
+    L.y6 = L.yCkpt + 28;
     L.y7 = L.y6 + 30;
     L.y8 = L.y7 + 32;
     L.yList = L.y8 + 34;
@@ -1017,6 +1052,40 @@ void AppUI::OnMouseDown(int mx, int my) {
     // NOTE: no thread-selection widgets. Thread count is Auto (resolved from
     // the IO class); manual override lives on as engine/CLI `--threads` only.
 
+    // Phase 4: checkpoint interval steppers (only while a session is armed
+    // and no scan is running; 0 = that trigger off).
+    {
+        const bool enabled = !st.sessionOut.empty() && !running;
+        const SDL_FRect rRowsMinus{static_cast<float>(kCkptRowsMinusX),
+                                   static_cast<float>(L.yCkpt), static_cast<float>(kCkptBtnW),
+                                   static_cast<float>(kCkptCtlH)};
+        const SDL_FRect rRowsPlus{static_cast<float>(kCkptRowsPlusX),
+                                  static_cast<float>(L.yCkpt), static_cast<float>(kCkptBtnW),
+                                  static_cast<float>(kCkptCtlH)};
+        const SDL_FRect rSecsMinus{static_cast<float>(kCkptSecsMinusX),
+                                   static_cast<float>(L.yCkpt), static_cast<float>(kCkptBtnW),
+                                   static_cast<float>(kCkptCtlH)};
+        const SDL_FRect rSecsPlus{static_cast<float>(kCkptSecsPlusX),
+                                  static_cast<float>(L.yCkpt), static_cast<float>(kCkptBtnW),
+                                  static_cast<float>(kCkptCtlH)};
+        if (enabled && hit(mx, my, rRowsMinus)) {
+            orch_.setCheckpointRows(StepLadder(st.checkpointRows, kCkptRowsLadder, kCkptRowsN, -1));
+            dirty_.store(true);
+        }
+        if (enabled && hit(mx, my, rRowsPlus)) {
+            orch_.setCheckpointRows(StepLadder(st.checkpointRows, kCkptRowsLadder, kCkptRowsN, +1));
+            dirty_.store(true);
+        }
+        if (enabled && hit(mx, my, rSecsMinus)) {
+            orch_.setCheckpointSecs(StepLadder(st.checkpointSecs, kCkptSecsLadder, kCkptSecsN, -1));
+            dirty_.store(true);
+        }
+        if (enabled && hit(mx, my, rSecsPlus)) {
+            orch_.setCheckpointSecs(StepLadder(st.checkpointSecs, kCkptSecsLadder, kCkptSecsN, +1));
+            dirty_.store(true);
+        }
+    }
+
     if (hit(mx, my, L.startBtn) && running) {
         orch_.stop();
         dirty_.store(true);
@@ -1782,6 +1851,50 @@ void AppUI::render(const bv::ScanOrchestrator::UiSnapshot& st) {
         }
         DrawTextVCenter(renderer_, fontBody_, "Contenuto completo",
                         kVerifyPlusX + kVerifyBtnW + 8, L.y3b, 26, kTextLo);
+    }
+
+    // Phase 4: checkpoint interval steppers (session armed only; 0 = off).
+    {
+        const bool enabled = !st.sessionOut.empty() && !running;
+        const RGBA labCol = enabled ? kTextHi : kTextLo;
+        DrawTextVCenter(renderer_, fontBody_, "Checkpoint: righe", kMargin, L.yCkpt, 26, labCol);
+        const auto stepper = [&](int x, const char* glyph, const SDL_FRect& r) {
+            const bool hov = enabled && hit(static_cast<int>(mx), static_cast<int>(my), r);
+            if (enabled)
+                DrawToggle(renderer_, fontBody_, glyph, x, L.yCkpt, kCkptBtnW, kCkptCtlH,
+                           false, hov);
+            else
+                DrawToggleDisabled(renderer_, fontBody_, glyph, x, L.yCkpt, kCkptBtnW,
+                                   kCkptCtlH);
+        };
+        const SDL_FRect rRowsMinus{static_cast<float>(kCkptRowsMinusX),
+                                   static_cast<float>(L.yCkpt), static_cast<float>(kCkptBtnW),
+                                   static_cast<float>(kCkptCtlH)};
+        const SDL_FRect rRowsPlus{static_cast<float>(kCkptRowsPlusX),
+                                  static_cast<float>(L.yCkpt), static_cast<float>(kCkptBtnW),
+                                  static_cast<float>(kCkptCtlH)};
+        const SDL_FRect rSecsMinus{static_cast<float>(kCkptSecsMinusX),
+                                   static_cast<float>(L.yCkpt), static_cast<float>(kCkptBtnW),
+                                   static_cast<float>(kCkptCtlH)};
+        const SDL_FRect rSecsPlus{static_cast<float>(kCkptSecsPlusX),
+                                  static_cast<float>(L.yCkpt), static_cast<float>(kCkptBtnW),
+                                  static_cast<float>(kCkptCtlH)};
+        stepper(kCkptRowsMinusX, "-", rRowsMinus);
+        stepper(kCkptRowsPlusX, "+", rRowsPlus);
+        stepper(kCkptSecsMinusX, "-", rSecsMinus);
+        stepper(kCkptSecsPlusX, "+", rSecsPlus);
+        const auto valueBox = [&](int x, int w, const std::string& text) {
+            FillRect(renderer_, x, L.yCkpt, w, kCkptCtlH, kField);
+            DrawRect(renderer_, x, L.yCkpt, w, kCkptCtlH, kBorder);
+            DrawTextCenterIn(renderer_, fontBody_, text, x, L.yCkpt, w, kCkptCtlH, labCol);
+        };
+        valueBox(kCkptRowsValX, kCkptRowsValW,
+                 st.checkpointRows == 0 ? "off" : std::to_string(st.checkpointRows));
+        DrawTextVCenter(renderer_, fontBody_, "sec", kCkptSecsLblX, L.yCkpt, 26, labCol);
+        valueBox(kCkptSecsValX, kCkptSecsValW,
+                 st.checkpointSecs == 0 ? "off" : std::to_string(st.checkpointSecs) + "s");
+        DrawTextVCenter(renderer_, fontBody_, "(off = solo salvataggio finale)", kCkptHintX,
+                        L.yCkpt, 26, kTextLo);
     }
 
     // Hash worker count, display only: live while hashing, last run otherwise.

@@ -357,7 +357,9 @@ next runs, with periodic checkpoints every 1000 rows / 30 s while armed; a secon
 RIPRENDI arms resuming a previous session (open dialog for a `.bvss` file): unchanged files are reused
 and only the rest is re-verified (live roots still required); a second click disarms it. Snapshot and
 resume arming are mutually exclusive. Cancelling a run with SESSIONE armed still saves whatever was
-finalized (`Interrupted` state), resumable later.
+finalized (`Interrupted` state), resumable later. Below the buttons, the Checkpoint row tunes the
+periodic flush while a session is armed (rows and seconds steppers cycling fixed ladders;
+0 = that trigger off, both 0 = save at the end only; defaults 1000 rows / 30 s).
 
 ### With Visual Studio / MSVC and CMake (Windows 11)
 
@@ -390,7 +392,10 @@ During a long scan with `--session-out`, `--checkpoint-rows N` and/or
 so a crash, reboot or cancellation loses at most one interval of work; the
 interrupted session stays resumable with `--resume`. Cancelling a run with an
 active `--session-out` still saves whatever was finalized (`Interrupted`
-state).
+state). A resumed run can itself refresh the snapshot (`--resume` with
+`--snapshot-out`) or verify offline against one (`--resume` with `--compare`):
+in the offline case the source device is not needed and remainder digests come
+from the snapshot.
 
 Examples:
 

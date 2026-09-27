@@ -224,6 +224,16 @@ void ScanOrchestrator::clearResume() {
     statusNote_.clear();
 }
 
+void ScanOrchestrator::setCheckpointRows(uint64_t n) {
+    std::lock_guard<std::mutex> lk(mtx_);
+    checkpointRows_ = n;
+}
+
+void ScanOrchestrator::setCheckpointSecs(uint64_t n) {
+    std::lock_guard<std::mutex> lk(mtx_);
+    checkpointSecs_ = n;
+}
+
 bool ScanOrchestrator::requestSingleVerify(const SingleVerifyParams& params) {
     {
         std::lock_guard<std::mutex> lk(mtx_);
@@ -348,8 +358,8 @@ bool ScanOrchestrator::startLiveScan() {
     options.sessionOut = sessionOut_;
     if (useResume_) options.resumeFrom = resumeFile_;
     if (!sessionOut_.empty()) {
-        options.checkpointRows = 1000;
-        options.checkpointSecs = 30;
+        options.checkpointRows = checkpointRows_;
+        options.checkpointSecs = checkpointSecs_;
     }
     options.cancel = &cancel_;
     options.onProgress = [this](const ScanProgress& p) {
@@ -480,6 +490,8 @@ ScanOrchestrator::UiSnapshot ScanOrchestrator::snapshot() const {
     s.lastSessionSaved = lastSessionSaved_;
     s.lastSessionReused = lastSessionReused_;
     s.lastSessionStale = lastSessionStale_;
+    s.checkpointRows = checkpointRows_;
+    s.checkpointSecs = checkpointSecs_;
     s.running = running_;
     s.resultsReady = resultsReady_;
     s.cancelled = cancel_.load();

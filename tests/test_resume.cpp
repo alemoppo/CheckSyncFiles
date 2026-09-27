@@ -17,6 +17,7 @@
 
 #include "Comparison/ScanMode.h"
 #include "Filesystem/FileIndex.h"
+#include "Filesystem/FileIndexSerializer.h"
 #include "ScanController.h"
 #include "Session/ResumePlan.h"
 #include "Session/SessionLogic.h"
@@ -107,7 +108,8 @@ ScanReport RunScan(const std::wstring& src, const std::wstring& dst, ScanMode mo
                    const std::wstring& sessionOut = L"",
                    const std::wstring& resumeFrom = L"", int verifyPercent = 100,
                    PartialPattern pattern = PartialPattern::Edges, uint64_t checkpointRows = 0,
-                   uint64_t checkpointSecs = 0, unsigned threads = 0) {
+                   uint64_t checkpointSecs = 0, unsigned threads = 0,
+                   const std::wstring& compareFrom = L"", const std::wstring& snapshotOut = L"") {
     ScanOptions opts;
     opts.source = src;
     opts.destination = dst;
@@ -119,6 +121,8 @@ ScanReport RunScan(const std::wstring& src, const std::wstring& dst, ScanMode mo
     opts.checkpointRows = checkpointRows;
     opts.checkpointSecs = checkpointSecs;
     opts.hashThreads = threads;
+    opts.compareFrom = compareFrom;
+    opts.snapshotOut = snapshotOut;
     return ScanController(false).run(opts);
 }
 
@@ -364,6 +368,56 @@ TEST("resume: changed/added/deleted files match a fresh run", [] {
             foundMismatch = true;
     }
     CHECK(foundMismatch);
+});
+
+TEST("resume: snapshot-out captures the current source during a resumed run", [] {
+    TempDir tmp;
+    const std::wstring src = MakeTwinTrees(tmp.path);
+    const std::wstring dst = tmp.path + L"\\dst";
+    const std::wstring base = tmp.path + L"\\sess";
+    const std::wstring snap = tmp.path + L"\\snap.bin";
+    ScanReport first = RunScan(src, dst, ScanMode::Content, base);
+    CHECK(first.sessionSaved);
+    // Resumed run that also refreshes the snapshot from the current source.
+    ScanReport r = RunScan(src, dst, ScanMode::Content, L"", base, 100,
+                           PartialPattern::Edges, 0, 0, 0, L"" /*compare*/, snap);
+    CHECK(r.sourceOk);
+    CHECK(r.destinationOk);
+    CHECK(r.usedSession);
+    CHECK(r.snapshotWritten);
+    FileIndex idx(false);
+    std::wstring root, err;
+    CHECK(indexio::ReadSnapshot(snap, idx, root, err));
+    CHECK(root == src);
+    CHECK(idx.stats().files > 0u);
+    ScanReport fresh = RunScan(src, dst, ScanMode::Content);
+    CHECK(StatsEqual(r.results.stats, fresh.results.stats));
+    CHECK(ProblemsEqual(r.results.problems, fresh.results.problems));
+});
+
+TEST("resume: offline resume against a snapshot matches offline fresh", [] {
+    TempDir tmp;
+    const std::wstring src = MakeTwinTrees(tmp.path);
+    const std::wstring dst = tmp.path + L"\\dst";
+    const std::wstring base = tmp.path + L"\\sess";
+    const std::wstring snap = tmp.path + L"\\snap.bin";
+    // Live run saving snapshot + session from the same state.
+    ScanReport first =
+        RunScan(src, dst, ScanMode::Content, base, L"", 100, PartialPattern::Edges, 0, 0,
+                0, L"" /*compare*/, snap);
+    CHECK(first.sessionSaved);
+    CHECK(first.snapshotWritten);
+    // Offline resume: source device absent (empty source), digests from snapshot.
+    ScanReport resumed = RunScan(L"", dst, ScanMode::Content, L"", base, 100,
+                                 PartialPattern::Edges, 0, 0, 0, snap);
+    CHECK(resumed.sourceOk);
+    CHECK(resumed.destinationOk);
+    CHECK(resumed.usedSession);
+    CHECK(resumed.usedSnapshot);
+    ScanReport freshOffline = RunScan(L"", dst, ScanMode::Content, L"", L"", 100,
+                                      PartialPattern::Edges, 0, 0, 0, snap);
+    CHECK(StatsEqual(resumed.results.stats, freshOffline.results.stats));
+    CHECK(ProblemsEqual(resumed.results.problems, freshOffline.results.problems));
 });
 
 TEST("resume: incompatible settings fail cleanly", [] {
