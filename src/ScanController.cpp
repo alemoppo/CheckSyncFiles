@@ -437,7 +437,9 @@ ScanReport ScanController::run(const ScanOptions& options) {
         ctx.createdAtUnix = checkpointCreatedAt;
         ctx.sourceA = options.source;
         ctx.sourceB = options.destination;
-        ctx.settings.mode = options.mode;
+        // Persist the EFFECTIVE mode: Content may have degraded to Size
+        // (digest-less snapshot), and journaled rows were produced under it.
+        ctx.settings.mode = report.modeUsed;
         ctx.settings.caseSensitive = caseSensitive_;
         ctx.settings.backend = BackendName(options.backend);
         ctx.settings.verify = report.verify;
@@ -1050,7 +1052,9 @@ ScanReport ScanController::run(const ScanOptions& options) {
         sess.createdAtUnix = session::NowUnixSeconds();
         sess.sourceA = options.source;
         sess.sourceB = options.destination;
-        sess.settings.mode = options.mode;
+        // See doCheckpoint: the journaled rows were produced under the
+        // effective mode, which may differ from the requested one.
+        sess.settings.mode = report.modeUsed;
         sess.settings.caseSensitive = caseSensitive_;
         sess.settings.backend = BackendName(options.backend);
         sess.settings.verify = report.verify;

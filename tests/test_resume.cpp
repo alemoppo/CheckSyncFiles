@@ -610,6 +610,52 @@ TEST("resume: corrupt context falls back to .prev and reports it", [] {
     CHECK(ProblemsEqual(resumed.results.problems, fresh.results.problems));
 });
 
+TEST("resume: degraded Size session is never promoted to Content", [] {
+    TempDir tmp;
+    const std::wstring src = tmp.path + L"\\src";
+    const std::wstring dst = tmp.path + L"\\dst";
+    fs::create_directories(fs::path(src));
+    fs::create_directories(fs::path(dst));
+    // Same size, different content: Size sees identical, Content sees mismatch.
+    CHECK(WriteText(src + L"\\a.txt", "hello world"));
+    CHECK(WriteText(dst + L"\\a.txt", "HELLO WORLD"));
+    const std::wstring snap = tmp.path + L"\\snap.bin";
+    const std::wstring base = tmp.path + L"\\sess";
+    // Presence snapshot: no digests.
+    ScanReport cap = RunScan(src, L"", ScanMode::Presence, L"", L"", 100,
+                             PartialPattern::Edges, 0, 0, 0, L"", snap);
+    CHECK(cap.snapshotWritten);
+    // Offline run requested as Content degrades to Size; session is saved.
+    ScanReport degraded = RunScan(L"", dst, ScanMode::Content, base, L"", 100,
+                                  PartialPattern::Edges, 0, 0, 0, snap);
+    CHECK(degraded.sourceOk);
+    CHECK(degraded.contentDegradedToSize);
+    CHECK(degraded.sessionSaved);
+    // The persisted mode must be the EFFECTIVE one (Size), not requested Content.
+    ScanSession saved;
+    CHECK(LoadSession(base, saved).ok);
+    CHECK(saved.settings.mode == ScanMode::Size);
+    // Resuming it requesting Content must refuse cleanly: reusing Size-made
+    // Identical rows as Content would skip hashing and miss the mismatch.
+    ScanReport refused = RunScan(src, dst, ScanMode::Content, L"", base);
+    CHECK(!refused.sourceOk);
+    // Resuming with matching Size settings works and reuses the identical row.
+    ScanReport sized = RunScan(src, dst, ScanMode::Size, L"", base);
+    CHECK(sized.sourceOk);
+    CHECK(sized.usedSession);
+    CHECK(sized.sessionReused > 0u);
+    ScanReport freshSize = RunScan(src, dst, ScanMode::Size);
+    CHECK(StatsEqual(sized.results.stats, freshSize.results.stats));
+    // Sanity: a true Content run really sees the mismatch.
+    ScanReport freshContent = RunScan(src, dst, ScanMode::Content);
+    bool foundMismatch = false;
+    for (const FileResult& p : freshContent.results.problems) {
+        if (p.relativePath == L"a.txt" && p.status == Status::ContentMismatch)
+            foundMismatch = true;
+    }
+    CHECK(foundMismatch);
+});
+
 TEST("resume: incompatible settings fail cleanly", [] {
     TempDir tmp;
     const std::wstring src = MakeTwinTrees(tmp.path);
