@@ -570,6 +570,16 @@ bool ParseContext(const std::string& text, ScanSession& out, SessionError& error
         detail = "missing/invalid settings.verify";
         return false;
     }
+    if (requested > 100 || effective > 100) {
+        error = SessionError::CorruptHeader;
+        detail = "out of range settings.verify";
+        return false;
+    }
+    if (threads > 4096) {
+        error = SessionError::CorruptHeader;
+        detail = "out of range settings.hashThreads";
+        return false;
+    }
     s.settings.verify.percentRequested = (int)requested;
     s.settings.verify.percentEffective = (int)effective;
     s.settings.hashThreads = (unsigned)threads;
@@ -609,9 +619,13 @@ bool ParseContext(const std::string& text, ScanSession& out, SessionError& error
     // Optional (defaults to 0): sessions written before runMillis existed.
     s.runMillis = 0;
     if (const Value* rm = root.find("runMillis")) {
-        if (rm->type != Value::Type::Int || rm->integer < 0) {
+        // 10 years in milliseconds: wall time beyond this is not a real run.
+        constexpr int64_t kMaxRunMillis = 10LL * 365 * 24 * 3600 * 1000;
+        if (rm->type != Value::Type::Int || rm->integer < 0 ||
+            rm->integer > kMaxRunMillis) {
             error = SessionError::CorruptHeader;
-            detail = "bad runMillis";
+            detail = (rm->type == Value::Type::Int) ? "out of range runMillis"
+                                                    : "bad runMillis";
             return false;
         }
         s.runMillis = (uint64_t)rm->integer;

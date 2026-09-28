@@ -107,6 +107,14 @@ JournalEntry MakeSeqEntry(int i) {
     return MakeEntry(name, Status::Identical, (i % 2) == 0);
 }
 
+// Mutable DOM navigation for header-surgery tests (missing/wrong-typed fields,
+// out-of-range values).
+json::Value* FindMutable(json::Value& root, const char* key) {
+    if (root.type != json::Value::Type::Object || !root.obj) return nullptr;
+    auto it = root.obj->find(key);
+    return it == root.obj->end() ? nullptr : &it->second;
+}
+
 ScanSession MakeRichSession() {
     ScanSession s;
     s.sessionId = GenerateSessionId();
@@ -423,6 +431,51 @@ TEST("session: session ids are unique", [] {
     CHECK(GenerateSessionId() != GenerateSessionId());
 });
 
+TEST("session: out-of-range settings are corrupt, not wrapped", [] {
+    TempDir tmp;
+    const std::wstring base = tmp.path + L"\\sess";
+    ScanSession src = MakeRichSession(); // requested=50, effective=50, threads=8
+    std::wstring err;
+    CHECK(SaveSession(base, src, err));
+    const std::string ctx = ReadRawBytes(ContextPath(base));
+    CHECK(!ctx.empty());
+    RemoveOne(PrevPath(base));
+    // Each variant mutates a fresh parse; all must fail as CorruptHeader with
+    // an "out of range" detail (narrowing casts used to wrap these silently).
+    auto tryMutant = [&](auto mutate) {
+        json::Value v;
+        std::string perr;
+        CHECK(json::Parse(ctx, v, perr));
+        mutate(v);
+        const std::string bad = json::Write(v);
+        CHECK(WriteRawBytes(ContextPath(base), bad.data(), bad.size()));
+        ScanSession loaded;
+        LoadOutcome o = LoadSession(base, loaded);
+        CHECK(!o.ok);
+        CHECK(o.error == SessionError::CorruptHeader);
+        CHECK(o.detail.compare(0, 12, "out of range") == 0);
+    };
+    tryMutant([](json::Value& v) { // effective=101
+        *FindMutable(*FindMutable(*FindMutable(v, "settings"), "verify"), "effective") =
+            json::Value::Int(101);
+    });
+    tryMutant([](json::Value& v) { // requested wraps to 100 as int32
+        *FindMutable(*FindMutable(*FindMutable(v, "settings"), "verify"), "requested") =
+            json::Value::Int(4294967396LL);
+    });
+    tryMutant([](json::Value& v) { // hashThreads=1e9
+        *FindMutable(*FindMutable(v, "settings"), "hashThreads") =
+            json::Value::Int(1000000000LL);
+    });
+    tryMutant([](json::Value& v) { // runMillis ~ 31600 years
+        *FindMutable(v, "runMillis") = json::Value::Int(1000000000000000000LL);
+    });
+    // The valid header still loads (no over-strictness).
+    CHECK(WriteRawBytes(ContextPath(base), ctx.data(), ctx.size()));
+    ScanSession loaded;
+    CHECK(LoadSession(base, loaded).ok);
+});
+
 TEST("session: header without runMillis loads with zero (old sessions)", [] {
     TempDir tmp;
     const std::wstring base = tmp.path + L"\\sess";
@@ -445,15 +498,6 @@ TEST("session: header without runMillis loads with zero (old sessions)", [] {
     CHECK(loaded.runMillis == 0u);
     CHECK(loaded.sessionId == src.sessionId);
 });
-
-namespace {
-// Mutable DOM navigation for header-surgery tests (missing/wrong-typed fields).
-json::Value* FindMutable(json::Value& root, const char* key) {
-    if (root.type != json::Value::Type::Object || !root.obj) return nullptr;
-    auto it = root.obj->find(key);
-    return it == root.obj->end() ? nullptr : &it->second;
-}
-} // namespace
 
 TEST("session: valid JSON with a missing required field is corrupt, not a crash", [] {
     TempDir tmp;
