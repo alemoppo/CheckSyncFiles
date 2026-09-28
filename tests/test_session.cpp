@@ -772,6 +772,47 @@ TEST("session: append does not scale with journal size", [] {
     CHECK(o.ok && !o.journalTruncated && o.journalRecovered == 100000u);
 });
 
+TEST("session: peek reads the header without the journal file", [] {
+    TempDir tmp;
+    const std::wstring base = tmp.path + L"\\sess";
+    ScanSession src = MakeRichSession();
+    std::wstring err;
+    CHECK(SaveSession(base, src, err));
+    // Delete the journal outright: Peek needs only the context...
+    CHECK(RemoveOne(JournalPath(base)));
+    ScanSession peeked;
+    LoadOutcome po = PeekSessionHeader(base, peeked);
+    CHECK(po.ok);
+    CHECK(peeked.journal.empty());
+    CHECK(peeked.sessionId == src.sessionId);
+    CHECK(peeked.sourceA == src.sourceA);
+    CHECK(peeked.sourceB == src.sourceB);
+    // ...while a full load on the same base reports the missing tail.
+    ScanSession loaded;
+    LoadOutcome o = LoadSession(base, loaded);
+    CHECK(o.ok);
+    CHECK(o.journalTruncated);
+});
+
+TEST("session: peek and load agree on a corrupt header", [] {
+    TempDir tmp;
+    const std::wstring base = tmp.path + L"\\sess";
+    ScanSession src = MakeRichSession();
+    std::wstring err;
+    CHECK(SaveSession(base, src, err));
+    CHECK(SaveSession(base, src, err)); // second save rotates a good .prev
+    const char junk[] = "{not valid json";
+    CHECK(WriteRawBytes(ContextPath(base), junk, sizeof(junk) - 1));
+    CHECK(WriteRawBytes(PrevPath(base), junk, sizeof(junk) - 1));
+    ScanSession a, b;
+    LoadOutcome po = PeekSessionHeader(base, a);
+    LoadOutcome o = LoadSession(base, b);
+    CHECK(!po.ok);
+    CHECK(!o.ok);
+    CHECK(po.error == o.error);
+    CHECK(po.detail == o.detail);
+});
+
 TEST("session: empty append without orphans keeps a coherent trailer", [] {
     TempDir tmp;
     const std::wstring base = tmp.path + L"\\sess";

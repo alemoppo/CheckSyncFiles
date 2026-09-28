@@ -183,24 +183,9 @@ void ScanOrchestrator::clearSnapshot() {
     statusNote_ = L"Modalita online: sorgente da enumerare.";
 }
 
-namespace {
-
-// The session store appends its own suffixes (.bvss/.bvj) to the base path,
-// but file dialogs return the picked file WITH its suffix: accept both forms
-// by stripping a trailing ".bvss".
-std::wstring StripSessionSuffix(std::wstring path) {
-    constexpr wchar_t kSuffix[] = L".bvss";
-    constexpr size_t kLen = sizeof(kSuffix) / sizeof(wchar_t) - 1;
-    if (path.size() > kLen && path.compare(path.size() - kLen, kLen, kSuffix) == 0)
-        path.resize(path.size() - kLen);
-    return path;
-}
-
-} // namespace
-
 void ScanOrchestrator::setSessionOut(std::wstring base) {
     std::lock_guard<std::mutex> lk(mtx_);
-    sessionOut_ = StripSessionSuffix(std::move(base));
+    sessionOut_ = session::StripSessionSuffix(std::move(base));
     statusNote_ = L"Sessione armata: salvataggio a fine scansione.";
 }
 
@@ -211,17 +196,20 @@ void ScanOrchestrator::clearSessionOut() {
 }
 
 void ScanOrchestrator::loadResumeSession(std::wstring file) {
-    std::lock_guard<std::mutex> lk(mtx_);
-    const std::wstring base = StripSessionSuffix(std::move(file));
-    // Validate immediately (instead of failing at AVVIA) and pre-fill empty
-    // roots from the session: the user no longer retypes what is saved.
-    // Explicitly typed roots always win (e.g. resuming onto a moved tree).
+    // Header-only peek OUTSIDE the lock: validating a session must never block
+    // the UI thread on a full journal replay, and the dialog already gave us a
+    // file (not the store base).
+    const std::wstring base = session::StripSessionSuffix(std::move(file));
     session::ScanSession sess;
-    const session::LoadOutcome outcome = session::LoadSession(base, sess);
+    const session::LoadOutcome outcome = session::PeekSessionHeader(base, sess);
+    std::lock_guard<std::mutex> lk(mtx_);
     if (!outcome.ok) {
         statusNote_ = L"Sessione non valida: " + pathutil::FromUtf8(outcome.detail);
         return;
     }
+    // Validate immediately (instead of failing at AVVIA) and pre-fill empty
+    // roots from the session: the user no longer retypes what is saved.
+    // Explicitly typed roots always win (e.g. resuming onto a moved tree).
     resumeFile_ = base;
     if (source_.empty() && !sess.sourceA.empty()) source_ = sess.sourceA;
     if (dest_.empty() && !sess.sourceB.empty()) dest_ = sess.sourceB;

@@ -13,6 +13,7 @@
 #include <string>
 
 #include "ScanController.h"
+#include "Filesystem/PathUtil.h"
 #include "Profiling/HashProfile.h"
 #include "Session/SessionStore.h"
 #include "Util/StrictNumbers.h"
@@ -184,20 +185,16 @@ bool ParseArgs(int argc, wchar_t** argv, Args& out) {
     if (out.help) return true;
 
     if (!out.resumeFrom.empty()) {
-        // Missing roots are filled from the session file (explicit flags win;
+        // Missing roots are filled from the session header (explicit flags win;
         // with --compare the source stays empty by design: it comes from the
-        // snapshot). A trailing ".bvss" picked from a file dialog is tolerated.
-        std::wstring resumeBase = out.resumeFrom;
-        constexpr wchar_t kSessSuffix[] = L".bvss";
-        constexpr size_t kSessSuffixLen = sizeof(kSessSuffix) / sizeof(wchar_t) - 1;
-        if (resumeBase.size() > kSessSuffixLen &&
-            resumeBase.compare(resumeBase.size() - kSessSuffixLen, kSessSuffixLen,
-                               kSessSuffix) == 0)
-            resumeBase.resize(resumeBase.size() - kSessSuffixLen);
+        // snapshot). Header-only peek: no journal replay for argument parsing.
+        const std::wstring resumeBase = bv::session::StripSessionSuffix(out.resumeFrom);
         bv::session::ScanSession sess;
-        const bv::session::LoadOutcome loaded = bv::session::LoadSession(resumeBase, sess);
+        const bv::session::LoadOutcome loaded =
+            bv::session::PeekSessionHeader(resumeBase, sess);
         if (!loaded.ok) {
-            std::wcerr << L"Errore: sessione non valida.\n\n";
+            std::wcerr << L"Errore: sessione non valida ("
+                       << bv::pathutil::FromUtf8(loaded.detail) << L").\n\n";
             return false;
         }
         if (out.source.empty() && out.compareFrom.empty() && !sess.sourceA.empty())

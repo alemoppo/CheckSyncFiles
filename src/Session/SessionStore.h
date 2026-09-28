@@ -112,10 +112,22 @@ bool AppendJournal(const std::wstring& basePath, const ScanSession& contextSessi
 // session); otherwise the missing tail is reported as truncated.
 LoadOutcome LoadSession(const std::wstring& basePath, ScanSession& out);
 
+// Header-only load: reads and validates just the context (with .prev fallback
+// like LoadSession) without touching the journal file. out.journal is always
+// empty; use it to validate a session or read its roots/settings without
+// paying for a full journal replay. Error and detail match LoadSession's for
+// the same damaged context.
+LoadOutcome PeekSessionHeader(const std::wstring& basePath, ScanSession& out);
+
 // Path helpers (exposed for tests and diagnostics).
 std::wstring ContextPath(const std::wstring& base);
 std::wstring JournalPath(const std::wstring& base);
 std::wstring PrevPath(const std::wstring& base);
+
+// Strips a trailing ".bvss" picked up from a file dialog: the store appends
+// its own suffixes to the base path, so both "sess" and "sess.bvss" resolve
+// to the same session. Single implementation shared by CLI and GUI.
+std::wstring StripSessionSuffix(std::wstring path);
 
 // CRC32 (zlib polynomial 0xEDB88320): init/update/finalize split so journal
 // appends can continue a stored digest without re-reading the file.

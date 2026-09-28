@@ -647,28 +647,58 @@ std::string JournalFileName(const std::wstring& basePath) {
     return pathutil::ToUtf8(name);
 }
 
+// Loads and parses the context header only (main file, else .prev with
+// fellBackToPrev), without touching the journal file. Shared by LoadSession,
+// PeekSessionHeader and ReadTrailer. On failure r carries the error and the
+// trailer outs are untouched; r.ok is left for the caller.
+bool LoadContextOnly(const std::wstring& basePath, ScanSession& sess, uint64_t& declRecords,
+                     uint64_t& declBytes, uint32_t& declCrc, LoadOutcome& r) {
+    std::string ctxText;
+    std::wstring ioErr;
+    const bool haveMain = ReadAll(ContextPath(basePath), ctxText, ioErr);
+    if (!haveMain) {
+        if (!ReadAll(PrevPath(basePath), ctxText, ioErr)) {
+            r.error = SessionError::IoError;
+            r.detail = "no context file";
+            return false;
+        }
+        r.fellBackToPrev = true;
+    }
+    SessionError cerr = SessionError::Ok;
+    std::string cdetail;
+    if (!ParseContext(ctxText, sess, cerr, cdetail, declRecords, declBytes, declCrc)) {
+        if (!haveMain || !ReadAll(PrevPath(basePath), ctxText, ioErr)) {
+            r.error = cerr;
+            r.detail = cdetail;
+            return false;
+        }
+        if (!ParseContext(ctxText, sess, cerr, cdetail, declRecords, declBytes, declCrc)) {
+            r.error = cerr;
+            r.detail = cdetail;
+            return false;
+        }
+        r.fellBackToPrev = true;
+    }
+    r.error = SessionError::Ok;
+    return true;
+}
+
 // Reads only the context trailer (declared record count, byte size, CRC)
 // without touching the journal file. Falls back to .prev like LoadSession.
 bool ReadTrailer(const std::wstring& basePath, uint64_t& records, uint64_t& bytes,
                  uint32_t& crc, std::wstring& error) {
-    std::string ctxText;
-    std::wstring ioErr;
-    const bool haveMain = ReadAll(ContextPath(basePath), ctxText, ioErr);
     ScanSession dummy;
-    SessionError cerr = SessionError::Ok;
-    std::string cdetail;
-    if (haveMain &&
-        ParseContext(ctxText, dummy, cerr, cdetail, records, bytes, crc))
-        return true;
-    if (!ReadAll(PrevPath(basePath), ctxText, ioErr)) {
-        error = haveMain ? L"append: existing context unreadable"
-                         : L"append: cannot load existing session";
+    LoadOutcome o;
+    uint64_t rec = 0, byt = 0;
+    uint32_t c = 0;
+    if (!LoadContextOnly(basePath, dummy, rec, byt, c, o)) {
+        error = (o.error == SessionError::IoError) ? L"append: cannot load existing session"
+                                                   : L"append: existing context unreadable";
         return false;
     }
-    if (!ParseContext(ctxText, dummy, cerr, cdetail, records, bytes, crc)) {
-        error = L"append: existing context unreadable";
-        return false;
-    }
+    records = rec;
+    bytes = byt;
+    crc = c;
     return true;
 }
 
@@ -677,6 +707,14 @@ bool ReadTrailer(const std::wstring& basePath, uint64_t& records, uint64_t& byte
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
+
+std::wstring StripSessionSuffix(std::wstring path) {
+    constexpr wchar_t kSuffix[] = L".bvss";
+    constexpr size_t kLen = sizeof(kSuffix) / sizeof(wchar_t) - 1;
+    if (path.size() > kLen && path.compare(path.size() - kLen, kLen, kSuffix) == 0)
+        path.resize(path.size() - kLen);
+    return path;
+}
 
 bool SaveSession(const std::wstring& basePath, const ScanSession& session, std::wstring& error) {
     std::string journal;
@@ -772,41 +810,27 @@ bool AppendJournal(const std::wstring& basePath, const ScanSession& contextSessi
     return WriteAtomic(ContextPath(basePath), newCtx, true, error);
 }
 
+LoadOutcome PeekSessionHeader(const std::wstring& basePath, ScanSession& out) {
+    LoadOutcome r;
+    ScanSession sess;
+    uint64_t declRecords = 0, declBytes = 0;
+    uint32_t declCrc = 0;
+    if (!LoadContextOnly(basePath, sess, declRecords, declBytes, declCrc, r)) return r;
+    out = std::move(sess); // ParseContext never fills the journal: always empty
+    r.ok = true;
+    return r;
+}
+
 LoadOutcome LoadSession(const std::wstring& basePath, ScanSession& out) {
     LoadOutcome r;
-    std::string ctxText;
-    std::wstring ioErr;
-    const bool haveMain = ReadAll(ContextPath(basePath), ctxText, ioErr);
-    if (!haveMain) {
-        // No main context: try .prev before giving up.
-        if (!ReadAll(PrevPath(basePath), ctxText, ioErr)) {
-            r.error = SessionError::IoError;
-            r.detail = "no context file";
-            return r;
-        }
-        r.fellBackToPrev = true;
-    }
-    SessionError cerr = SessionError::Ok;
-    std::string cdetail;
     uint64_t declRecords = 0, declBytes = 0;
     uint32_t declCrc = 0;
     ScanSession sess;
-    if (!ParseContext(ctxText, sess, cerr, cdetail, declRecords, declBytes, declCrc)) {
-        if (!haveMain || !ReadAll(PrevPath(basePath), ctxText, ioErr)) {
-            r.error = cerr;
-            r.detail = cdetail;
-            return r;
-        }
-        if (!ParseContext(ctxText, sess, cerr, cdetail, declRecords, declBytes, declCrc)) {
-            r.error = cerr;
-            r.detail = cdetail;
-            return r;
-        }
-        r.fellBackToPrev = true;
-    }
+    if (!LoadContextOnly(basePath, sess, declRecords, declBytes, declCrc, r)) return r;
     // Replay the journal: stop at the first short read, bad magic, length
     // overrun or CRC mismatch. Everything before is kept.
     std::string journal;
+    std::wstring ioErr;
     if (!ReadAll(JournalPath(basePath), journal, ioErr)) {
         if (declRecords == 0 && declBytes == 0) {
             out = sess; // fresh session, journal not yet created
