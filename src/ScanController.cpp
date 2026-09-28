@@ -449,7 +449,10 @@ ScanReport ScanController::run(const ScanOptions& options) {
     // thread after join). The first call bootstraps via SaveSession, later
     // ones append. Failures keep the rows queued for the next attempt and are
     // sticky-reported once; they never fail the scan itself.
-    auto doCheckpoint = [&](session::SessionState state) -> bool {
+    // `force` persists even with no new rows (context-only rewrite when
+    // bootstrapped, empty bootstrap save otherwise): used by the final and
+    // cancel paths so a reported save always matches files on disk.
+    auto doCheckpoint = [&](session::SessionState state, bool force = false) -> bool {
         std::lock_guard<std::mutex> lock(checkpointMutex);
         if (checkpointSessionId.empty()) {
             if (keepSessionIdentity) {
@@ -471,7 +474,7 @@ ScanReport ScanController::run(const ScanOptions& options) {
         checkpointTakenAtMark.store(checkpointTakenTotal.load(std::memory_order_relaxed),
                                     std::memory_order_relaxed);
         checkpointLastSecs.store(session::NowUnixSeconds(), std::memory_order_relaxed);
-        if (checkpointPending.empty()) return true; // nothing new: no I/O
+        if (checkpointPending.empty() && !force) return true; // nothing new: no I/O
         session::ScanSession ctx;
         ctx.sessionId = checkpointSessionId;
         ctx.createdAtUnix = checkpointCreatedAt;
@@ -1123,8 +1126,9 @@ ScanReport ScanController::run(const ScanOptions& options) {
         if (checkpointUsed) {
             // Incremental final: the pump already flushed the prefix; append
             // the tail and mark the session completed (bounded memory: flushed
-            // rows were freed after each append).
-            if (doCheckpoint(session::SessionState::Completed)) {
+            // rows were freed after each append). Forced so an empty tail
+            // still persists (or re-marks) the session files.
+            if (doCheckpoint(session::SessionState::Completed, true)) {
                 report.sessionSaved = true;
                 report.sessionPath = options.sessionOut;
             } else {
@@ -1161,8 +1165,15 @@ ScanReport ScanController::run(const ScanOptions& options) {
         bool interruptedSaved = false;
         if (cancelled) {
             if (checkpointUsed) {
-                if (!checkpointPending.empty() || rowSink.size() > 0)
-                    interruptedSaved = doCheckpoint(session::SessionState::Interrupted);
+                // A bootstrapped session is always left marked Interrupted,
+                // even with no new rows (context-only rewrite, journal
+                // untouched: an orphaned tail with nothing pending is foreign
+                // data and still refuses, leaving prior checkpoints intact).
+                // Without any persisted checkpoint yet, only actual rows
+                // justify creating session files.
+                if (!checkpointPending.empty() || rowSink.size() > 0 || checkpointBootstrapped)
+                    interruptedSaved =
+                        doCheckpoint(session::SessionState::Interrupted, true);
             } else {
                 std::vector<ClassifiedRow> rows = rowSink.take();
                 if (!sessionReusedEntries.empty() || !rows.empty()) {

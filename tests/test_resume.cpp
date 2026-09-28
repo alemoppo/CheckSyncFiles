@@ -720,6 +720,31 @@ TEST("resume: re-saving to the same base preserves sessionId and createdAt", [] 
     CHECK(s3.sessionId != s1.sessionId);
 });
 
+TEST("resume: checkpointing an empty tree still persists a session", [] {
+    TempDir tmp;
+    const std::wstring src = tmp.path + L"\\src";
+    const std::wstring dst = tmp.path + L"\\dst";
+    std::error_code ec;
+    fs::create_directories(fs::path(src), ec);
+    CHECK(!ec);
+    fs::create_directories(fs::path(dst), ec);
+    CHECK(!ec);
+    const std::wstring base = tmp.path + L"\\sess";
+    // Zero rows ever captured: the final save must still persist a (Completed,
+    // empty) session instead of merely reporting sessionSaved with no files.
+    ScanReport r = RunScan(src, dst, ScanMode::Content, base, L"", 100,
+                           PartialPattern::Edges, 1 /*checkpointRows*/);
+    CHECK(r.sourceOk);
+    CHECK(r.destinationOk);
+    CHECK(r.sessionSaved);
+    ScanSession loaded;
+    LoadOutcome o = LoadSession(base, loaded);
+    CHECK(o.ok);
+    CHECK(!o.journalTruncated);
+    CHECK(loaded.journal.empty());
+    CHECK(loaded.state == SessionState::Completed);
+});
+
 TEST("resume: incompatible settings fail cleanly", [] {
     TempDir tmp;
     const std::wstring src = MakeTwinTrees(tmp.path);
