@@ -89,6 +89,16 @@ const char* BackendName(EnumeratorBackend b) {
     return "auto";
 }
 
+// The source root a persisted session refers to. Live runs record the live
+// root; offline runs (source device absent) record the snapshot's recorded
+// root instead of the empty options.source, so a saved offline session stays
+// resumable and its provenance intact. Single definition for the final save,
+// checkpoints and any future session writer.
+const std::wstring& SessionSourceA(bool haveCompare, const std::wstring& loadedRoot,
+                                   const std::wstring& liveSource) {
+    return haveCompare ? loadedRoot : liveSource;
+}
+
 // Full single-side enumeration with MFT -> Win32 fallback (resume path).
 // Unlike the snapshot-capture block above (kept byte-identical for zero
 // regression risk), enumeration errors are NOT converted to result rows here:
@@ -382,6 +392,10 @@ ScanReport ScanController::run(const ScanOptions& options) {
     // plan (re-saved on --session-out), and the captured-row sink.
     session::ScanSession resumeSession;
     uint64_t resumePrevMillis = 0; // wall time accumulated by previous runs
+    // Source root recorded in the snapshot (offline mode only): declared here,
+    // before the checkpoint lambdas that refer to it; assigned in section 1
+    // and read only from section 2 on. Empty unless a snapshot was loaded.
+    std::wstring loadedRoot;
     FileIndex destIndex(caseSensitive_);
     std::vector<std::wstring> resumeErrA;
     std::vector<std::wstring> resumeErrB;
@@ -435,7 +449,7 @@ ScanReport ScanController::run(const ScanOptions& options) {
         session::ScanSession ctx;
         ctx.sessionId = checkpointSessionId;
         ctx.createdAtUnix = checkpointCreatedAt;
-        ctx.sourceA = options.source;
+        ctx.sourceA = SessionSourceA(haveCompare, loadedRoot, options.source);
         ctx.sourceB = options.destination;
         // Persist the EFFECTIVE mode: Content may have degraded to Size
         // (digest-less snapshot), and journaled rows were produced under it.
@@ -512,10 +526,6 @@ ScanReport ScanController::run(const ScanOptions& options) {
     //    source is enumerated concurrently with the destination below.
     // ---------------------------------------------------------------------
     const double t1 = NowSeconds();
-    // Source root recorded in the snapshot (offline mode only): hoisted here so
-    // the destination pass can reuse it as the display root for source-side
-    // results. Empty unless a snapshot was loaded successfully.
-    std::wstring loadedRoot;
     if (haveCompare) {
         std::wstring err;
         if (indexio::ReadSnapshot(options.compareFrom, sourceIndex, loadedRoot, err)) {
@@ -1050,7 +1060,7 @@ ScanReport ScanController::run(const ScanOptions& options) {
         session::ScanSession sess;
         sess.sessionId = session::GenerateSessionId();
         sess.createdAtUnix = session::NowUnixSeconds();
-        sess.sourceA = options.source;
+        sess.sourceA = SessionSourceA(haveCompare, loadedRoot, options.source);
         sess.sourceB = options.destination;
         // See doCheckpoint: the journaled rows were produced under the
         // effective mode, which may differ from the requested one.

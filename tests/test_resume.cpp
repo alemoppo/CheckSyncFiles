@@ -656,6 +656,43 @@ TEST("resume: degraded Size session is never promoted to Content", [] {
     CHECK(foundMismatch);
 });
 
+TEST("resume: offline resume saves a re-resumable sourceA", [] {
+    TempDir tmp;
+    const std::wstring src = MakeTwinTrees(tmp.path);
+    const std::wstring dst = tmp.path + L"\\dst";
+    const std::wstring base = tmp.path + L"\\sess";
+    const std::wstring snap = tmp.path + L"\\snap.bin";
+    const std::wstring base2 = tmp.path + L"\\sess2";
+    // Live run saving both snapshot (with digests) and session.
+    ScanReport first =
+        RunScan(src, dst, ScanMode::Content, base, L"", 100, PartialPattern::Edges, 0, 0,
+                0, L"" /*compare*/, snap);
+    CHECK(first.sessionSaved);
+    CHECK(first.snapshotWritten);
+    // Offline resume that itself saves a session.
+    ScanReport off1 = RunScan(L"", dst, ScanMode::Content, base2, base, 100,
+                              PartialPattern::Edges, 0, 0, 0, snap);
+    CHECK(off1.sourceOk);
+    CHECK(off1.destinationOk);
+    CHECK(off1.usedSession);
+    CHECK(off1.sessionSaved);
+    // The saved context must carry the snapshot's recorded root, not an
+    // empty source: otherwise no natural offline chain is possible.
+    ScanSession second;
+    CHECK(LoadSession(base2, second).ok);
+    CHECK(!second.sourceA.empty());
+    CHECK(second.sourceA == src);
+    // Second offline resume from that session matches an offline fresh run.
+    ScanReport off2 = RunScan(L"", dst, ScanMode::Content, L"", base2, 100,
+                              PartialPattern::Edges, 0, 0, 0, snap);
+    CHECK(off2.sourceOk);
+    CHECK(off2.usedSession);
+    ScanReport freshOffline = RunScan(L"", dst, ScanMode::Content, L"", L"", 100,
+                                      PartialPattern::Edges, 0, 0, 0, snap);
+    CHECK(StatsEqual(off2.results.stats, freshOffline.results.stats));
+    CHECK(ProblemsEqual(off2.results.problems, freshOffline.results.problems));
+});
+
 TEST("resume: incompatible settings fail cleanly", [] {
     TempDir tmp;
     const std::wstring src = MakeTwinTrees(tmp.path);
