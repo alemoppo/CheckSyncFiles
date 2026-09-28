@@ -17,7 +17,9 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <set>
 #include <string>
+#include <vector>
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -70,6 +72,14 @@ bool RemoveOne(const std::wstring& path) {
     return fs::remove(fs::path(path), ec);
 }
 
+bool HasDuplicatePaths(const std::vector<JournalEntry>& v) {
+    std::set<std::wstring> seen;
+    for (const auto& e : v) {
+        if (!seen.insert(e.relativePath).second) return true;
+    }
+    return false;
+}
+
 JournalEntry MakeEntry(const wchar_t* rel, Status verdict, bool withHashes,
                        bool isDir = false) {
     JournalEntry e;
@@ -89,6 +99,12 @@ JournalEntry MakeEntry(const wchar_t* rel, Status verdict, bool withHashes,
     e.verifiedPattern = PartialPattern::Edges;
     e.isDirectory = isDir;
     return e;
+}
+
+JournalEntry MakeSeqEntry(int i) {
+    wchar_t name[64];
+    swprintf(name, 64, L"seq\\f%06d.dat", i);
+    return MakeEntry(name, Status::Identical, (i % 2) == 0);
 }
 
 ScanSession MakeRichSession() {
@@ -571,4 +587,209 @@ TEST("session: benchmark 100k journal round-trip", [] {
     const auto loadMs = std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count();
     std::cout << "  [bench] 100k journal: save " << saveMs << " ms, load " << loadMs << " ms\n";
     CHECK(saveMs < 120000 && loadMs < 120000);
+});
+
+// ---------------------------------------------------------------------------
+// AppendJournal crash-recovery (Section 1): an orphaned tail (journal bytes
+// written by a previous append whose context save never landed) must be
+// detected and reconciled against the still-pending rows, never duplicated.
+// ---------------------------------------------------------------------------
+
+TEST("session: append retry after failed context save", [] {
+    TempDir tmp;
+    const std::wstring base = tmp.path + L"\\sess";
+    ScanSession s = MakeRichSession(); // 5 rows
+    std::wstring err;
+    CHECK(SaveSession(base, s, err));
+    const std::string ctx0 = ReadRawBytes(ContextPath(base));
+    CHECK(!ctx0.empty());
+    RemoveOne(PrevPath(base));
+
+    // First append lands on disk; then the context save "never happens".
+    const std::vector<JournalEntry> X = {MakeSeqEntry(1000), MakeSeqEntry(1001)};
+    ScanSession s2 = s;
+    s2.checkpoint.seq = 8;
+    CHECK(AppendJournal(base, s2, X, err));
+    CHECK(WriteRawBytes(ContextPath(base), ctx0.data(), ctx0.size()));
+    RemoveOne(PrevPath(base));
+
+    // Retry with the still-pending X plus new Z (as doCheckpoint would):
+    // the orphan must be recognized, not duplicated.
+    const std::vector<JournalEntry> Z = {MakeSeqEntry(1002)};
+    std::vector<JournalEntry> XZ = X;
+    XZ.insert(XZ.end(), Z.begin(), Z.end());
+    ScanSession s3 = s;
+    s3.checkpoint.seq = 9;
+    CHECK(AppendJournal(base, s3, XZ, err));
+
+    ScanSession loaded;
+    LoadOutcome o = LoadSession(base, loaded);
+    CHECK(o.ok);
+    CHECK(!o.journalTruncated);
+    CHECK(o.detail.empty());
+    const size_t expect = s.journal.size() + XZ.size();
+    CHECK(o.journalRecovered == expect);
+    CHECK(loaded.journal.size() == expect);
+    for (size_t i = 0; i < s.journal.size(); ++i) CHECK(loaded.journal[i] == s.journal[i]);
+    for (size_t i = 0; i < XZ.size(); ++i) CHECK(loaded.journal[s.journal.size() + i] == XZ[i]);
+    CHECK(!HasDuplicatePaths(loaded.journal));
+    CHECK(loaded.checkpoint.seq == 9u);
+});
+
+TEST("session: torn orphan tail", [] {
+    TempDir tmp;
+    const std::wstring base = tmp.path + L"\\sess";
+    ScanSession s = MakeRichSession();
+    std::wstring err;
+    CHECK(SaveSession(base, s, err));
+    const std::string ctx0 = ReadRawBytes(ContextPath(base));
+    const std::string j0 = ReadRawBytes(JournalPath(base));
+    CHECK(!j0.empty());
+    RemoveOne(PrevPath(base));
+
+    const std::vector<JournalEntry> X = {MakeSeqEntry(1000), MakeSeqEntry(1001)};
+    ScanSession s2 = s;
+    CHECK(AppendJournal(base, s2, X, err));
+    const std::string j1 = ReadRawBytes(JournalPath(base));
+    CHECK(j1.size() > j0.size());
+    // Crash between context save and retry, plus a torn tail: keep only the
+    // first half of the orphaned bytes.
+    CHECK(WriteRawBytes(ContextPath(base), ctx0.data(), ctx0.size()));
+    RemoveOne(PrevPath(base));
+    const size_t tail = j1.size() - j0.size();
+    CHECK(tail > 1u);
+    std::error_code ec;
+    fs::resize_file(fs::path(JournalPath(base)), j0.size() + tail / 2, ec);
+    CHECK(!ec);
+
+    // Same retry as T1.1 must converge to the same journal.
+    const std::vector<JournalEntry> Z = {MakeSeqEntry(1002)};
+    std::vector<JournalEntry> XZ = X;
+    XZ.insert(XZ.end(), Z.begin(), Z.end());
+    ScanSession s3 = s;
+    s3.checkpoint.seq = 9;
+    CHECK(AppendJournal(base, s3, XZ, err));
+
+    ScanSession loaded;
+    LoadOutcome o = LoadSession(base, loaded);
+    CHECK(o.ok);
+    CHECK(!o.journalTruncated);
+    CHECK(o.detail.empty());
+    const size_t expect = s.journal.size() + XZ.size();
+    CHECK(o.journalRecovered == expect);
+    CHECK(loaded.journal.size() == expect);
+    for (size_t i = 0; i < s.journal.size(); ++i) CHECK(loaded.journal[i] == s.journal[i]);
+    for (size_t i = 0; i < XZ.size(); ++i) CHECK(loaded.journal[s.journal.size() + i] == XZ[i]);
+    CHECK(!HasDuplicatePaths(loaded.journal));
+});
+
+TEST("session: orphan tail that is not a prefix", [] {
+    TempDir tmp;
+    const std::wstring base = tmp.path + L"\\sess";
+    ScanSession s = MakeRichSession();
+    std::wstring err;
+    CHECK(SaveSession(base, s, err));
+
+    // Foreign bytes past the declared journal size (not rows from this run).
+    const std::string before = ReadRawBytes(JournalPath(base));
+    const std::string garbage(64, '\xAA');
+    {
+        std::ofstream f(fs::path(JournalPath(base)), std::ios::binary | std::ios::app);
+        CHECK(static_cast<bool>(f));
+        f.write(garbage.data(), static_cast<std::streamsize>(garbage.size()));
+        f.flush();
+        CHECK(static_cast<bool>(f));
+    }
+    const std::string withGarbage = ReadRawBytes(JournalPath(base));
+    CHECK(withGarbage.size() == before.size() + garbage.size());
+
+    const std::vector<JournalEntry> XZ = {MakeSeqEntry(1000), MakeSeqEntry(1001)};
+    ScanSession s3 = s;
+    std::wstring err2;
+    CHECK(!AppendJournal(base, s3, XZ, err2));
+    CHECK(!err2.empty());
+    // The journal file must be byte-identical to before the call.
+    CHECK(ReadRawBytes(JournalPath(base)) == withGarbage);
+});
+
+TEST("session: orphan tail with empty entries", [] {
+    TempDir tmp;
+    const std::wstring base = tmp.path + L"\\sess";
+    ScanSession s = MakeRichSession();
+    std::wstring err;
+    CHECK(SaveSession(base, s, err));
+    const std::string ctx0 = ReadRawBytes(ContextPath(base));
+    RemoveOne(PrevPath(base));
+
+    const std::vector<JournalEntry> X = {MakeSeqEntry(1000)};
+    ScanSession s2 = s;
+    CHECK(AppendJournal(base, s2, X, err));
+    CHECK(WriteRawBytes(ContextPath(base), ctx0.data(), ctx0.size()));
+    RemoveOne(PrevPath(base));
+
+    // Orphaned rows exist but nothing is pending: refusing is the only safe
+    // answer (those rows belong to nobody).
+    const std::string journalBefore = ReadRawBytes(JournalPath(base));
+    const std::string ctxBefore = ReadRawBytes(ContextPath(base));
+    ScanSession s3 = s;
+    std::wstring err2;
+    CHECK(!AppendJournal(base, s3, {}, err2));
+    CHECK(!err2.empty());
+    CHECK(ReadRawBytes(JournalPath(base)) == journalBefore);
+    CHECK(ReadRawBytes(ContextPath(base)) == ctxBefore);
+});
+
+TEST("session: append does not scale with journal size", [] {
+    TempDir tmp;
+    const std::wstring base = tmp.path + L"\\sess";
+    ScanSession s = MakeRichSession();
+    s.journal.clear();
+    std::wstring err;
+    CHECK(SaveSession(base, s, err));
+    std::vector<double> ms;
+    ms.reserve(200);
+    int seq = 0;
+    for (int a = 0; a < 200; ++a) {
+        std::vector<JournalEntry> batch;
+        for (int i = 0; i < 500; ++i) batch.push_back(MakeSeqEntry(seq++));
+        const auto t0 = std::chrono::steady_clock::now();
+        CHECK(AppendJournal(base, s, batch, err));
+        const auto t1 = std::chrono::steady_clock::now();
+        ms.push_back(std::chrono::duration<double, std::milli>(t1 - t0).count());
+    }
+    double first = 0.0, last = 0.0;
+    for (int i = 0; i < 10; ++i) first += ms[i];
+    for (int i = 190; i < 200; ++i) last += ms[i];
+    first /= 10.0;
+    last /= 10.0;
+    std::cout << "  [bench] append avg ms: first10=" << first << " last10=" << last << "\n";
+    // A correct append costs O(batch) + fixed file I/O, independent of the
+    // journal size; re-reading/re-decoding the whole journal per append shows
+    // up as a multi-x slowdown on the tail appends.
+    CHECK(last < 3.0 * first + 20.0);
+    ScanSession loaded;
+    LoadOutcome o = LoadSession(base, loaded);
+    CHECK(o.ok && !o.journalTruncated && o.journalRecovered == 100000u);
+});
+
+TEST("session: empty append without orphans keeps a coherent trailer", [] {
+    TempDir tmp;
+    const std::wstring base = tmp.path + L"\\sess";
+    ScanSession s = MakeRichSession();
+    std::wstring err;
+    CHECK(SaveSession(base, s, err));
+    ScanSession s2 = s;
+    s2.state = SessionState::Completed;
+    s2.checkpoint.seq = 3;
+    CHECK(AppendJournal(base, s2, {}, err));
+    ScanSession loaded;
+    LoadOutcome o = LoadSession(base, loaded);
+    CHECK(o.ok);
+    CHECK(!o.journalTruncated);
+    CHECK(o.detail.empty());
+    CHECK(o.journalRecovered == s.journal.size());
+    CHECK(loaded.journal.size() == s.journal.size());
+    for (size_t i = 0; i < s.journal.size(); ++i) CHECK(loaded.journal[i] == s.journal[i]);
+    CHECK(loaded.state == SessionState::Completed);
+    CHECK(loaded.checkpoint.seq == 3u);
 });

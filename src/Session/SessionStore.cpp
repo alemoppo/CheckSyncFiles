@@ -1,5 +1,6 @@
 #include "Session/SessionStore.h"
 
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -646,6 +647,31 @@ std::string JournalFileName(const std::wstring& basePath) {
     return pathutil::ToUtf8(name);
 }
 
+// Reads only the context trailer (declared record count, byte size, CRC)
+// without touching the journal file. Falls back to .prev like LoadSession.
+bool ReadTrailer(const std::wstring& basePath, uint64_t& records, uint64_t& bytes,
+                 uint32_t& crc, std::wstring& error) {
+    std::string ctxText;
+    std::wstring ioErr;
+    const bool haveMain = ReadAll(ContextPath(basePath), ctxText, ioErr);
+    ScanSession dummy;
+    SessionError cerr = SessionError::Ok;
+    std::string cdetail;
+    if (haveMain &&
+        ParseContext(ctxText, dummy, cerr, cdetail, records, bytes, crc))
+        return true;
+    if (!ReadAll(PrevPath(basePath), ctxText, ioErr)) {
+        error = haveMain ? L"append: existing context unreadable"
+                         : L"append: cannot load existing session";
+        return false;
+    }
+    if (!ParseContext(ctxText, dummy, cerr, cdetail, records, bytes, crc)) {
+        error = L"append: existing context unreadable";
+        return false;
+    }
+    return true;
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -664,68 +690,81 @@ bool SaveSession(const std::wstring& basePath, const ScanSession& session, std::
 
 bool AppendJournal(const std::wstring& basePath, const ScanSession& contextSession,
                    const std::vector<JournalEntry>& entries, std::wstring& error) {
-    if (entries.empty()) {
-        // Nothing to append: still refresh the context (progress/state may have
-        // advanced), keeping the existing trailer.
-        ScanSession probe;
-        LoadOutcome prev = LoadSession(basePath, probe);
-        if (!prev.ok) {
-            error = L"append: cannot load existing session";
-            return false;
-        }
-        std::string cur;
-        if (!ReadAll(JournalPath(basePath), cur, error)) return false;
-        const std::string ctx =
-            BuildContext(contextSession, JournalFileName(basePath), probe.journal.size(),
-                         cur.size(), Crc32Of(cur.data(), cur.size()));
-        return WriteAtomic(ContextPath(basePath), ctx, true, error);
-    }
-    // Verify the journal did not change under us: trailer bytes must match.
-    ScanSession probe;
-    LoadOutcome prev = LoadSession(basePath, probe);
-    if (!prev.ok) {
-        error = L"append: cannot load existing session";
-        return false;
-    }
+    uint64_t declRecords = 0, declBytes = 0;
+    uint32_t declCrc = 0;
+    if (!ReadTrailer(basePath, declRecords, declBytes, declCrc, error)) return false;
+
     std::string addition;
     for (const auto& e : entries) EncodeRecord(e, addition);
-    {
-        std::ofstream f(fs::path(JournalPath(basePath)), std::ios::binary | std::ios::app);
+
+    // Reconcile the file size with the trailer WITHOUT reading the journal:
+    // any byte past declBytes is an orphaned tail of this run's own earlier
+    // append (see the contract on the declaration), still present in `entries`.
+    const std::wstring jpath = JournalPath(basePath);
+    std::error_code ec;
+    const uint64_t actualSize = fs::file_size(fs::path(jpath), ec);
+    if (ec) {
+        // A missing journal is coherent only when nothing was ever declared.
+        if (declRecords != 0 || declBytes != 0 || !addition.empty()) {
+            error = L"append: journal file missing";
+            return false;
+        }
+    } else if (actualSize < declBytes) {
+        error = L"append: journal shorter than declared, data lost";
+        return false;
+    } else if (actualSize > declBytes) {
+        const uint64_t tail = actualSize - declBytes;
+        if (addition.empty()) {
+            error = L"append: orphaned journal tail with no pending rows";
+            return false;
+        }
+        if (tail > addition.size()) {
+            error = L"append: orphaned journal tail longer than pending rows";
+            return false;
+        }
+        // Compare the orphan against the prefix of `addition` (tail bytes
+        // only, never the whole journal).
+        std::ifstream f(fs::path(jpath), std::ios::binary);
+        std::string orphan(static_cast<size_t>(tail), '\0');
+        bool tailOk = static_cast<bool>(f);
+        if (tailOk) {
+            f.seekg(static_cast<std::streamoff>(declBytes));
+            f.read(orphan.data(), static_cast<std::streamsize>(tail));
+            tailOk = static_cast<bool>(f) && static_cast<uint64_t>(f.gcount()) == tail &&
+                     memcmp(orphan.data(), addition.data(), static_cast<size_t>(tail)) == 0;
+        }
+        if (!tailOk) {
+            error = L"append: orphan tail does not match pending rows";
+            return false;
+        }
+        // Truncate away the orphan, then append the full addition below. A
+        // crash between the two leaves a torn tail, which the loader drops.
+        std::error_code tec;
+        fs::resize_file(fs::path(jpath), static_cast<uintmax_t>(declBytes), tec);
+        if (tec) {
+            error = L"append: cannot truncate orphaned journal tail";
+            return false;
+        }
+    }
+
+    if (!addition.empty()) {
+        std::ofstream f(fs::path(jpath), std::ios::binary | std::ios::app);
         if (!f) {
-            error = L"cannot open journal for append: " + JournalPath(basePath);
+            error = L"cannot open journal for append: " + jpath;
             return false;
         }
         f.write(addition.data(), static_cast<std::streamsize>(addition.size()));
         f.flush();
         if (!f) {
-            error = L"journal append failed: " + JournalPath(basePath);
+            error = L"journal append failed: " + jpath;
             return false;
         }
     }
-    FlushToDisk(JournalPath(basePath));
-    // Continue the stored CRC without re-reading: read back ONLY the trailer
-    // counts from the context we just loaded (probe came from it), recompute
-    // incrementally. The running CRC over the old bytes is derived from the
-    // stored digest (Final ^ 0xFFFFFFFF restores the internal state).
-    std::string ctxText;
-    if (!ReadAll(ContextPath(basePath), ctxText, error)) return false;
-    ScanSession ctx;
-    SessionError cerr = SessionError::Ok;
-    std::string cdetail;
-    uint64_t declRecords = 0, declBytes = 0;
-    uint32_t declCrc = 0;
-    if (!ParseContext(ctxText, ctx, cerr, cdetail, declRecords, declBytes, declCrc)) {
-        error = L"append: existing context unreadable";
-        return false;
-    }
+    FlushToDisk(jpath);
+    // Continue the stored CRC without re-reading the old bytes: Final ^
+    // 0xFFFFFFFF restores the internal CRC state (see the CRC32 test).
     const uint64_t newRecords = declRecords + entries.size();
-    std::string cur;
-    if (!ReadAll(JournalPath(basePath), cur, error)) return false;
     const uint64_t newBytes = declBytes + addition.size();
-    if (cur.size() < newBytes) {
-        error = L"append: journal shorter than expected after append";
-        return false;
-    }
     const uint32_t newCrc =
         Crc32Final(Crc32Update(declCrc ^ 0xFFFFFFFFu, addition.data(), addition.size()));
     const std::string newCtx = BuildContext(contextSession, JournalFileName(basePath), newRecords,

@@ -93,7 +93,17 @@ bool SaveSession(const std::wstring& basePath, const ScanSession& session,
 // Append `entries` to <base>.bvj (pure append + flush) and atomically refresh
 // <base>.bvss from `contextSession` (same rows + new entries, updated
 // progress/stats/checkpoint as passed in). The journal file is never
-// rewritten here; CRC continuation needs no re-read thanks to the trailer.
+// re-read here (only its size is stat'ed); CRC continuation needs no re-read
+// thanks to the trailer.
+//
+// CONTRACT: call AppendJournal only after bootstrapping the session files
+// with SaveSession in the SAME run, and always pass every still-unflushed row
+// in `entries` (the checkpoint pump keeps them queued across retries). Every
+// byte past the declared journal size is then necessarily an orphan of this
+// run's own earlier append, still present in `entries`: a longer-or-equal
+// prefix match truncates and re-appends, anything else is an explicit error
+// and the files are left untouched. Appending to a journal written by another
+// run breaks this contract: the truncation above would become destructive.
 bool AppendJournal(const std::wstring& basePath, const ScanSession& contextSession,
                    const std::vector<JournalEntry>& entries, std::wstring& error);
 
