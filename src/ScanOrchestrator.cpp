@@ -127,11 +127,13 @@ void ScanOrchestrator::setStartLockedHook(std::function<void()> hook) {
 void ScanOrchestrator::setSource(std::wstring s) {
     std::lock_guard<std::mutex> lk(mtx_);
     source_ = std::move(s);
+    sourcePrefilled_ = false; // user-typed input owns the field from now on
 }
 
 void ScanOrchestrator::setDest(std::wstring s) {
     std::lock_guard<std::mutex> lk(mtx_);
     dest_ = std::move(s);
+    destPrefilled_ = false; // user-typed input owns the field from now on
 }
 
 void ScanOrchestrator::setSourceFocus(bool f) {
@@ -173,6 +175,7 @@ void ScanOrchestrator::loadSnapshot(std::wstring file) {
     useResume_ = false; // mutually exclusive modes
     resumeFile_.clear();
     source_.clear(); // the device is no longer needed
+    sourcePrefilled_ = false;
     statusNote_ = L"Sorgente da snapshot. Impostare la destinazione e premere AVVIA.";
 }
 
@@ -211,18 +214,56 @@ void ScanOrchestrator::loadResumeSession(std::wstring file) {
     // roots from the session: the user no longer retypes what is saved.
     // Explicitly typed roots always win (e.g. resuming onto a moved tree).
     resumeFile_ = base;
-    if (source_.empty() && !sess.sourceA.empty()) source_ = sess.sourceA;
-    if (dest_.empty() && !sess.sourceB.empty()) dest_ = sess.sourceB;
+    // Provenance-aware prefill: an empty field, or one still holding a
+    // previous prefill, follows the newest session; a session without that
+    // root clears a prefilled field (the flag stays: the value is still not
+    // user-typed, so future sessions refill it and clearResume wipes it).
+    // A typed value always wins but gets an explicit warning on mismatch.
+    std::wstring warnings;
+    if (source_.empty() || sourcePrefilled_) {
+        if (!sess.sourceA.empty()) {
+            source_ = sess.sourceA;
+            sourcePrefilled_ = true;
+        } else {
+            source_.clear();
+        }
+    } else if (!sess.sourceA.empty() && source_ != sess.sourceA) {
+        warnings += L" Avviso: la sorgente digitata (" + source_ +
+                    L") differisce da quella della sessione (" + sess.sourceA +
+                    L"); verra usata quella digitata.";
+    }
+    if (dest_.empty() || destPrefilled_) {
+        if (!sess.sourceB.empty()) {
+            dest_ = sess.sourceB;
+            destPrefilled_ = true;
+        } else {
+            dest_.clear();
+        }
+    } else if (!sess.sourceB.empty() && dest_ != sess.sourceB) {
+        warnings += L" Avviso: la destinazione digitata (" + dest_ +
+                    L") differisce da quella della sessione (" + sess.sourceB +
+                    L"); verra usata quella digitata.";
+    }
     useResume_ = true;
     useSnapshot_ = false; // mutually exclusive modes
     snapshotFile_.clear();
-    statusNote_ = L"Ripresa armata: le righe invariate saranno riusate.";
+    statusNote_ = L"Ripresa armata: le righe invariate saranno riusate." + warnings;
 }
 
 void ScanOrchestrator::clearResume() {
     std::lock_guard<std::mutex> lk(mtx_);
     useResume_ = false;
     resumeFile_.clear();
+    // Wipe fields that were never typed by the user, so no stale prefill
+    // survives disarming.
+    if (sourcePrefilled_) {
+        source_.clear();
+        sourcePrefilled_ = false;
+    }
+    if (destPrefilled_) {
+        dest_.clear();
+        destPrefilled_ = false;
+    }
     statusNote_.clear();
 }
 

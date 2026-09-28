@@ -218,6 +218,12 @@ private:
     std::wstring sessionOut_;
     bool useResume_ = false;
     std::wstring resumeFile_;
+    // Provenance of the source/dest fields: true while the value came from a
+    // session prefill rather than the user. A prefilled field follows the
+    // newest armed session; user input (setSource/setDest) clears the flag and
+    // then always wins, with an explicit warning on mismatch.
+    bool sourcePrefilled_ = false;
+    bool destPrefilled_ = false;
     uint64_t checkpointRows_ = 1000;
     uint64_t checkpointSecs_ = 30;
     bool lastUsedSession_ = false;

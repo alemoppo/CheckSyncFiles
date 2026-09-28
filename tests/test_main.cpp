@@ -5228,6 +5228,51 @@ TEST("orchestrator: resume arming refuses an unloadable session", [] {
     CHECK(orch.snapshot().resumeFile.empty());
 });
 
+TEST("orchestrator: resume prefill tracks provenance across sessions", [] {
+    const std::wstring dir = MakeTempDir();
+    const std::wstring baseA = dir + L"\\sessA";
+    const std::wstring baseB = dir + L"\\sessB";
+    bv::session::ScanSession seedA, seedB;
+    seedA.sessionId = "prefill-A";
+    seedA.sourceA = L"A:\\one";
+    seedA.sourceB = L"A:\\two";
+    seedB.sessionId = "prefill-B";
+    seedB.sourceA = L"B:\\one";
+    seedB.sourceB = L"B:\\two";
+    std::wstring serr;
+    CHECK(bv::session::SaveSession(baseA, seedA, serr));
+    CHECK(bv::session::SaveSession(baseB, seedB, serr));
+
+    // Loading B over A applies B's roots (prefilled values never stick).
+    bv::ScanOrchestrator orch;
+    orch.loadResumeSession(baseA);
+    CHECK(orch.snapshot().source == L"A:\\one");
+    orch.loadResumeSession(baseB);
+    CHECK(orch.snapshot().useResume);
+    CHECK(orch.snapshot().source == L"B:\\one");
+    CHECK(orch.snapshot().dest == L"B:\\two");
+
+    // clearResume wipes still-prefilled fields; the next session refills them.
+    bv::ScanOrchestrator orch2;
+    orch2.loadResumeSession(baseA);
+    CHECK(orch2.snapshot().source == L"A:\\one");
+    orch2.clearResume();
+    CHECK(orch2.snapshot().source.empty());
+    CHECK(orch2.snapshot().dest.empty());
+    orch2.loadResumeSession(baseB);
+    CHECK(orch2.snapshot().source == L"B:\\one");
+    CHECK(orch2.snapshot().dest == L"B:\\two");
+
+    // A typed root wins and produces an explicit warning.
+    bv::ScanOrchestrator orch3;
+    orch3.setSource(L"X:\\typed");
+    orch3.loadResumeSession(baseA); // session says A:\one
+    CHECK(orch3.snapshot().useResume);
+    CHECK(orch3.snapshot().source == L"X:\\typed");
+    CHECK(orch3.snapshot().dest == L"A:\\two");
+    CHECK(orch3.snapshot().statusNote.find(L"Avviso") != std::wstring::npos);
+});
+
 TEST("orchestrator: failed source is exposed as incomplete, not successful", [] {
     const std::wstring dir = MakeTempDir();
     const std::wstring dst = MakeTempDir();
