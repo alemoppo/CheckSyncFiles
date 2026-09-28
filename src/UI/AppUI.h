@@ -70,6 +70,8 @@ private:
     // .bvss file, second click disarms). Toggle semantics mirror onLoadSnapshot.
     void onArmSession();
     void onLoadResumeSession();
+    // Puts the PC to sleep (standby, not hibernate); warns on failure.
+    void SuspendOnce();
     // Copies the finished results out of the orchestrator once per run, so the
     // render loop never re-copies a large problem list on every repaint.
     void syncResultsCache(const bv::ScanOrchestrator::UiSnapshot& st);
@@ -103,6 +105,11 @@ private:
     // callback, so it is atomic (benign by nature, but tidy).
     std::atomic<bool> dirty_{true};
     bool quit_ = false;
+    // Standby-after-run checkbox: while checked, a successfully completed
+    // scan puts the PC to sleep once (edge-triggered per run via
+    // standbyDone_; cancelled/failed runs never suspend).
+    bool standbyAfterRun_ = false;
+    bool standbyDone_ = false;
     uint8_t filter_ = kFilterAll;
     int scroll_ = 0;
 

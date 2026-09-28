@@ -360,7 +360,10 @@ and only the rest is re-verified; empty source/destination fields are pre-filled
 resume arming are mutually exclusive. Cancelling a run with SESSIONE armed still saves whatever was
 finalized (`Interrupted` state), resumable later. Below the buttons, the Checkpoint row tunes the
 periodic flush while a session is armed (rows and seconds steppers cycling fixed ladders;
-0 = that trigger off, both 0 = save at the end only; defaults 1000 rows / 30 s).
+0 = that trigger off, both 0 = save at the end only; defaults 1000 rows / 30 s). The "Standby
+alla fine" checkbox (status row, right end; toggling allowed even mid-run) puts the PC to sleep
+once when a scan completes successfully (cancelled/incomplete runs never suspend; the checkbox
+stays as set for the next runs).
 
 ### With Visual Studio / MSVC and CMake (Windows 11)
 

@@ -15,6 +15,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <objbase.h>
+#include <powrprof.h>
 #include <shellapi.h>
 #include <shobjidl.h>
 
@@ -101,6 +102,14 @@ constexpr int kCkptSecsValX = kCkptSecsMinusX + kCkptBtnW + kCkptGap;
 constexpr int kCkptSecsPlusX = kCkptSecsValX + kCkptSecsValW + kCkptGap;
 constexpr int kCkptHintX = kCkptSecsPlusX + kCkptBtnW + 16;
 constexpr int kCkptCtlH = 22;
+
+// Standby-after-run checkbox geometry: status row (y6), right end. Wide
+// enough for the box plus the "Standby alla fine" label.
+inline SDL_FRect StandbyRect(int winW, int y6) {
+    constexpr float w = 200.0f, h = 24.0f;
+    return SDL_FRect{static_cast<float>(winW - kMargin) - w, static_cast<float>(y6 + 3), w,
+                     h};
+}
 
 // Slider pixel -> 0..100 percent (clamped, rounded).
 int SliderPercentFromX(int mx) {
@@ -1122,6 +1131,12 @@ void AppUI::OnMouseDown(int mx, int my) {
         onLoadResumeSession();
         dirty_.store(true);
     }
+    // Standby checkbox: toggling is always allowed, even mid-run (the main
+    // use case is arming it after AVVIA and walking away).
+    if (hit(mx, my, StandbyRect(winW_, L.y6))) {
+        standbyAfterRun_ = !standbyAfterRun_;
+        dirty_.store(true);
+    }
 
     // Filters (7 problem views + the Tempistiche timings view).
     const int fr = 92;
@@ -1634,6 +1649,15 @@ void AppUI::onLoadResumeSession() {
     dirty_.store(true);
 }
 
+void AppUI::SuspendOnce() {
+    // Sleep (standby, RAM stays powered) rather than hibernate: FALSE selects
+    // suspend. Needs SE_SHUTDOWN_NAME, normally held by interactive users.
+    if (!SetSuspendState(FALSE, FALSE, FALSE)) {
+        MessageBoxW(nullptr, L"Standby non riuscito: privilegi insufficienti.",
+                    L"CheckSyncFiles", MB_ICONWARNING | MB_OK);
+    }
+}
+
 void AppUI::syncResultsCache(const bv::ScanOrchestrator::UiSnapshot& st) {
     if (st.resultsReady && !resultsReadySeen_) {
         uiResults_ = orch_.results();
@@ -1693,6 +1717,17 @@ void AppUI::render(const bv::ScanOrchestrator::UiSnapshot& st) {
     // Fold in a finished single-file re-verification, if any. Same frame,
     // same main thread: no race with the list draw below.
     PollSingleVerify();
+
+    // Standby-after-run: fire once per successfully completed scan. Cancelled
+    // or incomplete runs never suspend (the user is either present or the run
+    // needs attention). Single-file re-verifications never touch resultsReady.
+    if (!st.resultsReady) {
+        standbyDone_ = false;
+    } else if (standbyAfterRun_ && !standbyDone_ && st.sourceOk && st.destinationOk &&
+               !st.cancelled) {
+        standbyDone_ = true;
+        SuspendOnce();
+    }
 
     const Layout L = ComputeLayout(winW_, winH_);
 
@@ -2084,6 +2119,30 @@ void AppUI::render(const bv::ScanOrchestrator::UiSnapshot& st) {
                   statusNote;
     }
     DrawText(renderer_, fontBody_, ToUtf8(status), kMargin, L.y6, kTextHi);
+
+    // ---- Standby-after-run checkbox (status row, right end, above text) ----
+    {
+        const SDL_FRect sb = StandbyRect(winW_, L.y6);
+        const bool overStandby =
+            hit(static_cast<int>(mx), static_cast<int>(my), sb);
+        const int bx = static_cast<int>(sb.x) + 8;
+        const int by = L.y6 + 7;
+        constexpr int kBox = 16;
+        FillRect(renderer_, bx, by, kBox, kBox, kField);
+        DrawRect(renderer_, bx, by, kBox, kBox, overStandby ? kAccentHover : kBorder);
+        if (standbyAfterRun_) {
+            SDL_SetRenderDrawColor(renderer_, kTextHi.r, kTextHi.g, kTextHi.b,
+                                   kTextHi.a);
+            SDL_RenderLine(renderer_, static_cast<float>(bx + 3), static_cast<float>(by + 3),
+                           static_cast<float>(bx + kBox - 3),
+                           static_cast<float>(by + kBox - 3));
+            SDL_RenderLine(renderer_, static_cast<float>(bx + 3),
+                           static_cast<float>(by + kBox - 3),
+                           static_cast<float>(bx + kBox - 3), static_cast<float>(by + 3));
+        }
+        DrawTextVCenter(renderer_, fontBody_, "Standby alla fine", bx + kBox + 8, L.y6, 26,
+                        kTextHi);
+    }
     if (!footerMetrics.empty()) {
         DrawTextRight(renderer_, fontBody_, ToUtf8(footerMetrics), winW_ - kMargin, L.metricsY,
                       kTextLo);

@@ -40,7 +40,7 @@ if(BUILD_GUI)
     UI/AppUI.cpp
     UI/Utf.cpp
   )
-  target_link_libraries(bv_gui PRIVATE bv_core SDL3::SDL3 SDL3_ttf::SDL3_ttf ole32 uuid shell32)
+  target_link_libraries(bv_gui PRIVATE bv_core SDL3::SDL3 SDL3_ttf::SDL3_ttf ole32 uuid shell32 powrprof)
   if(MINGW)
     target_link_libraries(bv_gui PRIVATE winmm)
   endif()
