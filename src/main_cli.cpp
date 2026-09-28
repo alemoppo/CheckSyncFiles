@@ -768,7 +768,7 @@ bv::ScanController controller(options.caseSensitive);
 
     std::wcout << L"\nTempo totale:            " << FormatTime(report.secondsTotal) << L"\n";
     if (report.usedSession && report.sessionTotalMillis > 0)
-        std::wcout << L"Tempo cumulato (run prec.): " << FormatTime(report.sessionTotalMillis / 1000.0)
+        std::wcout << L"Tempo cumulato (tutte le run): " << FormatTime(report.sessionTotalMillis / 1000.0)
                    << L"\n";
     std::wcout << L"  - enum sorgente:       " << FormatTime(report.secondsEnumerateSource) << L"\n";
     std::wcout << L"  - destinazione+confr:  " << FormatTime(report.secondsDestinationPass) << L"\n";
