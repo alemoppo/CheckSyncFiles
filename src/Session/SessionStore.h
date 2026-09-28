@@ -28,6 +28,7 @@
 //     "progressA":{ "files":uint, "dirs":uint, "bytes":uint },
 //     "progressB":{…}, "stats":{…19 counters…},
 //     "checkpoint":{ "seq":uint, "at":uint },
+//     "runMillis":uint,   // cumulative wall time, optional on load (default 0)
 //     "journal":{ "file":"<name>.bvj", "records":uint, "bytes":uint,
 //                 "crc32":uint } }
 //

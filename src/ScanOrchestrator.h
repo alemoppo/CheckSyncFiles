@@ -50,6 +50,9 @@ public:
         bool lastSessionSaved = false; // last run wrote a session file
         uint64_t lastSessionReused = 0;
         uint64_t lastSessionStale = 0;
+        // Cumulative wall time (previous runs + last one, milliseconds): lets
+        // the UI show time since the very first run of a resumed session.
+        uint64_t lastSessionTotalMillis = 0;
         // Checkpoint knobs applied to armed session runs (0 = that trigger
         // off; both 0 = save at the end only). Defaults: 1000 rows / 30 s.
         uint64_t checkpointRows = 1000;
@@ -221,6 +224,7 @@ private:
     bool lastSessionSaved_ = false;
     uint64_t lastSessionReused_ = 0;
     uint64_t lastSessionStale_ = 0;
+    uint64_t lastSessionTotalMillis_ = 0;
     std::wstring lastSessionPath_;
 
     // Run state.

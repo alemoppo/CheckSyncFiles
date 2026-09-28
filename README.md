@@ -355,7 +355,8 @@ read): a second click or choosing a source with Browse returns to online mode. S
 resumable session (`<base>.bvss` + `<base>.bvj`, default name derived from the source) at the end of the
 next runs, with periodic checkpoints every 1000 rows / 30 s while armed; a second click disarms it.
 RIPRENDI arms resuming a previous session (open dialog for a `.bvss` file): unchanged files are reused
-and only the rest is re-verified (live roots still required); a second click disarms it. Snapshot and
+and only the rest is re-verified; empty source/destination fields are pre-filled from the session
+(explicitly typed roots always win), and the footer shows cumulative time since the first run. Snapshot and
 resume arming are mutually exclusive. Cancelling a run with SESSIONE armed still saves whatever was
 finalized (`Interrupted` state), resumable later. Below the buttons, the Checkpoint row tunes the
 periodic flush while a session is armed (rows and seconds steppers cycling fixed ladders;
@@ -392,7 +393,10 @@ During a long scan with `--session-out`, `--checkpoint-rows N` and/or
 so a crash, reboot or cancellation loses at most one interval of work; the
 interrupted session stays resumable with `--resume`. Cancelling a run with an
 active `--session-out` still saves whatever was finalized (`Interrupted`
-state). A resumed run can itself refresh the snapshot (`--resume` with
+state). Roots are remembered: `--resume <base>` fills in a missing `--source`
+/ `--dest` from the session file (explicit flags always win). Every save
+accumulates wall time (`runMillis`), so a resumed run reports time since the
+very first run as well as its own. A resumed run can itself refresh the snapshot (`--resume` with
 `--snapshot-out`) or verify offline against one (`--resume` with `--compare`):
 in the offline case the source device is not needed and remainder digests come
 from the snapshot.

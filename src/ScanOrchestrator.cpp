@@ -9,6 +9,8 @@
 #include <windows.h>
 
 #include "Export/CsvExporter.h"
+#include "Filesystem/PathUtil.h"
+#include "Session/SessionStore.h"
 
 namespace bv {
 
@@ -210,7 +212,19 @@ void ScanOrchestrator::clearSessionOut() {
 
 void ScanOrchestrator::loadResumeSession(std::wstring file) {
     std::lock_guard<std::mutex> lk(mtx_);
-    resumeFile_ = StripSessionSuffix(std::move(file));
+    const std::wstring base = StripSessionSuffix(std::move(file));
+    // Validate immediately (instead of failing at AVVIA) and pre-fill empty
+    // roots from the session: the user no longer retypes what is saved.
+    // Explicitly typed roots always win (e.g. resuming onto a moved tree).
+    session::ScanSession sess;
+    const session::LoadOutcome outcome = session::LoadSession(base, sess);
+    if (!outcome.ok) {
+        statusNote_ = L"Sessione non valida: " + pathutil::FromUtf8(outcome.detail);
+        return;
+    }
+    resumeFile_ = base;
+    if (source_.empty() && !sess.sourceA.empty()) source_ = sess.sourceA;
+    if (dest_.empty() && !sess.sourceB.empty()) dest_ = sess.sourceB;
     useResume_ = true;
     useSnapshot_ = false; // mutually exclusive modes
     snapshotFile_.clear();
@@ -490,6 +504,7 @@ ScanOrchestrator::UiSnapshot ScanOrchestrator::snapshot() const {
     s.lastSessionSaved = lastSessionSaved_;
     s.lastSessionReused = lastSessionReused_;
     s.lastSessionStale = lastSessionStale_;
+    s.lastSessionTotalMillis = lastSessionTotalMillis_;
     s.checkpointRows = checkpointRows_;
     s.checkpointSecs = checkpointSecs_;
     s.running = running_;
@@ -605,6 +620,7 @@ void ScanOrchestrator::workerThread(ScanOptions options) {
         lastSessionPath_ = report.sessionPath;
         lastSessionReused_ = report.sessionReused;
         lastSessionStale_ = report.sessionStale;
+        lastSessionTotalMillis_ = report.sessionTotalMillis;
         lastDegraded_ = report.contentDegradedToSize;
         sourceOk_ = report.sourceOk;
         destinationOk_ = report.destinationOk;

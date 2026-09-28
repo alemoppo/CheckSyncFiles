@@ -381,6 +381,7 @@ ScanReport ScanController::run(const ScanOptions& options) {
     // index, per-side enumeration error dirs (force stale), rows reused by the
     // plan (re-saved on --session-out), and the captured-row sink.
     session::ScanSession resumeSession;
+    uint64_t resumePrevMillis = 0; // wall time accumulated by previous runs
     FileIndex destIndex(caseSensitive_);
     std::vector<std::wstring> resumeErrA;
     std::vector<std::wstring> resumeErrB;
@@ -448,6 +449,8 @@ ScanReport ScanController::run(const ScanOptions& options) {
                          checkpointStats.bytesDest};
         ctx.stats = checkpointStats;
         ctx.checkpoint = {checkpointSeq, session::NowUnixSeconds()};
+        ctx.runMillis = resumePrevMillis +
+                        static_cast<uint64_t>((NowSeconds() - t0) * 1000.0);
         std::wstring werr;
         bool ok = false;
         if (!checkpointBootstrapped) {
@@ -684,6 +687,7 @@ ScanReport ScanController::run(const ScanOptions& options) {
             resumeFail(L"impossibile caricare la sessione: " +
                        pathutil::FromUtf8(loaded.detail));
         } else {
+            resumePrevMillis = resumeSession.runMillis;
             session::ScanSettings current;
             current.mode = options.mode;
             current.caseSensitive = caseSensitive_;
@@ -1053,6 +1057,8 @@ ScanReport ScanController::run(const ScanOptions& options) {
                           report.results.stats.bytesDest};
         sess.stats = report.results.stats;
         sess.checkpoint = {checkpointSeq, sess.createdAtUnix};
+        sess.runMillis =
+            resumePrevMillis + static_cast<uint64_t>((NowSeconds() - t0) * 1000.0);
         return sess;
     };
 
@@ -1161,6 +1167,9 @@ ScanReport ScanController::run(const ScanOptions& options) {
     report.secondsDestinationPass = t3 - t0 - report.secondsEnumerateSource -
                                     report.secondsHashing;
     report.secondsTotal = t3 - t0;
+    if (report.usedSession)
+        report.sessionTotalMillis =
+            resumePrevMillis + static_cast<uint64_t>(report.secondsTotal * 1000.0);
 
     if (hashProf) hashProf->Finalize(report.hashProfile);
 

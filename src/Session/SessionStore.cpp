@@ -444,6 +444,7 @@ std::string BuildContext(const ScanSession& s, const std::string& journalName,
     (*cp.obj)["seq"] = Value::Int((int64_t)s.checkpoint.seq);
     (*cp.obj)["at"] = Value::Int((int64_t)s.checkpoint.atUnix);
     o["checkpoint"] = cp;
+    o["runMillis"] = Value::Int((int64_t)s.runMillis);
     Value j = Value::MakeObject();
     (*j.obj)["file"] = Value::String(journalName);
     (*j.obj)["records"] = Value::Int((int64_t)journalRecords);
@@ -604,6 +605,16 @@ bool ParseContext(const std::string& text, ScanSession& out, SessionError& error
     }
     s.checkpoint.seq = (uint64_t)seq;
     s.checkpoint.atUnix = (uint64_t)at;
+    // Optional (defaults to 0): sessions written before runMillis existed.
+    s.runMillis = 0;
+    if (const Value* rm = root.find("runMillis")) {
+        if (rm->type != Value::Type::Int || rm->integer < 0) {
+            error = SessionError::CorruptHeader;
+            detail = "bad runMillis";
+            return false;
+        }
+        s.runMillis = (uint64_t)rm->integer;
+    }
     const Value* j = root.find("journal");
     if (!j || j->type != Value::Type::Object) {
         error = SessionError::CorruptHeader;

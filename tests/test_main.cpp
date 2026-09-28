@@ -5182,15 +5182,28 @@ TEST("orchestrator: resume run reuses rows and matches the first run", [] {
 });
 
 TEST("orchestrator: snapshot and resume arming are mutually exclusive", [] {
+    // Arming a resume validates the file immediately, so this needs a real one.
+    const std::wstring dir = MakeTempDir();
+    const std::wstring base = dir + L"\\sess";
+    bv::session::ScanSession seed;
+    seed.sessionId = "arming-test";
+    seed.sourceA = L"C:\\a";
+    seed.sourceB = L"C:\\b";
+    std::wstring serr;
+    CHECK(bv::session::SaveSession(base, seed, serr));
+
     bv::ScanOrchestrator orch;
     orch.loadSnapshot(L"C:\\x.bin");
     CHECK(orch.snapshot().useSnapshot);
-    orch.loadResumeSession(L"C:\\y.bvss");
+    orch.loadResumeSession(base + L".bvss");
     CHECK(!orch.snapshot().useSnapshot);
     CHECK(orch.snapshot().useResume);
     // The store suffix is stripped: dialogs return the picked file, the store
     // wants the base.
-    CHECK(orch.snapshot().resumeFile == L"C:\\y");
+    CHECK(orch.snapshot().resumeFile == base);
+    // Empty roots are pre-filled from the session.
+    CHECK(orch.snapshot().source == L"C:\\a");
+    CHECK(orch.snapshot().dest == L"C:\\b");
     orch.loadSnapshot(L"C:\\z.bin");
     CHECK(orch.snapshot().useSnapshot);
     CHECK(!orch.snapshot().useResume);
@@ -5198,9 +5211,21 @@ TEST("orchestrator: snapshot and resume arming are mutually exclusive", [] {
     CHECK(orch.snapshot().sessionOut == L"C:\\s");
     orch.clearSessionOut();
     CHECK(orch.snapshot().sessionOut.empty());
-    orch.loadResumeSession(L"C:\\y.bvss");
+    // Explicitly typed roots win over the session ones.
+    orch.setSource(L"D:\\other");
+    orch.loadResumeSession(base);
+    CHECK(orch.snapshot().useResume);
+    CHECK(orch.snapshot().source == L"D:\\other");
+    CHECK(orch.snapshot().dest == L"C:\\b");
     orch.clearResume();
     CHECK(!orch.snapshot().useResume);
+});
+
+TEST("orchestrator: resume arming refuses an unloadable session", [] {
+    bv::ScanOrchestrator orch;
+    orch.loadResumeSession(L"C:\\does\\not\\exist");
+    CHECK(!orch.snapshot().useResume);
+    CHECK(orch.snapshot().resumeFile.empty());
 });
 
 TEST("orchestrator: failed source is exposed as incomplete, not successful", [] {

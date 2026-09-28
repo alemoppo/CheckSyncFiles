@@ -84,8 +84,10 @@ uint64_t StepLadder(uint64_t cur, const uint64_t* ladder, size_t n, int dir) {
     return ladder[0];
 }
 
-// Checkpoint row geometry (label + two -/value/+ steppers + hint).
-constexpr int kCkptX0 = kMargin + 110;
+// Checkpoint row geometry (label + two -/value/+ steppers + hint). The label
+// "Checkpoint: righe" is ~17 chars, so the controls start at +170 to avoid
+// overlapping its tail; everything chains from kCkptX0 (label stays put).
+constexpr int kCkptX0 = kMargin + 170;
 constexpr int kCkptBtnW = 28;
 constexpr int kCkptGap = 6;
 constexpr int kCkptRowsValW = 70;
@@ -2058,6 +2060,8 @@ void AppUI::render(const bv::ScanOrchestrator::UiSnapshot& st) {
                              FormatRateCountW(uiResults_.stats.sourceFiles,
                                               st.lastSecondsTotal);
         }
+        if (st.lastUsedSession && st.lastSessionTotalMillis > 0)
+            footerMetrics += L"   Cumulato: " + FormatHms(st.lastSessionTotalMillis / 1000.0);
     }
     // Run-level partial banner (like the offline note above): percent and
     // pattern EFFECTIVELY used, shown only when the read was really partial.

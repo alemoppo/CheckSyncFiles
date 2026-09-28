@@ -119,6 +119,7 @@ ScanSession MakeRichSession() {
     s.stats.bytesSource = 100000;
     s.stats.bytesDest = 90000;
     s.checkpoint = {7, NowUnixSeconds()};
+    s.runMillis = 123456;
     s.journal.push_back(MakeEntry(L"Foto\\img001.jpg", Status::Identical, true));
     JournalEntry cm = MakeEntry(L"Docs\\relazione.docx", Status::ContentMismatchPartial, true);
     cm.verifiedPercent = 50;
@@ -175,6 +176,7 @@ void CheckSessionEqual(const ScanSession& a, const ScanSession& b) {
     CHECK(StatsEqual(a.stats, b.stats));
     CHECK(a.checkpoint.seq == b.checkpoint.seq);
     CHECK(a.checkpoint.atUnix == b.checkpoint.atUnix);
+    CHECK(a.runMillis == b.runMillis);
     CHECK(a.journal.size() == b.journal.size());
     for (size_t i = 0; i < a.journal.size() && i < b.journal.size(); ++i)
         CHECK(a.journal[i] == b.journal[i]);
@@ -403,6 +405,29 @@ TEST("session: missing journal with zero records loads cleanly", [] {
 
 TEST("session: session ids are unique", [] {
     CHECK(GenerateSessionId() != GenerateSessionId());
+});
+
+TEST("session: header without runMillis loads with zero (old sessions)", [] {
+    TempDir tmp;
+    const std::wstring base = tmp.path + L"\\sess";
+    ScanSession src = MakeRichSession();
+    CHECK(src.runMillis != 0u);
+    std::wstring err;
+    CHECK(SaveSession(base, src, err));
+    std::string ctx = ReadRawBytes(ContextPath(base));
+    CHECK(!ctx.empty());
+    json::Value v;
+    std::string perr;
+    CHECK(json::Parse(ctx, v, perr));
+    CHECK(v.obj->erase("runMillis") == 1u);
+    const std::string slim = json::Write(v);
+    CHECK(WriteRawBytes(ContextPath(base), slim.data(), slim.size()));
+    RemoveOne(PrevPath(base));
+    ScanSession loaded;
+    LoadOutcome o = LoadSession(base, loaded);
+    CHECK(o.ok);
+    CHECK(loaded.runMillis == 0u);
+    CHECK(loaded.sessionId == src.sessionId);
 });
 
 namespace {

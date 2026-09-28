@@ -420,6 +420,28 @@ TEST("resume: offline resume against a snapshot matches offline fresh", [] {
     CHECK(ProblemsEqual(resumed.results.problems, freshOffline.results.problems));
 });
 
+TEST("resume: cumulative wall time grows monotonically across chained runs", [] {
+    TempDir tmp;
+    const std::wstring src = MakeTwinTrees(tmp.path);
+    const std::wstring dst = tmp.path + L"\\dst";
+    const std::wstring base = tmp.path + L"\\sess";
+    ScanReport first = RunScan(src, dst, ScanMode::Content, base);
+    CHECK(first.sessionSaved);
+    ScanSession s1;
+    CHECK(LoadSession(base, s1).ok);
+    ScanReport second = RunScan(src, dst, ScanMode::Content, L"", base);
+    CHECK(second.usedSession);
+    CHECK(second.sessionTotalMillis >= s1.runMillis);
+    // A resumed run that re-saves chains the accumulation forward.
+    ScanReport third = RunScan(src, dst, ScanMode::Content, base, base);
+    CHECK(third.usedSession);
+    CHECK(third.sessionSaved);
+    ScanSession s3;
+    CHECK(LoadSession(base, s3).ok);
+    CHECK(s3.runMillis >= s1.runMillis);
+    CHECK(third.sessionTotalMillis >= s3.runMillis);
+});
+
 TEST("resume: incompatible settings fail cleanly", [] {
     TempDir tmp;
     const std::wstring src = MakeTwinTrees(tmp.path);

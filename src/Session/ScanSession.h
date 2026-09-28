@@ -127,6 +127,10 @@ struct ScanSession {
     SideProgress progressB;
     Stats stats; // cumulative counters over journaled rows
     CheckpointInfo checkpoint;
+    // Cumulative wall-clock time of all runs contributing to this session, in
+    // milliseconds (previous runs + current run at save time). Optional on
+    // load (defaults to 0) so pre-change sessions still read.
+    uint64_t runMillis = 0;
     std::vector<JournalEntry> journal; // finalized rows only (see above)
 };
 

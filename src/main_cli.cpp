@@ -14,6 +14,7 @@
 
 #include "ScanController.h"
 #include "Profiling/HashProfile.h"
+#include "Session/SessionStore.h"
 #include "Util/StrictNumbers.h"
 
 #define WIN32_LEAN_AND_MEAN
@@ -183,6 +184,26 @@ bool ParseArgs(int argc, wchar_t** argv, Args& out) {
     if (out.help) return true;
 
     if (!out.resumeFrom.empty()) {
+        // Missing roots are filled from the session file (explicit flags win;
+        // with --compare the source stays empty by design: it comes from the
+        // snapshot). A trailing ".bvss" picked from a file dialog is tolerated.
+        std::wstring resumeBase = out.resumeFrom;
+        constexpr wchar_t kSessSuffix[] = L".bvss";
+        constexpr size_t kSessSuffixLen = sizeof(kSessSuffix) / sizeof(wchar_t) - 1;
+        if (resumeBase.size() > kSessSuffixLen &&
+            resumeBase.compare(resumeBase.size() - kSessSuffixLen, kSessSuffixLen,
+                               kSessSuffix) == 0)
+            resumeBase.resize(resumeBase.size() - kSessSuffixLen);
+        bv::session::ScanSession sess;
+        const bv::session::LoadOutcome loaded = bv::session::LoadSession(resumeBase, sess);
+        if (!loaded.ok) {
+            std::wcerr << L"Errore: sessione non valida.\n\n";
+            return false;
+        }
+        if (out.source.empty() && out.compareFrom.empty() && !sess.sourceA.empty())
+            out.source = sess.sourceA;
+        if (out.dest.empty() && !sess.sourceB.empty()) out.dest = sess.sourceB;
+        out.resumeFrom = resumeBase;
         // Offline resume (--compare): source from the snapshot, like --compare.
         if (!out.compareFrom.empty()) {
             if (!out.source.empty()) {
@@ -742,6 +763,9 @@ bv::ScanController controller(options.caseSensitive);
     }
 
     std::wcout << L"\nTempo totale:            " << FormatTime(report.secondsTotal) << L"\n";
+    if (report.usedSession && report.sessionTotalMillis > 0)
+        std::wcout << L"Tempo cumulato (run prec.): " << FormatTime(report.sessionTotalMillis / 1000.0)
+                   << L"\n";
     std::wcout << L"  - enum sorgente:       " << FormatTime(report.secondsEnumerateSource) << L"\n";
     std::wcout << L"  - destinazione+confr:  " << FormatTime(report.secondsDestinationPass) << L"\n";
     std::wcout << L"  - verifica contenuti:  " << FormatTime(report.secondsHashing) << L"\n";

@@ -185,9 +185,12 @@ struct ScanReport {
     // Phase 1: resumable sessions ------------------------------------------------
     bool usedSession = false;   // this run resumed a previous session
     uint64_t sessionReused = 0; // journaled rows reused as-is
-    uint64_t sessionStale = 0;  // journaled rows routed to re-verification
+    uint64_t sessionStale = 0;  // journaled paths routed to re-verification
     bool sessionSaved = false;  // a session file was written for this run
     std::wstring sessionPath;   // base path it was written to
+    // Cumulative wall time (previous runs + this one, milliseconds), set when
+    // a session is resumed so the caller can show time since the very first run.
+    uint64_t sessionTotalMillis = 0;
 };
 
 // Orchestrates a comparison run:
