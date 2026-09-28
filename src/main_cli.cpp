@@ -741,6 +741,13 @@ bv::ScanController controller(options.caseSensitive);
     if (report.usedSession) {
         std::wcout << L"Sessione ripresa:     " << Group(report.sessionReused) << L" righe riusate, "
                    << Group(report.sessionStale) << L" riverificate\n";
+        if (report.sessionJournalTruncated)
+            std::wcout << L"ATTENZIONE: journal di sessione danneggiato in coda: "
+                       << Group(report.sessionRecovered)
+                       << L" righe recuperate, il resto riverificato.\n";
+        if (report.sessionFellBackToPrev)
+            std::wcout << L"ATTENZIONE: contesto sessione principale inutilizzabile: "
+                       << L"usato il backup precedente.\n";
     }
     if (report.sessionSaved) {
         std::wcout << L"Sessione salvata:     " << report.sessionPath << L"\n";

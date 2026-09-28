@@ -134,6 +134,19 @@ bool WriteText(const std::wstring& path, const std::string& data) {
     return static_cast<bool>(f);
 }
 
+bool WriteBytes(const std::wstring& path, const char* data, size_t n) {
+    std::ofstream f(fs::path(path), std::ios::binary | std::ios::trunc);
+    if (!f) return false;
+    f.write(data, static_cast<std::streamsize>(n));
+    f.flush();
+    return static_cast<bool>(f);
+}
+
+std::string ReadBytes(const std::wstring& path) {
+    std::ifstream f(fs::path(path), std::ios::binary);
+    return std::string((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+}
+
 void DumpProblems(const std::vector<FileResult>& problems) {
     for (const FileResult& p : problems) {
         printf("  [dbg] problem status=%d dir=%d rel=%ls sA=%llu sD=%llu\n", (int)p.status,
@@ -465,6 +478,50 @@ TEST("resume: cumulative wall time grows monotonically across chained runs", [] 
     CHECK(LoadSession(base, s3).ok);
     CHECK(s3.runMillis >= s1.runMillis);
     CHECK(third.sessionTotalMillis >= s3.runMillis);
+});
+
+TEST("resume: truncated journal still resumes, flags reported, results match fresh", [] {
+    TempDir tmp;
+    const std::wstring src = MakeTwinTrees(tmp.path);
+    const std::wstring dst = tmp.path + L"\\dst";
+    const std::wstring base = tmp.path + L"\\sess";
+    ScanReport first = RunScan(src, dst, ScanMode::Content, base);
+    CHECK(first.sessionSaved);
+    // Damage the journal mid-record (a torn crash tail).
+    const std::string jb = ReadBytes(bv::session::JournalPath(base));
+    CHECK(!jb.empty());
+    CHECK(WriteBytes(bv::session::JournalPath(base), jb.data(), jb.size() / 2));
+    ScanReport resumed = RunScan(src, dst, ScanMode::Content, L"", base);
+    CHECK(resumed.sourceOk);
+    CHECK(resumed.destinationOk);
+    CHECK(resumed.usedSession);
+    CHECK(resumed.sessionJournalTruncated);
+    CHECK(resumed.sessionRecovered > 0u);
+    CHECK(!resumed.sessionFellBackToPrev);
+    ScanReport fresh = RunScan(src, dst, ScanMode::Content);
+    CHECK(StatsEqual(resumed.results.stats, fresh.results.stats));
+    CHECK(ProblemsEqual(resumed.results.problems, fresh.results.problems));
+});
+
+TEST("resume: corrupt context falls back to .prev and reports it", [] {
+    TempDir tmp;
+    const std::wstring src = MakeTwinTrees(tmp.path);
+    const std::wstring dst = tmp.path + L"\\dst";
+    const std::wstring base = tmp.path + L"\\sess";
+    ScanReport first = RunScan(src, dst, ScanMode::Content, base);
+    CHECK(first.sessionSaved);
+    ScanReport again = RunScan(src, dst, ScanMode::Content, base);
+    CHECK(again.sessionSaved); // second save rotates a good .prev
+    const char junk[] = "{not valid json";
+    CHECK(WriteBytes(bv::session::ContextPath(base), junk, sizeof(junk) - 1));
+    ScanReport resumed = RunScan(src, dst, ScanMode::Content, L"", base);
+    CHECK(resumed.sourceOk);
+    CHECK(resumed.destinationOk);
+    CHECK(resumed.usedSession);
+    CHECK(resumed.sessionFellBackToPrev);
+    ScanReport fresh = RunScan(src, dst, ScanMode::Content);
+    CHECK(StatsEqual(resumed.results.stats, fresh.results.stats));
+    CHECK(ProblemsEqual(resumed.results.problems, fresh.results.problems));
 });
 
 TEST("resume: incompatible settings fail cleanly", [] {

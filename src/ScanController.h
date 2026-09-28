@@ -191,6 +191,11 @@ struct ScanReport {
     // Cumulative wall time (previous runs + this one, milliseconds), set when
     // a session is resumed so the caller can show time since the very first run.
     uint64_t sessionTotalMillis = 0;
+    // Journal health of the resumed session, copied from the load outcome so
+    // callers can warn (never fatal: unseen paths are simply re-verified).
+    bool sessionJournalTruncated = false;
+    size_t sessionRecovered = 0;
+    bool sessionFellBackToPrev = false;
 };
 
 // Orchestrates a comparison run:

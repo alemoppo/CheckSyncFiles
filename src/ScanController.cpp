@@ -687,6 +687,11 @@ ScanReport ScanController::run(const ScanOptions& options) {
             resumeFail(L"impossibile caricare la sessione: " +
                        pathutil::FromUtf8(loaded.detail));
         } else {
+            // Surface journal health for warnings (a damaged tail or a .prev
+            // fallback never stops the resume: unseen paths are re-verified).
+            report.sessionJournalTruncated = loaded.journalTruncated;
+            report.sessionRecovered = loaded.journalRecovered;
+            report.sessionFellBackToPrev = loaded.fellBackToPrev;
             resumePrevMillis = resumeSession.runMillis;
             session::ScanSettings current;
             current.mode = options.mode;

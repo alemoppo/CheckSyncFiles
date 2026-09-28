@@ -231,6 +231,9 @@ private:
     uint64_t lastSessionReused_ = 0;
     uint64_t lastSessionStale_ = 0;
     uint64_t lastSessionTotalMillis_ = 0;
+    bool lastSessionJournalTruncated_ = false;
+    size_t lastSessionRecovered_ = 0;
+    bool lastSessionFellBackToPrev_ = false;
     std::wstring lastSessionPath_;
 
     // Run state.

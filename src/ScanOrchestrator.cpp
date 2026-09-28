@@ -650,6 +650,9 @@ void ScanOrchestrator::workerThread(ScanOptions options) {
         lastSessionReused_ = report.sessionReused;
         lastSessionStale_ = report.sessionStale;
         lastSessionTotalMillis_ = report.sessionTotalMillis;
+        lastSessionJournalTruncated_ = report.sessionJournalTruncated;
+        lastSessionRecovered_ = report.sessionRecovered;
+        lastSessionFellBackToPrev_ = report.sessionFellBackToPrev;
         lastDegraded_ = report.contentDegradedToSize;
         sourceOk_ = report.sourceOk;
         destinationOk_ = report.destinationOk;
@@ -684,6 +687,18 @@ void ScanOrchestrator::workerThread(ScanOptions options) {
                               : reason;
         } else {
             statusNote_.clear();
+        }
+        // Journal health warnings ride along any resumed run (a damaged tail
+        // or a .prev fallback never stops the resume: unseen paths are
+        // re-verified, but the user must know about it).
+        if (lastUsedSession_) {
+            if (lastSessionJournalTruncated_)
+                statusNote_ += L" ATTENZIONE: journal di sessione danneggiato in coda: " +
+                               std::to_wstring(lastSessionRecovered_) +
+                               L" righe recuperate, il resto riverificato.";
+            if (lastSessionFellBackToPrev_)
+                statusNote_ += L" ATTENZIONE: contesto sessione principale inutilizzabile:"
+                               L" usato il backup precedente.";
         }
     }
     std::function<void()> hook;
