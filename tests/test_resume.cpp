@@ -693,6 +693,33 @@ TEST("resume: offline resume saves a re-resumable sourceA", [] {
     CHECK(ProblemsEqual(off2.results.problems, freshOffline.results.problems));
 });
 
+TEST("resume: re-saving to the same base preserves sessionId and createdAt", [] {
+    TempDir tmp;
+    const std::wstring src = MakeTwinTrees(tmp.path);
+    const std::wstring dst = tmp.path + L"\\dst";
+    const std::wstring base = tmp.path + L"\\sess";
+    const std::wstring base2 = tmp.path + L"\\sess2";
+    ScanReport first = RunScan(src, dst, ScanMode::Content, base);
+    CHECK(first.sessionSaved);
+    ScanSession s1;
+    CHECK(LoadSession(base, s1).ok);
+    // Resume from base, re-saving onto the SAME base: identity is preserved.
+    ScanReport second = RunScan(src, dst, ScanMode::Content, base, base);
+    CHECK(second.usedSession);
+    CHECK(second.sessionSaved);
+    ScanSession s2;
+    CHECK(LoadSession(base, s2).ok);
+    CHECK(s2.sessionId == s1.sessionId);
+    CHECK(s2.createdAtUnix == s1.createdAtUnix);
+    CHECK(s2.journal.size() == s1.journal.size());
+    // Re-saving onto an explicitly DIFFERENT base forks a new identity.
+    ScanReport third = RunScan(src, dst, ScanMode::Content, base2, base);
+    CHECK(third.sessionSaved);
+    ScanSession s3;
+    CHECK(LoadSession(base2, s3).ok);
+    CHECK(s3.sessionId != s1.sessionId);
+});
+
 TEST("resume: incompatible settings fail cleanly", [] {
     TempDir tmp;
     const std::wstring src = MakeTwinTrees(tmp.path);

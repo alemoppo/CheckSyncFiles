@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <filesystem>
 #include <functional>
 #include <memory>
 #include <random>
@@ -97,6 +98,20 @@ const char* BackendName(EnumeratorBackend b) {
 const std::wstring& SessionSourceA(bool haveCompare, const std::wstring& loadedRoot,
                                    const std::wstring& liveSource) {
     return haveCompare ? loadedRoot : liveSource;
+}
+
+// Whether two session base paths address the same session files, after
+// absolutizing and normalizing (covers "./x" vs "x" spellings; comparison is
+// exact otherwise, so unrelated spellings of the same file via symlinks or
+// 8.3 names fork instead of merging -- safe direction).
+bool SameSessionBase(const std::wstring& a, const std::wstring& b) {
+    if (a == b) return true;
+    std::error_code ec;
+    const auto na = std::filesystem::absolute(std::filesystem::path(a), ec).lexically_normal();
+    if (ec) return false;
+    const auto nb = std::filesystem::absolute(std::filesystem::path(b), ec).lexically_normal();
+    if (ec) return false;
+    return na == nb;
 }
 
 // Full single-side enumeration with MFT -> Win32 fallback (resume path).
@@ -392,6 +407,12 @@ ScanReport ScanController::run(const ScanOptions& options) {
     // plan (re-saved on --session-out), and the captured-row sink.
     session::ScanSession resumeSession;
     uint64_t resumePrevMillis = 0; // wall time accumulated by previous runs
+    // Identity preservation (Section 4): when the run re-saves onto the same
+    // base it resumed from, the session keeps its id/createdAt; an explicitly
+    // different base forks a new identity.
+    bool keepSessionIdentity = false;
+    std::string keepSessionId;
+    uint64_t keepCreatedAt = 0;
     // Source root recorded in the snapshot (offline mode only): declared here,
     // before the checkpoint lambdas that refer to it; assigned in section 1
     // and read only from section 2 on. Empty unless a snapshot was loaded.
@@ -431,8 +452,13 @@ ScanReport ScanController::run(const ScanOptions& options) {
     auto doCheckpoint = [&](session::SessionState state) -> bool {
         std::lock_guard<std::mutex> lock(checkpointMutex);
         if (checkpointSessionId.empty()) {
-            checkpointSessionId = session::GenerateSessionId();
-            checkpointCreatedAt = session::NowUnixSeconds();
+            if (keepSessionIdentity) {
+                checkpointSessionId = keepSessionId;
+                checkpointCreatedAt = keepCreatedAt;
+            } else {
+                checkpointSessionId = session::GenerateSessionId();
+                checkpointCreatedAt = session::NowUnixSeconds();
+            }
         }
         for (ClassifiedRow& row : rowSink.take()) {
             checkpointTakenTotal.fetch_add(1, std::memory_order_relaxed);
@@ -705,6 +731,12 @@ ScanReport ScanController::run(const ScanOptions& options) {
             report.sessionRecovered = loaded.journalRecovered;
             report.sessionFellBackToPrev = loaded.fellBackToPrev;
             resumePrevMillis = resumeSession.runMillis;
+            if (!options.sessionOut.empty() &&
+                SameSessionBase(options.sessionOut, options.resumeFrom)) {
+                keepSessionIdentity = true;
+                keepSessionId = resumeSession.sessionId;
+                keepCreatedAt = resumeSession.createdAtUnix;
+            }
             session::ScanSettings current;
             current.mode = options.mode;
             current.caseSensitive = caseSensitive_;
@@ -1058,8 +1090,13 @@ ScanReport ScanController::run(const ScanOptions& options) {
     // final report; the journal is filled by the caller).
     auto buildFinalSession = [&](session::SessionState state) {
         session::ScanSession sess;
-        sess.sessionId = session::GenerateSessionId();
-        sess.createdAtUnix = session::NowUnixSeconds();
+        if (keepSessionIdentity) {
+            sess.sessionId = keepSessionId;
+            sess.createdAtUnix = keepCreatedAt;
+        } else {
+            sess.sessionId = session::GenerateSessionId();
+            sess.createdAtUnix = session::NowUnixSeconds();
+        }
         sess.sourceA = SessionSourceA(haveCompare, loadedRoot, options.source);
         sess.sourceB = options.destination;
         // See doCheckpoint: the journaled rows were produced under the

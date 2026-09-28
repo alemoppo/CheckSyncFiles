@@ -117,7 +117,11 @@ struct JournalEntry {
 // to reconstruct the remaining work. No runtime state.
 struct ScanSession {
     uint32_t schemaVersion = kSchemaVersion;
-    std::string sessionId;   // opaque unique id (see GenerateSessionId)
+    // Opaque unique id (see GenerateSessionId). Identity semantics: a run
+    // that re-saves onto the SAME base it resumed from preserves id and
+    // createdAt (one logical session across runs); saving onto an explicitly
+    // different base forks a new identity.
+    std::string sessionId;
     uint64_t createdAtUnix = 0; // Unix seconds (UTC)
     std::wstring sourceA;    // live root, or snapshot path for offline runs
     std::wstring sourceB;    // destination root
