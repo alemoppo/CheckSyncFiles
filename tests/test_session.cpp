@@ -431,6 +431,56 @@ TEST("session: session ids are unique", [] {
     CHECK(GenerateSessionId() != GenerateSessionId());
 });
 
+TEST("session: required header fields are strict, unknown ones ignored", [] {
+    TempDir tmp;
+    const std::wstring base = tmp.path + L"\\sess";
+    ScanSession src = MakeRichSession();
+    std::wstring err;
+    CHECK(SaveSession(base, src, err));
+    const std::string ctx = ReadRawBytes(ContextPath(base));
+    CHECK(!ctx.empty());
+    RemoveOne(PrevPath(base));
+    auto tryMutant = [&](auto mutate, bool expectOk) {
+        json::Value v;
+        std::string perr;
+        CHECK(json::Parse(ctx, v, perr));
+        mutate(v);
+        const std::string text = json::Write(v);
+        CHECK(WriteRawBytes(ContextPath(base), text.data(), text.size()));
+        ScanSession loaded;
+        LoadOutcome o = LoadSession(base, loaded);
+        CHECK(o.ok == expectOk);
+        if (!expectOk) CHECK(o.error == SessionError::CorruptHeader);
+        return o.ok;
+    };
+    // Missing or wrong-typed required fields are corruption...
+    CHECK(!tryMutant([](json::Value& v) { CHECK(v.obj->erase("sourceA") == 1u); }, false));
+    CHECK(!tryMutant(
+        [](json::Value& v) { *FindMutable(v, "sourceB") = json::Value::Int(7); }, false));
+    CHECK(!tryMutant([](json::Value& v) { CHECK(v.obj->erase("settings") == 1u); }, false));
+    CHECK(!tryMutant(
+        [](json::Value& v) {
+            CHECK(FindMutable(*FindMutable(v, "settings"), "verify")->obj->erase("pattern") ==
+                  1u);
+        },
+        false));
+    CHECK(!tryMutant([](json::Value& v) { CHECK(v.obj->erase("state") == 1u); }, false));
+    CHECK(!tryMutant([](json::Value& v) { CHECK(v.obj->erase("progressA") == 1u); }, false));
+    CHECK(!tryMutant([](json::Value& v) { CHECK(v.obj->erase("checkpoint") == 1u); }, false));
+    // ...while unknown future fields are ignored for extensibility.
+    CHECK(tryMutant(
+        [](json::Value& v) {
+            (*v.obj)["futureField"] = json::Value::String("whatever");
+            (*v.obj)["anotherOne"] = json::Value::Int(42);
+        },
+        true));
+    // Restore the valid header: the last mutant left a corrupt one behind.
+    CHECK(WriteRawBytes(ContextPath(base), ctx.data(), ctx.size()));
+    ScanSession loaded;
+    CHECK(LoadSession(base, loaded).ok);
+    CHECK(loaded.sessionId == src.sessionId);
+});
+
 TEST("session: out-of-range settings are corrupt, not wrapped", [] {
     TempDir tmp;
     const std::wstring base = tmp.path + L"\\sess";

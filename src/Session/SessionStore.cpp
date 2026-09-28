@@ -529,8 +529,18 @@ bool ParseContext(const std::string& text, ScanSession& out, SessionError& error
         detail = "missing sessionId";
         return false;
     }
-    s.sourceA = pathutil::FromUtf8(root.find("sourceA") ? root.find("sourceA")->asString() : "");
-    s.sourceB = pathutil::FromUtf8(root.find("sourceB") ? root.find("sourceB")->asString() : "");
+    // Required fields: the key must exist and hold a string (an empty value
+    // stays valid -- offline sessions legitimately record an empty sourceA).
+    // Anything else is corruption, never a silent default.
+    const Value* sA = root.find("sourceA");
+    const Value* sB = root.find("sourceB");
+    if (!sA || sA->type != Value::Type::String || !sB || sB->type != Value::Type::String) {
+        error = SessionError::CorruptHeader;
+        detail = "missing/invalid sourceA/sourceB";
+        return false;
+    }
+    s.sourceA = pathutil::FromUtf8(sA->str);
+    s.sourceB = pathutil::FromUtf8(sB->str);
     const Value* set = root.find("settings");
     if (!set || set->type != Value::Type::Object) {
         error = SessionError::CorruptHeader;
