@@ -215,6 +215,92 @@ TEST("resume: duplicate journal paths count once, last wins", [] {
     CHECK(plan.reusedProblems[0].status == Status::ContentMismatch);
 });
 
+TEST("resume: file turned directory is stale even with matching size/mtime", [] {
+    FileIndex curA(false), curB(false);
+    curA.addEntry(MkEntry(L"a.txt", 100, 1000));
+    // A directory crafted with the same size/mtime: fingerprints match, only
+    // the type differs. The saved file row must NOT be reused.
+    FileEntry dirB = MkEntry(L"a.txt", 100, 1000, true);
+    curB.addEntry(std::move(dirB));
+    ScanSession s =
+        MkSession({MkJournal(L"a.txt", Status::Identical, 100, 1000, 100, 1000)});
+    ResumeInput in{&s, &curA, &curB, L"A", L"B", {}, {}};
+    ResumePlan plan(false);
+    std::string detail;
+    CHECK(PlanResume(in, plan, detail));
+    CHECK(plan.reused == 0u);
+    CHECK(plan.stale == 1u);
+    CHECK(plan.remainderB.size() == 1u);
+    FileEntry got;
+    CHECK(plan.remainderB.find(L"a.txt", got));
+    CHECK(got.isDirectory); // the remainder holds the CURRENT entry
+});
+
+TEST("resume: directory turned file is stale", [] {
+    FileIndex curA(false), curB(false);
+    curA.addEntry(MkEntry(L"d", 0, 5000)); // now a file, same size/mtime
+    curB.addEntry(MkEntry(L"d", 0, 5000, true));
+    ScanSession s = MkSession({MkJournal(L"d", Status::Identical, 0, 5000, 0, 5000, true)});
+    ResumeInput in{&s, &curA, &curB, L"A", L"B", {}, {}};
+    ResumePlan plan(false);
+    std::string detail;
+    CHECK(PlanResume(in, plan, detail));
+    CHECK(plan.reused == 0u);
+    CHECK(plan.stale == 1u);
+    CHECK(plan.remainderA.size() == 1u);
+    FileEntry got;
+    CHECK(plan.remainderA.find(L"d", got));
+    CHECK(!got.isDirectory);
+});
+
+TEST("resume: file turned directory on both sides is stale", [] {
+    FileIndex curA(false), curB(false);
+    curA.addEntry(MkEntry(L"a.txt", 100, 1000, true));
+    curB.addEntry(MkEntry(L"a.txt", 100, 1000, true));
+    ScanSession s =
+        MkSession({MkJournal(L"a.txt", Status::Identical, 100, 1000, 100, 1000)});
+    ResumeInput in{&s, &curA, &curB, L"A", L"B", {}, {}};
+    ResumePlan plan(false);
+    std::string detail;
+    CHECK(PlanResume(in, plan, detail));
+    CHECK(plan.reused == 0u);
+    CHECK(plan.stale == 1u);
+    CHECK(plan.remainderA.size() == 1u);
+    CHECK(plan.remainderB.size() == 1u);
+});
+
+TEST("resume: missing file turned directory is stale", [] {
+    FileIndex curA(false), curB(false);
+    curA.addEntry(MkEntry(L"f.txt", 10, 100, true)); // same size/mtime, now a dir
+    ScanSession s = MkSession({MkJournal(L"f.txt", Status::Missing, 10, 100, 0, 0)});
+    ResumeInput in{&s, &curA, &curB, L"A", L"B", {}, {}};
+    ResumePlan plan(false);
+    std::string detail;
+    CHECK(PlanResume(in, plan, detail));
+    CHECK(plan.reused == 0u);
+    CHECK(plan.stale == 1u);
+    CHECK(plan.remainderA.size() == 1u);
+    FileEntry got;
+    CHECK(plan.remainderA.find(L"f.txt", got));
+    CHECK(got.isDirectory);
+});
+
+TEST("resume: extra file turned directory is stale", [] {
+    FileIndex curA(false), curB(false);
+    curB.addEntry(MkEntry(L"f.txt", 10, 100, true)); // same size/mtime, now a dir
+    ScanSession s = MkSession({MkJournal(L"f.txt", Status::Extra, 0, 0, 10, 100)});
+    ResumeInput in{&s, &curA, &curB, L"A", L"B", {}, {}};
+    ResumePlan plan(false);
+    std::string detail;
+    CHECK(PlanResume(in, plan, detail));
+    CHECK(plan.reused == 0u);
+    CHECK(plan.stale == 1u);
+    CHECK(plan.remainderB.size() == 1u);
+    FileEntry got;
+    CHECK(plan.remainderB.find(L"f.txt", got));
+    CHECK(got.isDirectory);
+});
+
 TEST("resume: size or mtime change forces re-verification", [] {
     for (int variant = 0; variant < 3; ++variant) {
         FileIndex curA(false), curB(false);

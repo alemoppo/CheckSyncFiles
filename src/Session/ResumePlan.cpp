@@ -221,24 +221,21 @@ bool PlanResume(const ResumeInput& in, ResumePlan& out, std::string& detail) {
             if (foundB) plan.remainderB.addEntry(std::move(curB));
             continue;
         }
-        // A SizeMismatch involving a directory side is always re-verified:
-        // the single isDirectory flag cannot reconstruct per-side types, so
-        // only the engine can re-decide it.
-        if (e.verdict == Status::SizeMismatch && (curA.isDirectory || curB.isDirectory)) {
-            ++plan.stale;
-            if (foundA) plan.remainderA.addEntry(std::move(curA));
-            if (foundB) plan.remainderB.addEntry(std::move(curB));
-            continue;
-        }
-        // Presence matches on every implied side: the saved digest (if any)
-        // is reusable only for the exact saved version. Directory rows carry
-        // no content, so they need presence (checked) plus still-a-directory,
-        // never mtime: dir mtimes flutter on live filesystems (external
-        // touches re-list the directory), while real child changes have their
-        // own rows that go stale independently.
+        // Type check first, on every present side: the current type must equal
+        // the saved one before size/mtime are even looked at. A file that
+        // became a directory (or vice versa) is never the saved version, even
+        // when size/mtime happen to match. This also covers the old
+        // SizeMismatch-with-directory-side case (a single isDirectory flag
+        // cannot reconstruct per-side types, so only the engine re-decides).
+        // Directory rows still skip mtime entirely: dir mtimes flutter on live
+        // filesystems, while real child changes have their own rows that go
+        // stale independently.
         bool stale = false;
-        if (e.isDirectory) {
-            stale = (expectA && !curA.isDirectory) || (expectB && !curB.isDirectory);
+        if ((expectA && curA.isDirectory != e.isDirectory) ||
+            (expectB && curB.isDirectory != e.isDirectory)) {
+            stale = true;
+        } else if (e.isDirectory) {
+            stale = false; // presence + type already proven above
         } else if (expectA && expectB) {
             stale = NeedsReverify(e, curA.size, curA.lastWriteTime, curB.size,
                                   curB.lastWriteTime);
