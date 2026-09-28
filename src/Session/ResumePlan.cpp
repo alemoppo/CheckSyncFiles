@@ -1,5 +1,6 @@
 #include "Session/ResumePlan.h"
 
+#include <unordered_map>
 #include <unordered_set>
 
 #include "Filesystem/PathUtil.h"
@@ -155,7 +156,17 @@ bool PlanResume(const ResumeInput& in, ResumePlan& out, std::string& detail) {
     // dropped). Used afterwards to pick up current paths the journal never
     // saw (new files must be verified, not silently skipped).
     std::unordered_set<std::wstring> consumed;
-    for (const JournalEntry& e : in.session->journal) {
+    // The journal is append-only, so the LAST record of a path wins: index it
+    // first and skip earlier duplicates, otherwise a path would be reused and
+    // counted twice (in reusedStats, reusedEntries and the remainder sets).
+    // Defense in depth -- the store never writes duplicates, but a
+    // hand-edited or merged journal might hold them.
+    std::unordered_map<std::wstring, size_t> lastIndex;
+    for (size_t i = 0; i < in.session->journal.size(); ++i)
+        lastIndex[fold(in.session->journal[i].relativePath)] = i;
+    for (size_t i = 0; i < in.session->journal.size(); ++i) {
+        const JournalEntry& e = in.session->journal[i];
+        if (lastIndex[fold(e.relativePath)] != i) continue; // superseded duplicate
         FileEntry curA, curB;
         const bool foundA = in.currentA->find(e.relativePath, curA);
         const bool foundB = in.currentB->find(e.relativePath, curB);

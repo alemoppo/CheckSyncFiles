@@ -177,6 +177,31 @@ TEST("resume: identical rows are reused when fingerprints match", [] {
     CHECK(plan.reusedStats.bytesSource == 100u);
 });
 
+TEST("resume: duplicate journal paths count once, last wins", [] {
+    FileIndex curA(false), curB(false);
+    curA.addEntry(MkEntry(L"a.txt", 100, 1000));
+    curB.addEntry(MkEntry(L"a.txt", 100, 1000));
+    // Same path twice with different verdicts (append-only journal): only the
+    // LAST record may be reused/counted.
+    ScanSession s = MkSession({MkJournal(L"a.txt", Status::Identical, 100, 1000, 100, 1000),
+                               MkJournal(L"a.txt", Status::ContentMismatch, 100, 1000, 100,
+                                         1000)});
+    ResumeInput in{&s, &curA, &curB, L"A", L"B", {}, {}};
+    ResumePlan plan(false);
+    std::string detail;
+    CHECK(PlanResume(in, plan, detail));
+    CHECK(plan.reused == 1u);
+    CHECK(plan.stale == 0u);
+    CHECK(plan.reusedEntries.size() == 1u);
+    CHECK(plan.reusedEntries[0].verdict == Status::ContentMismatch);
+    CHECK(plan.reusedStats.identicalFiles == 0u);
+    CHECK(plan.reusedStats.contentMismatch == 1u);
+    CHECK(plan.reusedStats.sourceFiles == 1u);
+    CHECK(plan.reusedStats.destFiles == 1u);
+    CHECK(plan.reusedProblems.size() == 1u);
+    CHECK(plan.reusedProblems[0].status == Status::ContentMismatch);
+});
+
 TEST("resume: size or mtime change forces re-verification", [] {
     for (int variant = 0; variant < 3; ++variant) {
         FileIndex curA(false), curB(false);
