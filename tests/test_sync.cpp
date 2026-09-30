@@ -958,3 +958,64 @@ TEST("sync-resultset: directory counters retire correctly", [] {
         CHECK_EQ(rs.stats.identicalFiles, 0ull);
     }
 });
+
+TEST("sync-plan: single action summary is not double-counted", [] {
+    // CopyToDst on a 40-byte Missing file.
+    {
+        const SyncPlan p = BuildSingleActionPlan(
+            MakeRow(Status::Missing, L"n.txt", false, 40), ManualOp::CopyToDst,
+            L"C:\\A", L"C:\\B", /*toA=*/false);
+        CHECK_EQ(p.actions.size(), 1ull);
+        CHECK_EQ(p.summary.copyFiles, 1ull);
+        CHECK_EQ(p.summary.bytesToCopy, 40ull);
+    }
+    // ReplaceToDst on a 10-byte different file.
+    {
+        const SyncPlan p = BuildSingleActionPlan(
+            MakeRow(Status::SizeMismatch, L"c.txt", false, 10, 20),
+            ManualOp::ReplaceToDst, L"C:\\A", L"C:\\B", /*toA=*/false);
+        CHECK_EQ(p.actions.size(), 1ull);
+        CHECK_EQ(p.summary.replaceFiles, 1ull);
+        CHECK_EQ(p.summary.bytesToCopy, 10ull);
+    }
+    // DeleteAtDst on an Extra file.
+    {
+        const SyncPlan p = BuildSingleActionPlan(MakeRow(Status::Extra, L"o.txt"),
+                                                 ManualOp::DeleteAtDst, L"C:\\A",
+                                                 L"C:\\B", /*toA=*/false);
+        CHECK_EQ(p.actions.size(), 1ull);
+        CHECK_EQ(p.summary.deleteFiles, 1ull);
+    }
+    // CreateDirDst on a Missing dir.
+    {
+        const SyncPlan p = BuildSingleActionPlan(MakeRow(Status::Missing, L"nd", true),
+                                                 ManualOp::CreateDirDst, L"C:\\A",
+                                                 L"C:\\B", /*toA=*/false);
+        CHECK_EQ(p.actions.size(), 1ull);
+        CHECK_EQ(p.summary.createDirs, 1ull);
+    }
+});
+
+TEST("sync-plan: single dir delete counts exactly once", [] {
+    const SyncPlan p = BuildSingleActionPlan(MakeRow(Status::Extra, L"xd", true),
+                                             ManualOp::DeleteAtDst, L"C:\\A", L"C:\\B",
+                                             /*toA=*/false);
+    CHECK_EQ(p.actions.size(), 1ull);
+    CHECK_EQ(p.summary.deleteDirs, 1ull);
+});
+
+TEST("sync-plan: single two-action plan keeps execution order", [] {
+    // A file-over-dir replace plans a guarded DirDelete plus the FileReplace;
+    // BuildSingleActionPlan emits at most two actions, so group order
+    // (deletes before writes) is observable here, mirroring BuildSyncPlan.
+    const SyncPlan p = BuildSingleActionPlan(
+        MakeMismatchRow(L"foo", false, ReparseKind::None, true, ReparseKind::None, 7,
+                        0),
+        ManualOp::ReplaceToDst, L"C:\\A", L"C:\\B", /*toA=*/false);
+    CHECK_EQ(p.actions.size(), 2ull);
+    CHECK(p.actions[0].op == SyncOp::DirDelete);
+    CHECK(p.actions[1].op == SyncOp::FileReplace);
+    CHECK_EQ(p.summary.deleteDirs, 1ull);
+    CHECK_EQ(p.summary.replaceFiles, 1ull);
+    CHECK_EQ(p.summary.bytesToCopy, 7ull);
+});

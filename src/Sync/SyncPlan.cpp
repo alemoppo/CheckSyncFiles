@@ -49,11 +49,6 @@ void Tally(SyncPlan& plan, const SyncAction& a) {
     }
 }
 
-void PushAction(SyncPlan& plan, SyncAction a) {
-    Tally(plan, a);
-    plan.actions.push_back(std::move(a));
-}
-
 void PushSkip(SyncPlan& plan, const FileResult& r, const std::string& reason) {
     plan.skipped.push_back(pathutil::ToUtf8(r.relativePath) + ": " + reason);
 }
@@ -348,11 +343,16 @@ SyncPlan BuildSingleActionPlan(const FileResult& row, ManualOp op,
             break;
     }
     plan.extraFoldedRels.push_back(pathutil::FoldForCompare(row.relativePath));
-    for (const SyncAction& a : g.createDirs) PushAction(plan, a);
-    for (const SyncAction& a : g.deletes) PushAction(plan, a);
-    for (const SyncAction& a : g.deleteDirs) PushAction(plan, a);
-    for (const SyncAction& a : g.fileWrites) PushAction(plan, a);
-    for (const SyncAction& a : g.linkWrites) PushAction(plan, a);
+    // Direct insert (same group order as BuildSyncPlan): the Append* helpers
+    // above already called Tally for every action, so PushAction here would
+    // count plan.summary twice.
+    plan.actions.reserve(g.createDirs.size() + g.deletes.size() + g.deleteDirs.size() +
+                         g.fileWrites.size() + g.linkWrites.size());
+    plan.actions.insert(plan.actions.end(), g.createDirs.begin(), g.createDirs.end());
+    plan.actions.insert(plan.actions.end(), g.deletes.begin(), g.deletes.end());
+    plan.actions.insert(plan.actions.end(), g.deleteDirs.begin(), g.deleteDirs.end());
+    plan.actions.insert(plan.actions.end(), g.fileWrites.begin(), g.fileWrites.end());
+    plan.actions.insert(plan.actions.end(), g.linkWrites.begin(), g.linkWrites.end());
     return plan;
 }
 
