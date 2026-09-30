@@ -219,8 +219,13 @@ bool DeleteFileOne(const std::wstring& root, const std::wstring& abs,
 }
 
 DeleteDirOutcome DeleteDirGuarded(const std::wstring& root, const std::wstring& dirAbs,
-                                  const std::vector<std::wstring>& allowedFoldedRels) {
+                                  const std::vector<std::wstring>& allowedFoldedRels,
+                                  const std::atomic_bool* cancel) {
     DeleteDirOutcome out;
+    const auto abortCancel = [&]() {
+        out.cancelled = true;
+        out.message = L"cancellazione interrotta: " + dirAbs;
+    };
     const std::wstring chainWhy = CheckParentChain(root, dirAbs);
     if (!chainWhy.empty()) {
         out.message = L"cartella non raggiungibile in sicurezza: " + chainWhy;
@@ -275,6 +280,10 @@ DeleteDirOutcome DeleteDirGuarded(const std::wstring& root, const std::wstring& 
         out.message = why + L": " + entryAbs;
     };
     while (!stack.empty()) {
+        if (WasCancelled(cancel)) {
+            abortCancel();
+            return out;
+        }
         Frame& top = stack.back();
         std::vector<std::pair<std::wstring, DWORD>> children;
         {
@@ -297,6 +306,10 @@ DeleteDirOutcome DeleteDirGuarded(const std::wstring& root, const std::wstring& 
         }
         bool descended = false;
         for (const auto& [name, attrs] : children) {
+            if (WasCancelled(cancel)) {
+                abortCancel();
+                return out;
+            }
             const std::wstring childAbs = top.abs + L"\\" + name;
             const std::wstring childRel = top.rel.empty() ? name : top.rel + L"\\" + name;
             const bool isDir = (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
@@ -350,6 +363,10 @@ DeleteDirOutcome DeleteDirGuarded(const std::wstring& root, const std::wstring& 
         // (it exists on the source side too): keep it, skip the tree.
         if (!isAllowed(top.rel) && !top.dirty) {
             abortSkip(top.abs, L"cartella condivisa con la sorgente, preservata");
+            return out;
+        }
+        if (WasCancelled(cancel)) {
+            abortCancel();
             return out;
         }
         SetFileAttributesW(Prefixed(top.abs).c_str(), FILE_ATTRIBUTE_NORMAL);

@@ -152,6 +152,17 @@ TEST("links: different targets are ContentMismatch with digests", [] {
     CHECK(d.row.hashSource != d.row.hashDest);
     CHECK_EQ(d.row.sizeSource, 6ull);
     CHECK_EQ(d.row.sizeDest, 6ull);
+    CHECK(d.row.isDirectory); // directory-link mismatch retires to dirs
+});
+
+TEST("links: file symlinks with different targets stay files", [] {
+    const LinkDecision d =
+        TryClassifyLinks(LinkEntry(L"al", ReparseKind::SymlinkFile, L"C:\\one", false),
+                         LinkEntry(L"al", ReparseKind::SymlinkFile, L"C:\\two", false),
+                         L"C:\\A", L"D:\\B");
+    CHECK(d.handled && !d.identical);
+    CHECK(d.row.status == Status::ContentMismatch);
+    CHECK(!d.row.isDirectory);
 });
 
 TEST("links: unknown or mixed reparse is ReadError, never SizeMismatch", [] {

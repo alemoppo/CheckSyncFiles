@@ -16,7 +16,7 @@ namespace sync {
 // windows.h function-like macros rewrite those tokens even after "::".
 enum class SyncOp {
     FileCopy,    // new file src -> dst (dest must not exist; races adapt)
-    FileReplace, // file src -> dst, overwriting via temp + rename
+    FileReplace, // file src -> dst, direct in-place overwrite (no temp file)
     FileDelete,  // delete a file at dst (absent = success, no-op)
     DirCreate,   // create an empty dir at dst (exists = success, no-op)
     DirDelete,   // recursive delete of a dir at dst (guarded, see below)

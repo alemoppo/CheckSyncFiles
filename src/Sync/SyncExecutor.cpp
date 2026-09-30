@@ -304,7 +304,15 @@ SyncReport ExecutePlan(const SyncPlan& plan, const std::atomic_bool* cancel,
             }
             case SyncOp::DirDelete: {
                 DeleteDirOutcome o = DeleteDirGuarded(plan.destRoot, dstAbs,
-                                                       plan.extraFoldedRels);
+                                                       plan.extraFoldedRels, cancel);
+                if (o.cancelled) {
+                    SyncActionResult r = Fail(a.op, a.relativePath, o.message);
+                    r.cancelled = true;
+                    finishItem(std::move(r));
+                    abortRemaining(i + 1, /*cancelled=*/true, /*diskFull=*/false,
+                                   L"interrotta dall'utente");
+                    return report;
+                }
                 if (o.ok) {
                     finishItem(Done(a.op, a.relativePath));
                 } else if (o.skipped) {

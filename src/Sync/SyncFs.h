@@ -40,14 +40,18 @@ bool DeleteFileOne(const std::wstring& root, const std::wstring& abs,
 // `allowedRels` (or dirs that become empty on the way) are removed; links are
 // unlinked, never followed. Absent = success. Anything unexpected aborts the
 // directory with `skipped=true`: entries already removed stay removed (no
-// rollback), the rest is left in place.
+// rollback), the rest is left in place. `cancel` (nullable) is polled between
+// entries and before recursing/removing: on cancel the walk stops at once
+// with `cancelled=true`, leaving the partial state in place.
 struct DeleteDirOutcome {
     bool ok = false;
-    bool skipped = false; // unexpected content: dir left (partially) in place
+    bool skipped = false;   // unexpected content: dir left (partially) in place
+    bool cancelled = false; // user cancel: stopped early, partial state kept
     std::wstring message;
 };
 DeleteDirOutcome DeleteDirGuarded(const std::wstring& root, const std::wstring& dirAbs,
-                                  const std::vector<std::wstring>& allowedFoldedRels);
+                                  const std::vector<std::wstring>& allowedFoldedRels,
+                                  const std::atomic_bool* cancel = nullptr);
 
 // Live kind of a path: what the executor adapts to (TOCTOU-safe planning).
 // Supported links resolve to LinkFile/LinkDir; anything else reparse-shaped

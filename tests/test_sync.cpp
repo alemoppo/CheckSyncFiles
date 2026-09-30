@@ -10,6 +10,7 @@
 #include <windows.h>
 
 #include "Comparison/SingleVerify.h"
+#include "Filesystem/PathUtil.h"
 #include "Filesystem/ReparsePoint.h"
 #include "ScanOrchestrator.h"
 #include "Sync/SyncExecutor.h"
@@ -748,6 +749,130 @@ TEST("sync-mismatch-type: file-over-dir retires to identicalFiles", [] {
     CHECK_EQ(r.results.stats.sizeMismatch, 0ull);
     CHECK_EQ(r.results.stats.extraFiles, 0ull);
     CHECK_EQ(r.results.stats.identicalFiles, 1ull); // foo converged to a file
+    CHECK_EQ(r.results.stats.identicalDirs, 0ull);
+});
+
+TEST("sync-exec: preset cancel stops a recursive DirDelete untouched", [] {
+    // Deterministic by construction: a pre-set flag exercises the exact same
+    // check points (loop top, per entry, pre-remove) and abort path as a
+    // mid-recursion cancel, without timing. Mid-tree timing cannot be tested
+    // deterministically without hooks, which this patch avoids on purpose.
+    const std::wstring b = MakeTempDir();
+    CHECK(fs::create_directories(b + L"\\tree\\sub"));
+    CHECK(WriteFileBytes(b + L"\\tree\\a.txt", "a", 1));
+    CHECK(WriteFileBytes(b + L"\\tree\\sub\\c.txt", "c", 1));
+    const std::wstring treeFolded = pathutil::FoldForCompare(L"tree");
+    const std::wstring aFolded = pathutil::FoldForCompare(L"tree\\a.txt");
+    const std::wstring cFolded = pathutil::FoldForCompare(L"tree\\sub\\c.txt");
+    const std::wstring subFolded = pathutil::FoldForCompare(L"tree\\sub");
+    // Direct primitive level: nothing is deleted, cancelled is reported.
+    {
+        std::atomic_bool cancel{true};
+        const DeleteDirOutcome o =
+            DeleteDirGuarded(b, b + L"\\tree", {treeFolded, aFolded, cFolded, subFolded},
+                             &cancel);
+        CHECK(o.cancelled && !o.ok && !o.skipped);
+        CHECK(ReadAll(b + L"\\tree\\a.txt") == "a");
+        CHECK(ReadAll(b + L"\\tree\\sub\\c.txt") == "c");
+    }
+    // Executor level: the action is reported cancelled (not failed) and the
+    // remaining plan stops as cancelled.
+    {
+        ResultSet rs;
+        rs.problems.push_back(MakeRow(Status::Extra, L"tree\\a.txt"));
+        rs.problems.push_back(MakeRow(Status::Extra, L"tree\\sub\\c.txt"));
+        const SyncPlan plan = BuildSyncPlan(rs, MakeTempDir(), b);
+        std::atomic_bool cancel{true};
+        const SyncReport rep = ExecutePlan(plan, &cancel);
+        CHECK(rep.cancelled);
+        CHECK_EQ(rep.doneCount, 0ull);
+        CHECK_EQ(rep.failedCount, 0ull);
+        bool sawCancelled = false;
+        for (const sync::SyncActionResult& it : rep.items) {
+            if (it.cancelled) sawCancelled = true;
+            CHECK(!it.ok);
+        }
+        CHECK(sawCancelled);
+        CHECK(ReadAll(b + L"\\tree\\a.txt") == "a");
+        CHECK(fs::is_directory(b + L"\\tree\\sub"));
+    }
+});
+
+TEST("sync-mismatch-type: dir links with different targets retire to dirs", [] {
+    const std::wstring a = MakeTempDir();
+    const std::wstring b = MakeTempDir();
+    CHECK(fs::create_directory(a + L"\\real1"));
+    CHECK(WriteFileBytes(a + L"\\real1\\f.txt", "data", 4));
+    CHECK(fs::create_directory(b + L"\\real2"));
+    CHECK(WriteFileBytes(b + L"\\real2\\f.txt", "data", 4));
+    std::wstring err;
+    CHECK(CreateLink(a + L"\\j", a + L"\\real1", ReparseKind::Junction, err));
+    CHECK(CreateLink(b + L"\\j", b + L"\\real2", ReparseKind::Junction, err));
+
+    auto r = RunScan(a, b, ScanMode::Content);
+    const FileResult* mm = nullptr;
+    for (const FileResult& p : r.results.problems) {
+        if (p.relativePath == L"j") mm = &p;
+    }
+    CHECK(mm != nullptr);
+    CHECK(mm->status == Status::ContentMismatch);
+    CHECK(mm->reparseKind == ReparseKind::Junction);
+    CHECK(mm->isDirectory); // source side is a directory link
+
+    const SyncReport rep =
+        ExecutePlan(BuildSyncPlan(r.results, a, b, true), nullptr);
+    CHECK_EQ(rep.failedCount, 0ull);
+    CHECK(ReadLinkTarget(b + L"\\j") == b + L"\\real1"); // rebased onto B
+
+    for (const sync::SyncActionResult& it : rep.items) {
+        if (it.ok && !it.cancelled) {
+            FileResult fresh;
+            fresh.status = Status::Identical;
+            fresh.relativePath = it.relativePath;
+            ApplySingleResult(r.results, fresh);
+        }
+    }
+    CHECK(r.results.problems.empty());
+    // j went to identicalDirs (not Files); the copied f.txt to identicalFiles.
+    CHECK_EQ(r.results.stats.identicalDirs, 1ull);
+    CHECK_EQ(r.results.stats.identicalFiles, 1ull);
+});
+
+TEST("sync-mismatch-type: file symlinks with different targets stay files", [] {
+    const std::wstring a = MakeTempDir();
+    const std::wstring b = MakeTempDir();
+    CHECK(fs::create_directories(a + L"\\T"));
+    CHECK(WriteFileBytes(a + L"\\T\\t.txt", "x", 1));
+    CHECK(fs::create_directories(b + L"\\T"));
+    CHECK(WriteFileBytes(b + L"\\T\\t.txt", "x", 1));
+    std::wstring linkErr;
+    if (!TryFileSymlink(a + L"\\al", a + L"\\T", linkErr)) {
+        SKIP_WITHOUT_PRIVILEGE(linkErr);
+    }
+    if (!TryFileSymlink(b + L"\\al", b + L"\\U", linkErr)) {
+        SKIP_WITHOUT_PRIVILEGE(linkErr);
+    }
+
+    auto r = RunScan(a, b, ScanMode::Content);
+    CHECK_EQ(r.results.problems.size(), 1ull);
+    CHECK(r.results.problems[0].status == Status::ContentMismatch);
+    CHECK(!r.results.problems[0].isDirectory);
+
+    const SyncReport rep =
+        ExecutePlan(BuildSyncPlan(r.results, a, b, true), nullptr);
+    CHECK_EQ(rep.failedCount, 0ull);
+    CHECK(ReadLinkTarget(b + L"\\al") == b + L"\\T");
+
+    for (const sync::SyncActionResult& it : rep.items) {
+        if (it.ok && !it.cancelled) {
+            FileResult fresh;
+            fresh.status = Status::Identical;
+            fresh.relativePath = it.relativePath;
+            ApplySingleResult(r.results, fresh);
+        }
+    }
+    CHECK(r.results.problems.empty());
+    CHECK_EQ(r.results.stats.identicalFiles, 1ull);
     CHECK_EQ(r.results.stats.identicalDirs, 0ull);
 });
 

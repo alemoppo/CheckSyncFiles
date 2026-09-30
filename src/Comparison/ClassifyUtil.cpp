@@ -65,8 +65,10 @@ LinkDecision TryClassifyLinks(const FileEntry& src, const FileEntry& dst,
     }
     // Different targets: ContentMismatch carrying sha256(target) digests, so
     // the row has the same shape as a content mismatch (sizes = target
-    // lengths, never file bytes: targets are never followed).
+    // lengths, never file bytes: targets are never followed). Source side
+    // type, like every other mismatch row (sync converges to the source).
     d.row.status = Status::ContentMismatch;
+    d.row.isDirectory = src.isDirectory;
     const std::string srcU8 = pathutil::ToUtf8(srcNorm);
     const std::string dstU8 = pathutil::ToUtf8(dstNorm);
     d.row.sizeSource = srcU8.size();
