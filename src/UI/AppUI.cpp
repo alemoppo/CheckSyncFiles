@@ -103,8 +103,8 @@ constexpr int kCkptSecsPlusX = kCkptSecsValX + kCkptSecsValW + kCkptGap;
 constexpr int kCkptHintX = kCkptSecsPlusX + kCkptBtnW + 16;
 constexpr int kCkptCtlH = 22;
 
-// Standby-after-run checkbox geometry: status row (y6), right end. Wide
-// enough for the box plus the "Standby alla fine" label.
+// Standby-after-run checkbox geometry: footer row above the counters
+// (metricsY), right end. Wide enough for the box plus the label.
 inline SDL_FRect StandbyRect(int winW, int y6) {
     constexpr float w = 200.0f, h = 24.0f;
     return SDL_FRect{static_cast<float>(winW - kMargin) - w, static_cast<float>(y6 + 3), w,
@@ -133,7 +133,8 @@ struct Layout {
     int y1 = 0, y2 = 0, y3 = 0, y3b = 0, y5 = 0;
     int yCkpt = 0; // Phase 4: checkpoint interval steppers (session armed)
     int y6 = 0, y7 = 0, y8 = 0, yList = 0, listBottom = 0, summaryY = 0;
-    int metricsY = 0; // dedicated footer row for Tempo / Velocita
+    int hTrackY = 0; // 12px horizontal-scrollbar strip just below the list
+    int metricsY = 0; // footer row above the counters (standby checkbox)
 
     SDL_FRect sourceField, destField;
     SDL_FRect sourceBrowse, destBrowse;
@@ -163,7 +164,8 @@ Layout ComputeLayout(int W, int H) {
     L.y7 = L.y6 + 30;
     L.y8 = L.y7 + 32;
     L.yList = L.y8 + 34;
-    L.listBottom = H - 50;
+    L.listBottom = H - 64;
+    L.hTrackY = L.listBottom + 2; // 12px strip, 2px gap to metricsY (H-48)
     L.summaryY = H - 26;
     L.metricsY = H - 48;
 
@@ -505,6 +507,38 @@ size_t CaretFromPixelX(TTF_Font* font, const std::wstring& text, int x,
         }
     }
     return best;
+}
+
+// Untruncated row text, exactly as DrawResultsList draws it (status column
+// excluded): directory part + file name + optional error tail.
+void RowHeadTail(const FileResult& p, std::wstring& head, std::wstring& tail) {
+    head = (p.isDirectory ? L"[dir] " : L"") +
+           (p.fullPath.empty() ? p.relativePath : p.fullPath);
+    tail.clear();
+    if (!p.errorMessage.empty()) {
+        tail = L"  (" + p.errorMessage + L")";
+    }
+}
+
+// Pixel width of the row text: dir part in the body font, file name in bold.
+int MeasureRowText(TTF_Font* body, TTF_Font* bold, const std::wstring& head,
+                   const std::wstring& tail) {
+    if (!body) return 0;
+    if (!bold) bold = body;
+    const size_t sep = head.find_last_of(L"\\/");
+    const std::string dirU8 =
+        ToUtf8(sep == std::wstring::npos ? std::wstring() : head.substr(0, sep + 1));
+    const std::string nameU8 =
+        ToUtf8(sep == std::wstring::npos ? head : head.substr(sep + 1));
+    const std::string tailU8 = ToUtf8(tail);
+    int w = 0, h = 0, tw = 0;
+    TTF_GetStringSize(body, dirU8.c_str(), dirU8.size(), &tw, &h);
+    w += tw;
+    TTF_GetStringSize(bold, nameU8.c_str(), nameU8.size(), &tw, &h);
+    w += tw;
+    TTF_GetStringSize(body, tailU8.c_str(), tailU8.size(), &tw, &h);
+    w += tw;
+    return w;
 }
 
 std::string Group(std::uint64_t v) {
@@ -850,6 +884,17 @@ void AppUI::processEvents() {
                     }
                     dirty_ = true;
                 }
+                if (hDragging_) {
+                    const float dx = static_cast<float>(ev.motion.x - hDragStartX_);
+                    const int hTrackRange = hTrackW - hThumbW;
+                    if (hTrackRange > 0) {
+                        const float newRatio = std::clamp(hDragRatio_ + dx * (1.0f / static_cast<float>(hTrackRange)), 0.0f, 1.0f);
+                        const int vw = winW_ - 2 * kMargin - 12;
+                        const int maxSX = std::max(0, contentW_ - vw);
+                        scrollX_ = std::clamp(static_cast<int>(newRatio * static_cast<float>(maxSX)), 0, maxSX);
+                    }
+                    dirty_ = true;
+                }
                 if (fieldDrag_) { // drag extends the field selection (anchor held)
                     const bv::ScanOrchestrator::UiSnapshot dgs = orch_.snapshot();
                     const Layout dgl = ComputeLayout(winW_, winH_);
@@ -879,6 +924,7 @@ void AppUI::processEvents() {
                 break;
             case SDL_EVENT_MOUSE_BUTTON_UP:
                 scrollbarDragging_ = false;
+                hDragging_ = false;
                 sliderDragging_ = false;
                 break;
             case SDL_EVENT_MOUSE_WHEEL:
@@ -1133,7 +1179,7 @@ void AppUI::OnMouseDown(int mx, int my) {
     }
     // Standby checkbox: toggling is always allowed, even mid-run (the main
     // use case is arming it after AVVIA and walking away).
-    if (hit(mx, my, StandbyRect(winW_, L.y6))) {
+    if (hit(mx, my, StandbyRect(winW_, L.metricsY))) {
         standbyAfterRun_ = !standbyAfterRun_;
         dirty_.store(true);
     }
@@ -1211,6 +1257,42 @@ void AppUI::OnMouseDown(int mx, int my) {
                 : 0.0f;
             scroll_ = std::clamp(static_cast<int>(clickRatio * static_cast<float>(maxScroll)),
                                  0, maxScroll);
+        }
+        dirty_.store(true);
+    }
+
+    // Horizontal scrollbar click/drag start: same model, transposed.
+    if (mx >= kMargin && mx < winW_ - kMargin - 12 &&
+        my >= L.hTrackY && my < L.hTrackY + 12) {
+        hTrackY = L.hTrackY;
+        hTrackW = winW_ - 2 * kMargin - 12;
+        const int maxScrollX = std::max(0, contentW_ - hTrackW);
+        scrollX_ = std::clamp(scrollX_, 0, maxScrollX);
+        const float hRatio = contentW_ <= 0 ? 1.0f
+            : static_cast<float>(hTrackW) / static_cast<float>(contentW_);
+        const int thumbW = std::max(20, static_cast<int>(hTrackW * hRatio));
+        const int hRange = hTrackW - thumbW;
+        const float hScrollRatio = maxScrollX > 0
+            ? static_cast<float>(scrollX_) / static_cast<float>(maxScrollX)
+            : 0.0f;
+        const int thumbX = kMargin + (hRange > 0
+            ? static_cast<int>(hScrollRatio * static_cast<float>(hRange))
+            : 0);
+        hThumbX = thumbX;
+        hThumbW = thumbW;
+
+        if (mx >= thumbX && mx < thumbX + thumbW) {
+            hDragging_ = true;
+            hDragStartX_ = mx;
+            hDragRatio_ = hScrollRatio;
+        } else {
+            // Click on track: center the thumb on the click position.
+            const float clickRatio = hRange > 0
+                ? static_cast<float>(mx - kMargin - thumbW / 2) /
+                  static_cast<float>(hRange)
+                : 0.0f;
+            scrollX_ = std::clamp(static_cast<int>(clickRatio * static_cast<float>(maxScrollX)),
+                                  0, maxScrollX);
         }
         dirty_.store(true);
     }
@@ -1679,6 +1761,26 @@ void AppUI::syncResultsCache(const bv::ScanOrchestrator::UiSnapshot& st) {
 
 void AppUI::rebuildFilteredCache() {
     filteredCache_ = FilteredRows();
+    scrollX_ = 0;
+    // Widest row in pixels for the horizontal scrollbar: the longest
+    // candidate by character count is measured once, so huge result sets
+    // stay cheap (thumb sizing is proportional, exactness not required).
+    contentW_ = 0;
+    size_t longestChars = 0;
+    std::wstring lhead, ltail;
+    for (const FileResult* rp : filteredCache_) {
+        std::wstring head, tail;
+        RowHeadTail(*rp, head, tail);
+        const size_t n = head.size() + tail.size();
+        if (n > longestChars) {
+            longestChars = n;
+            lhead = head;
+            ltail = tail;
+        }
+    }
+    if (longestChars > 0) {
+        contentW_ = 120 + MeasureRowText(fontBody_, fontBold_, lhead, ltail) + 8;
+    }
 }
 
 std::vector<const bv::FileResult*> AppUI::FilteredRows() const {
@@ -2120,13 +2222,13 @@ void AppUI::render(const bv::ScanOrchestrator::UiSnapshot& st) {
     }
     DrawText(renderer_, fontBody_, ToUtf8(status), kMargin, L.y6, kTextHi);
 
-    // ---- Standby-after-run checkbox (status row, right end, above text) ----
+    // ---- Standby-after-run checkbox (footer row above counters, right end) ----
     {
-        const SDL_FRect sb = StandbyRect(winW_, L.y6);
+        const SDL_FRect sb = StandbyRect(winW_, L.metricsY);
         const bool overStandby =
             hit(static_cast<int>(mx), static_cast<int>(my), sb);
         const int bx = static_cast<int>(sb.x) + 8;
-        const int by = L.y6 + 7;
+        const int by = L.metricsY + 3;
         constexpr int kBox = 16;
         FillRect(renderer_, bx, by, kBox, kBox, kField);
         DrawRect(renderer_, bx, by, kBox, kBox, overStandby ? kAccentHover : kBorder);
@@ -2140,13 +2242,10 @@ void AppUI::render(const bv::ScanOrchestrator::UiSnapshot& st) {
                            static_cast<float>(by + kBox - 3),
                            static_cast<float>(bx + kBox - 3), static_cast<float>(by + 3));
         }
-        DrawTextVCenter(renderer_, fontBody_, "Standby alla fine", bx + kBox + 8, L.y6, 26,
-                        kTextHi);
+        DrawTextVCenter(renderer_, fontBody_, "Standby alla fine", bx + kBox + 8, L.metricsY,
+                        22, kTextHi);
     }
-    if (!footerMetrics.empty()) {
-        DrawTextRight(renderer_, fontBody_, ToUtf8(footerMetrics), winW_ - kMargin, L.metricsY,
-                      kTextLo);
-    }
+
 
     // ---- Progress bar ----
     const int barW = winW_ - 2 * kMargin;
@@ -2182,6 +2281,12 @@ void AppUI::render(const bv::ScanOrchestrator::UiSnapshot& st) {
         DrawResultsList(L.yList, L.listBottom);
     }
     DrawSummary(L.summaryY, st.hashingErrors);
+    // Tempo/Velocita share the counters row, right-aligned. Drawn after the
+    // counters so they stay readable if the two ever meet in the middle.
+    if (!footerMetrics.empty()) {
+        DrawTextRight(renderer_, fontBody_, ToUtf8(footerMetrics), winW_ - kMargin, L.summaryY,
+                      kTextLo);
+    }
     DrawContextMenu();
 
     SDL_RenderPresent(renderer_);
@@ -2446,6 +2551,22 @@ void AppUI::DrawResultsList(int yList, int listBottom) {
     const SDL_Rect clip{kMargin, listTop, cw, ch};
     SDL_SetRenderClipRect(renderer_, &clip);
 
+    // Horizontal scrollbar geometry (pixel-based ratio over contentW_).
+    const int maxScrollX = std::max(0, contentW_ - cw);
+    scrollX_ = std::clamp(scrollX_, 0, maxScrollX);
+    hTrackY = listBottom + 2;
+    hTrackW = cw;
+    const float hRatio = contentW_ <= 0 ? 1.0f
+        : static_cast<float>(cw) / static_cast<float>(contentW_);
+    hThumbW = std::max(20, static_cast<int>(hTrackW * hRatio));
+    const int hRange = hTrackW - hThumbW;
+    const float hScrollRatio = maxScrollX > 0
+        ? static_cast<float>(scrollX_) / static_cast<float>(maxScrollX)
+        : 0.0f;
+    hThumbX = kMargin + (hRange > 0
+        ? static_cast<int>(hScrollRatio * static_cast<float>(hRange))
+        : 0);
+
     // Compute scrollbar geometry (row-based ratio, not pixels).
     scrollbarTrackX = winW_ - kMargin - 12;
     scrollbarTrackY = listTop;
@@ -2470,23 +2591,18 @@ void AppUI::DrawResultsList(int yList, int listBottom) {
             FillRect(renderer_, kMargin, y, cw, kRowH, kPanel);
         }
         DrawTextVCenter(renderer_, fontBody_, ToUtf8(StatusName(p.status)),
-                        kMargin + 2, y, kRowH, StatusColor(p.status));
-        std::wstring head = (p.isDirectory ? L"[dir] " : L"") +
-                              (p.fullPath.empty() ? p.relativePath : p.fullPath);
-        std::wstring tail;
-        if (!p.errorMessage.empty()) {
-            std::wstring msg = p.errorMessage;
-            if (msg.size() > 96) msg = msg.substr(0, 93) + L"...";
-            tail = L"  (" + msg + L")";
-        }
-        if (head.size() > 180) head = head.substr(0, 177) + L"...";
+                        kMargin + 2 - scrollX_, y, kRowH, StatusColor(p.status));
+        // Full untruncated text: overflow is reachable via the horizontal
+        // scrollbar below (the list clip cuts it visually).
+        std::wstring head, tail;
+        RowHeadTail(p, head, tail);
         // Bold only the file name (last component with extension), not the path.
         const size_t sep = head.find_last_of(L"\\/");
         const std::string dirU8 =
             ToUtf8(sep == std::wstring::npos ? std::wstring() : head.substr(0, sep + 1));
         const std::string nameU8 =
             ToUtf8(sep == std::wstring::npos ? head : head.substr(sep + 1));
-        int tx = kMargin + 120;
+        int tx = kMargin + 120 - scrollX_;
         tx += DrawTextVCenterW(renderer_, fontBody_, dirU8, tx, y, kRowH, kTextHi);
         if (!nameU8.empty()) {
             tx += DrawTextVCenterBold(renderer_, fontBody_, nameU8, tx, y, kRowH, kTextHi);
@@ -2505,6 +2621,15 @@ void AppUI::DrawResultsList(int yList, int listBottom) {
         FillRect(renderer_, scrollbarTrackX + 1, scrollbarThumbY, 10, scrollbarThumbH, kAccent);
     } else {
         FillRect(renderer_, scrollbarTrackX + 1, scrollbarTrackY + 1, 10, ch - 2, kBorder);
+    }
+
+    // Horizontal scrollbar strip below the list (same model, transposed).
+    FillRect(renderer_, kMargin, hTrackY, hTrackW, 12, kPanel);
+    DrawRect(renderer_, kMargin, hTrackY, hTrackW, 12, kBorder);
+    if (contentW_ > cw) {
+        FillRect(renderer_, hThumbX + 1, hTrackY + 1, hThumbW - 2, 10, kAccent);
+    } else {
+        FillRect(renderer_, kMargin + 1, hTrackY + 1, hTrackW - 2, 10, kBorder);
     }
 }
 

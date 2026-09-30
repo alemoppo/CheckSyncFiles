@@ -137,6 +137,19 @@ private:
     int scrollbarDragStartY_ = 0;
     float scrollbarDragRatio_ = 0.0f;
 
+    // Horizontal scrollbar state (results list): pixel offset over the
+    // measured content width. Same interaction model as the vertical bar
+    // (thumb drag, track click-to-jump, proportional thumb).
+    int scrollX_ = 0;
+    int contentW_ = 0; // widest filtered row in px, measured at cache rebuild
+    int hTrackY = 0;
+    int hTrackW = 0;
+    int hThumbX = 0;
+    int hThumbW = 0;
+    bool hDragging_ = false;
+    int hDragStartX_ = 0;
+    float hDragRatio_ = 0.0f;
+
     // Cursor position (in UTF-16 code units) inside the focused path field.
     // Lives here because the field text is stored in the orchestrator; this is
     // the only UI-side bit of the editing state.
