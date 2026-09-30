@@ -45,6 +45,7 @@ bool FileComparator::run(const std::wstring& destRoot,
                 r.sizeDest = e.size;
                 r.isDirectory = e.isDirectory;
                 r.reparseKind = e.reparseKind;
+                r.dstIsDirectory = e.isDirectory; // source absent
                 extraFolded.push_back(pathutil::FoldForCompare(r.relativePath));
                 if (e.isDirectory) {
                     ++out.stats.extraDirs;
@@ -140,6 +141,9 @@ void FileComparator::classifyMatched(FileEntry& src, FileEntry& dst, ResultSet& 
         r.sizeSource = src.size;
         r.sizeDest = dst.size;
         r.isDirectory = false;
+        r.srcIsDirectory = srcDir;
+        r.srcReparseKind = ReparseKind::None; // links never reach here
+        r.dstIsDirectory = dstDir;
         out.problems.push_back(std::move(r));
         return;
     }
@@ -160,6 +164,9 @@ void FileComparator::classifyMatched(FileEntry& src, FileEntry& dst, ResultSet& 
                 r.sizeSource = src.size;
                 r.sizeDest = dst.size;
                 r.isDirectory = false;
+                r.srcIsDirectory = false; // file-file here (dirs/links above)
+                r.srcReparseKind = ReparseKind::None;
+                r.dstIsDirectory = false;
                 out.problems.push_back(std::move(r));
             }
             break;
@@ -183,6 +190,9 @@ void FileComparator::classifyMatched(FileEntry& src, FileEntry& dst, ResultSet& 
                 r.sizeSource = src.size;
                 r.sizeDest = dst.size;
                 r.isDirectory = false;
+                r.srcIsDirectory = false; // file-file here (dirs/links above)
+                r.srcReparseKind = ReparseKind::None;
+                r.dstIsDirectory = false;
                 out.problems.push_back(std::move(r));
             }
             break;
@@ -230,6 +240,8 @@ void FileComparator::recordMissing(ResultSet& out) {
             r.sizeSource = e.size;
             r.isDirectory = false;
             r.reparseKind = e.reparseKind;
+            r.srcIsDirectory = e.isDirectory;
+            r.srcReparseKind = e.reparseKind; // destination absent
             out.problems.push_back(std::move(r));
         }
     }
@@ -244,6 +256,8 @@ void FileComparator::recordMissing(ResultSet& out) {
         r.relativePath = it.entry->relativePath;
         r.isDirectory = true;
         r.reparseKind = it.entry->reparseKind;
+        r.srcIsDirectory = true;
+        r.srcReparseKind = it.entry->reparseKind; // destination absent
         out.problems.push_back(std::move(r));
     }
 }

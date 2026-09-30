@@ -44,6 +44,45 @@ std::wstring ResolveWithinRoot(const std::wstring& root, const std::wstring& rel
     return abs;
 }
 
+std::wstring CheckParentChain(const std::wstring& root, const std::wstring& abs) {
+    const std::wstring nRoot = pathutil::NormalizeRoot(root);
+    if (nRoot.empty()) return L"percorso fuori radice";
+    if (pathutil::FoldForCompare(abs) == pathutil::FoldForCompare(nRoot)) {
+        return {}; // the root itself: no intermediate components to check
+    }
+    if (abs.size() <= nRoot.size()) return L"percorso fuori radice";
+    std::wstring rest = abs.substr(nRoot.size());
+    if (rest.empty() || rest[0] != L'\\') return L"percorso fuori radice";
+    rest.erase(0, 1);
+    // All components but the leaf: each existing one must be a plain dir.
+    std::wstring cur = nRoot;
+    size_t i = 0;
+    while (i < rest.size()) {
+        size_t j = i;
+        while (j < rest.size() && rest[j] != L'\\') ++j;
+        const bool last = (j == rest.size());
+        cur += L"\\" + rest.substr(i, j - i);
+        if (!last) {
+            const DWORD attrs = GetFileAttributesW(pathutil::AddLongPathPrefix(cur).c_str());
+            if (attrs == INVALID_FILE_ATTRIBUTES) {
+                const DWORD code = GetLastError();
+                if (code == ERROR_FILE_NOT_FOUND || code == ERROR_PATH_NOT_FOUND) {
+                    return {}; // absent: created later, re-checked per level
+                }
+                return L"componente intermedio illeggibile: " + cur;
+            }
+            if ((attrs & FILE_ATTRIBUTE_DIRECTORY) == 0) {
+                return L"componente intermedio non cartella: " + cur;
+            }
+            if ((attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+                return L"componente intermedio e un reparse point (non seguito): " + cur;
+            }
+        }
+        i = j + 1;
+    }
+    return {};
+}
+
 uint64_t FreeBytesOnVolume(const std::wstring& path) {
     const std::wstring win = pathutil::AddLongPathPrefix(pathutil::NormalizeRoot(path));
     ULARGE_INTEGER free = {};

@@ -22,5 +22,15 @@ std::wstring ResolveWithinRoot(const std::wstring& root, const std::wstring& rel
 // Free bytes available on the volume hosting `path` (0 on error).
 uint64_t FreeBytesOnVolume(const std::wstring& path);
 
+// Parent-chain containment: every EXISTING intermediate component of `abs`
+// below `root` must be a plain directory. A reparse point (junction, symlink,
+// anything reparse-shaped) or a non-directory in the way is rejected, because
+// the OS would resolve the operation outside the root. Absent components are
+// fine (created later, each level re-checked by CreateDirAll). The leaf
+// itself is NOT checked: it may legitimately be the link the operation acts
+// on (per-op explicit semantics). Detection never follows links (attribute
+// query reports the link itself). Returns empty when safe, else a reason.
+std::wstring CheckParentChain(const std::wstring& root, const std::wstring& abs);
+
 } // namespace sync
 } // namespace bv

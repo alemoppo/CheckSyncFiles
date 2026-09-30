@@ -94,7 +94,12 @@ ReparseKind GetReparseKind(const std::wstring& absPath, bool isDirectory,
                            std::wstring* error) {
     std::vector<uint8_t> buf;
     DWORD bytes = 0;
-    if (!ReadReparseBuffer(absPath, buf, bytes, error)) return ReparseKind::None;
+    if (!ReadReparseBuffer(absPath, buf, bytes, error)) {
+        // ERROR_NOT_A_REPARSE_POINT means surely-plain; any other failure
+        // (access, races, ...) leaves a possibly-unreadable reparse point.
+        return GetLastError() == ERROR_NOT_A_REPARSE_POINT ? ReparseKind::None
+                                                           : ReparseKind::Unknown;
+    }
     if (bytes < sizeof(uint32_t)) {
         SetError(error, L"reparse point illeggibile: " + absPath);
         return ReparseKind::None;

@@ -105,6 +105,9 @@ void HashOneCandidateInto(const ContentCandidate& c, bool offlineSource, FileInd
         r.sizeSource = c.sizeSource;
         r.sizeDest = c.sizeDest;
         r.isDirectory = false;
+        r.srcIsDirectory = false; // hash candidates are always file-file
+        r.srcReparseKind = ReparseKind::None;
+        r.dstIsDirectory = false;
         r.hasHashSource = hasSrc;
         r.hasHashDest = hasDst;
         r.hashSource = sd;
@@ -181,6 +184,9 @@ void HashOneCandidateInto(const ContentCandidate& c, bool offlineSource, FileInd
         r.sizeSource = c.sizeSource;
         r.sizeDest = c.sizeDest;
         r.isDirectory = false;
+        r.srcIsDirectory = false; // hash candidates are always file-file
+        r.srcReparseKind = ReparseKind::None;
+        r.dstIsDirectory = false;
         r.errorMessage = L"file modificato durante la scansione (riverificare)";
         sink.addProblem(std::move(r));
         const auto entries = candidateEntries();
@@ -226,6 +232,9 @@ void HashOneCandidateInto(const ContentCandidate& c, bool offlineSource, FileInd
             r.sizeSource = c.sizeSource;
             r.sizeDest = c.sizeDest;
             r.isDirectory = false;
+            r.srcIsDirectory = false; // hash candidates are always file-file
+            r.srcReparseKind = ReparseKind::None;
+            r.dstIsDirectory = false;
             r.hasHashSource = true;
             r.hasHashDest = true;
             r.hashSource = srcDigest;

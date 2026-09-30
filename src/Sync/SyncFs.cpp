@@ -71,29 +71,48 @@ bool PreserveTimesAndAttrs(const std::wstring& srcAbs, const std::wstring& dstAb
     return true;
 }
 
-void RemoveTemp(const std::wstring& tmpAbs) {
-    SetFileAttributesW(Prefixed(tmpAbs).c_str(), FILE_ATTRIBUTE_NORMAL);
-    DeleteFileW(Prefixed(tmpAbs).c_str());
-}
-
 } // namespace
 
 LiveKind StatLiveKind(const std::wstring& abs) {
     const std::wstring win = Prefixed(abs);
     WIN32_FILE_ATTRIBUTE_DATA data{};
     if (!GetFileAttributesExW(win.c_str(), GetFileExInfoStandard, &data)) {
-        return LiveKind::Absent;
+        const DWORD code = GetLastError();
+        // Only true absence converges to Absent; anything else (denied, ...)
+        // must fail loudly instead of looking already-gone.
+        if (code == ERROR_FILE_NOT_FOUND || code == ERROR_PATH_NOT_FOUND) {
+            return LiveKind::Absent;
+        }
+        return LiveKind::Other;
     }
     const bool isDir = (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
     const bool isReparse = (data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
     if (!isReparse) return isDir ? LiveKind::Dir : LiveKind::File;
-    return isDir ? LiveKind::LinkDir : LiveKind::LinkFile;
+    // Never mistake an unknown/unsupported reparse for a normal link: the
+    // executor preserves UnsupportedReparse instead of acting on it.
+    const ReparseKind kind = GetReparseKind(abs, isDir);
+    if (kind == ReparseKind::SymlinkFile || kind == ReparseKind::SymlinkDir ||
+        kind == ReparseKind::Junction) {
+        return isDir ? LiveKind::LinkDir : LiveKind::LinkFile;
+    }
+    return LiveKind::UnsupportedReparse;
 }
 
-bool CopyFileAtomic(const std::wstring& srcAbs, const std::wstring& dstAbs,
+bool CopyFileDirect(const std::wstring& srcRoot, const std::wstring& srcAbs,
+                    const std::wstring& dstRoot, const std::wstring& dstAbs,
                     const std::atomic_bool* cancel, std::wstring& error) {
     if (WasCancelled(cancel)) {
         error = L"operazione annullata prima della copia.";
+        return false;
+    }
+    std::wstring chainWhy = CheckParentChain(srcRoot, srcAbs);
+    if (!chainWhy.empty()) {
+        error = L"sorgente non raggiungibile in sicurezza: " + chainWhy;
+        return false;
+    }
+    chainWhy = CheckParentChain(dstRoot, dstAbs);
+    if (!chainWhy.empty()) {
+        error = L"destinazione non raggiungibile in sicurezza: " + chainWhy;
         return false;
     }
     // Never copy THROUGH a link: links travel via CreateLink only.
@@ -101,38 +120,14 @@ bool CopyFileAtomic(const std::wstring& srcAbs, const std::wstring& dstAbs,
         error = L"sorgente non piu un file regolare (rinominata/link?): " + srcAbs;
         return false;
     }
-    const std::wstring dst = Prefixed(dstAbs);
-    // Unique temp sibling in the destination directory (same volume: the
-    // rename below stays atomic and never crosses volumes).
-    std::wstring tmpAbs;
-    for (int attempt = 0; attempt < 100; ++attempt) {
-        wchar_t name[64];
-        swprintf_s(name, L".bvtmp_%08x_%d", GetCurrentProcessId(), attempt);
-        const size_t slash = dstAbs.find_last_of(L'\\');
-        tmpAbs = dstAbs.substr(0, slash + 1) + name;
-        HANDLE probe = CreateFileW(Prefixed(tmpAbs).c_str(), GENERIC_WRITE, 0, nullptr,
-                                   CREATE_NEW, FILE_ATTRIBUTE_TEMPORARY, nullptr);
-        if (probe != INVALID_HANDLE_VALUE) {
-            CloseHandle(probe);
-            break;
-        }
-        if (GetLastError() != ERROR_FILE_EXISTS && GetLastError() != ERROR_ALREADY_EXISTS) {
-            error = L"creazione file temporaneo fallita: " + dstAbs;
-            return false;
-        }
-        tmpAbs.clear();
-    }
-    if (tmpAbs.empty()) {
-        error = L"creazione file temporaneo fallita: " + dstAbs;
-        return false;
-    }
-    const std::wstring tmp = Prefixed(tmpAbs);
+    // Direct overwrite by design (see header): a failed copy may truncate
+    // the destination; the next comparison re-detects it for a retry.
     const BOOL copied =
-        CopyFileExW(Prefixed(srcAbs).c_str(), tmp.c_str(), CopyProgressBridge,
-                    const_cast<std::atomic_bool*>(cancel), nullptr, 0);
+        CopyFileExW(Prefixed(srcAbs).c_str(), Prefixed(dstAbs).c_str(),
+                    CopyProgressBridge, const_cast<std::atomic_bool*>(cancel), nullptr,
+                    0);
     if (!copied) {
         const DWORD code = GetLastError();
-        RemoveTemp(tmpAbs);
         if (code == ERROR_REQUEST_ABORTED && WasCancelled(cancel)) {
             error = L"copia annullata: " + srcAbs;
         } else if (code == ERROR_DISK_FULL || code == ERROR_HANDLE_DISK_FULL) {
@@ -143,18 +138,7 @@ bool CopyFileAtomic(const std::wstring& srcAbs, const std::wstring& dstAbs,
         SetLastError(code); // let the executor tell disk-full/cancel apart
         return false;
     }
-    if (!PreserveTimesAndAttrs(srcAbs, tmpAbs, error)) {
-        RemoveTemp(tmpAbs);
-        return false;
-    }
-    SetFileAttributesW(tmp.c_str(), FILE_ATTRIBUTE_NORMAL);
-    if (!MoveFileExW(tmp.c_str(), dst.c_str(),
-                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
-        const DWORD code = GetLastError();
-        RemoveTemp(tmpAbs);
-        error = L"sostituzione destinazione fallita (codice " + std::to_wstring(code) +
-                L"): " + dstAbs;
-        SetLastError(code);
+    if (!PreserveTimesAndAttrs(srcAbs, dstAbs, error)) {
         return false;
     }
     error.clear();
@@ -164,6 +148,11 @@ bool CopyFileAtomic(const std::wstring& srcAbs, const std::wstring& dstAbs,
 
 bool CreateDirAll(const std::wstring& root, const std::wstring& dirAbs,
                   std::wstring& error) {
+    const std::wstring chainWhy = CheckParentChain(root, dirAbs);
+    if (!chainWhy.empty()) {
+        error = L"cartella non raggiungibile in sicurezza: " + chainWhy;
+        return false;
+    }
     const std::wstring nRoot = pathutil::NormalizeRoot(root);
     // Walk down component by component so every created level is contained.
     std::wstring cur = nRoot;
@@ -182,11 +171,22 @@ bool CreateDirAll(const std::wstring& root, const std::wstring& dirAbs,
                 return false;
             }
         }
-        // A file in the way of a needed directory: unrecoverable here.
+        // Whatever is in the way must be a PLAIN directory: a file is
+        // unrecoverable here, and a reparse point would divert everything
+        // created below it outside the root (re-checked per level, not just
+        // once up front, so a concurrently created link is also caught).
         const DWORD attrs = GetFileAttributesW(Prefixed(cur).c_str());
-        if (attrs != INVALID_FILE_ATTRIBUTES &&
-            (attrs & FILE_ATTRIBUTE_DIRECTORY) == 0) {
+        if (attrs == INVALID_FILE_ATTRIBUTES) {
+            error = L"cartella illeggibile dopo la creazione: " + cur;
+            return false;
+        }
+        if ((attrs & FILE_ATTRIBUTE_DIRECTORY) == 0) {
             error = L"un file blocca la creazione della cartella: " + cur;
+            return false;
+        }
+        if ((attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+            error = L"un reparse point blocca la creazione della cartella (non seguito): " +
+                    cur;
             return false;
         }
         i = j + 1;
@@ -195,7 +195,13 @@ bool CreateDirAll(const std::wstring& root, const std::wstring& dirAbs,
     return true;
 }
 
-bool DeleteFileOne(const std::wstring& abs, std::wstring& error) {
+bool DeleteFileOne(const std::wstring& root, const std::wstring& abs,
+                   std::wstring& error) {
+    const std::wstring chainWhy = CheckParentChain(root, abs);
+    if (!chainWhy.empty()) {
+        error = L"file non raggiungibile in sicurezza: " + chainWhy;
+        return false;
+    }
     const std::wstring win = Prefixed(abs);
     SetFileAttributesW(win.c_str(), FILE_ATTRIBUTE_NORMAL);
     if (DeleteFileW(win.c_str())) {
@@ -215,6 +221,11 @@ bool DeleteFileOne(const std::wstring& abs, std::wstring& error) {
 DeleteDirOutcome DeleteDirGuarded(const std::wstring& root, const std::wstring& dirAbs,
                                   const std::vector<std::wstring>& allowedFoldedRels) {
     DeleteDirOutcome out;
+    const std::wstring chainWhy = CheckParentChain(root, dirAbs);
+    if (!chainWhy.empty()) {
+        out.message = L"cartella non raggiungibile in sicurezza: " + chainWhy;
+        return out;
+    }
     const std::wstring nRoot = pathutil::NormalizeRoot(root);
     const std::wstring baseRel =
         dirAbs.size() > nRoot.size() ? dirAbs.substr(nRoot.size() + 1) : std::wstring();
@@ -291,9 +302,19 @@ DeleteDirOutcome DeleteDirGuarded(const std::wstring& root, const std::wstring& 
             const bool isDir = (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
             const bool isReparse = (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
             if (isReparse) {
-                // Unlink, never follow. Allowed only if the link itself is listed.
+                // Unlink, never follow. Allowed only if the link itself is
+                // listed AND it is a supported link: an unknown/unsupported
+                // reparse point is never unlinked blindly, even when listed.
                 if (!isAllowed(childRel)) {
                     abortSkip(childAbs, L"link non atteso, cartella preservata");
+                    return out;
+                }
+                const ReparseKind childKind = GetReparseKind(childAbs, isDir);
+                if (childKind != ReparseKind::SymlinkFile &&
+                    childKind != ReparseKind::SymlinkDir &&
+                    childKind != ReparseKind::Junction) {
+                    abortSkip(childAbs,
+                              L"reparse point non supportato, cartella preservata");
                     return out;
                 }
                 std::wstring err;
@@ -310,7 +331,7 @@ DeleteDirOutcome DeleteDirGuarded(const std::wstring& root, const std::wstring& 
                     return out;
                 }
                 std::wstring err;
-                if (!DeleteFileOne(childAbs, err)) {
+                if (!DeleteFileOne(root, childAbs, err)) {
                     out.message = err;
                     return out; // hard error, not a skip
                 }

@@ -9,6 +9,20 @@ namespace bv {
 namespace sync {
 namespace {
 
+// A plan holds groups emitted in execution order:
+//   DirCreate (absent targets) -> FileDelete/LinkDelete -> DirDelete
+//   (deep-first) -> FileCopy/FileReplace -> LinkCreate/LinkReplace.
+// Deletes run before writes so a destination cleared for a type change is
+// gone when the replacement is written; the guarded DirDelete never removes
+// a path the source side claims (see nonExtraRels below).
+struct Groups {
+    std::vector<SyncAction> createDirs;
+    std::vector<SyncAction> deletes; // FileDelete + LinkDelete
+    std::vector<SyncAction> deleteDirs;
+    std::vector<SyncAction> fileWrites; // FileCopy + FileReplace
+    std::vector<SyncAction> linkWrites; // LinkCreate + LinkReplace
+};
+
 bool IsSupportedLink(ReparseKind k) {
     return k == ReparseKind::SymlinkFile || k == ReparseKind::SymlinkDir ||
            k == ReparseKind::Junction;
@@ -44,13 +58,154 @@ void PushSkip(SyncPlan& plan, const FileResult& r, const std::string& reason) {
     plan.skipped.push_back(pathutil::ToUtf8(r.relativePath) + ": " + reason);
 }
 
-// Every ancestor dir of `rel` (deepest last here; the caller sorts).
-void Ancestors(const std::wstring& rel, std::vector<std::wstring>& out) {
-    size_t pos = 0;
-    while ((pos = rel.find(L'\\', pos)) != std::wstring::npos) {
-        out.push_back(rel.substr(0, pos));
-        ++pos;
+void PushSkipRel(SyncPlan& plan, const std::wstring& rel, const std::string& reason) {
+    plan.skipped.push_back(pathutil::ToUtf8(rel) + ": " + reason);
+}
+
+// One side of a replacement, with explicit type (never inferred from the
+// other side): the source side drives copy/replace selection, the
+// destination side drives the clearing deletes.
+struct OneSide {
+    bool isDir = false;
+    ReparseKind kind = ReparseKind::None;
+    uint64_t bytes = 0; // source side only: estimated inbound bytes
+};
+
+SyncAction MakeAction(SyncOp op, const std::wstring& rel, const OneSide& src) {
+    SyncAction a;
+    a.op = op;
+    a.relativePath = rel;
+    a.isDirectory = src.isDir;
+    a.linkKind = src.kind;
+    a.bytes = src.bytes;
+    return a;
+}
+
+// Missing-like: the source side exists, the destination side is absent.
+void AppendMissingLike(SyncPlan& plan, Groups& g, const std::wstring& rel,
+                       const OneSide& src, bool allowDir) {
+    if (!IsSupportedLink(src.kind) && src.kind != ReparseKind::None) {
+        PushSkipRel(plan, rel, "sorgente link non supportato");
+        return;
     }
+    const bool srcLink = src.kind != ReparseKind::None;
+    if (srcLink) {
+        SyncAction a = MakeAction(SyncOp::LinkCreate, rel, src);
+        Tally(plan, a);
+        g.linkWrites.push_back(std::move(a));
+    } else if (src.isDir) {
+        if (!allowDir) {
+            PushSkipRel(plan, rel, "cartelle: solo eliminazione in questa direzione");
+            return;
+        }
+        SyncAction a = MakeAction(SyncOp::DirCreate, rel, src);
+        Tally(plan, a);
+        g.createDirs.push_back(std::move(a));
+    } else {
+        SyncAction a = MakeAction(SyncOp::FileCopy, rel, src);
+        Tally(plan, a);
+        g.fileWrites.push_back(std::move(a));
+    }
+}
+
+// Extra-like: the destination side exists, the source side is absent.
+void AppendExtraLike(SyncPlan& plan, Groups& g, const std::wstring& rel,
+                     const OneSide& dst, std::vector<std::wstring>& dirAncestors,
+                     bool scheduleAncestors) {
+    if (!IsSupportedLink(dst.kind) && dst.kind != ReparseKind::None) {
+        PushSkipRel(plan, rel, "destinazione link non supportato");
+        return;
+    }
+    plan.extraFoldedRels.push_back(pathutil::FoldForCompare(rel));
+    const bool dstLink = dst.kind != ReparseKind::None;
+    SyncAction a;
+    if (dstLink) {
+        a = MakeAction(SyncOp::LinkDelete, rel, dst);
+        Tally(plan, a);
+        g.deletes.push_back(std::move(a));
+    } else if (dst.isDir) {
+        a = MakeAction(SyncOp::DirDelete, rel, dst);
+        Tally(plan, a);
+        g.deleteDirs.push_back(std::move(a));
+    } else {
+        a = MakeAction(SyncOp::FileDelete, rel, dst);
+        Tally(plan, a);
+        g.deletes.push_back(std::move(a));
+    }
+    if (scheduleAncestors) {
+        size_t pos = 0;
+        while ((pos = rel.find(L'\\', pos)) != std::wstring::npos) {
+            dirAncestors.push_back(rel.substr(0, pos));
+            ++pos;
+        }
+    }
+}
+
+// Mismatch replace driven by the SOURCE side (copies reproduce the source):
+// a source file is copied, a source dir is created, a source link is
+// recreated. Clearing deletes for a conflicting destination are emitted into
+// the delete groups so they run before the write. Returns false (skip
+// pushed) when either side is unplannable.
+bool AppendMismatchReplace(SyncPlan& plan, Groups& g, const std::wstring& rel,
+                           const OneSide& src, const OneSide& dst) {
+    if (!IsSupportedLink(src.kind) && src.kind != ReparseKind::None) {
+        PushSkipRel(plan, rel, "sorgente link non supportato");
+        return false;
+    }
+    if (!IsSupportedLink(dst.kind) && dst.kind != ReparseKind::None) {
+        PushSkipRel(plan, rel, "destinazione reparse non supportato");
+        return false;
+    }
+    const bool srcLink = src.kind != ReparseKind::None;
+    const bool dstLink = dst.kind != ReparseKind::None;
+    if (srcLink) {
+        // A conflicting real directory must be cleared first (the executor
+        // only gives way to links for empty dirs).
+        if (!dstLink && dst.isDir) {
+            SyncAction d = MakeAction(SyncOp::DirDelete, rel, dst);
+            Tally(plan, d);
+            g.deleteDirs.push_back(std::move(d));
+        }
+        SyncAction a = MakeAction(SyncOp::LinkReplace, rel, src);
+        Tally(plan, a);
+        g.linkWrites.push_back(std::move(a));
+        return true;
+    }
+    if (src.isDir) {
+        // Destination must become a directory. No clearing delete is needed:
+        // the executor adapts DirCreate to a conflicting live file/link
+        // (deleted inline), while a conflicting dir is kept for row
+        // convergence. A separate delete would race the adaptation (deleting
+        // a directory as a file errors out).
+        SyncAction a = MakeAction(SyncOp::DirCreate, rel, src);
+        Tally(plan, a);
+        g.createDirs.push_back(std::move(a));
+        return true;
+    }
+    // Source plain file.
+    if (!dstLink && dst.isDir) {
+        // Possibly non-empty: guarded delete first, then the copy.
+        SyncAction d = MakeAction(SyncOp::DirDelete, rel, dst);
+        Tally(plan, d);
+        g.deleteDirs.push_back(std::move(d));
+    }
+    // A conflicting destination link is unlinked inline by the executor.
+    SyncAction a = MakeAction(SyncOp::FileReplace, rel, src);
+    Tally(plan, a);
+    g.fileWrites.push_back(std::move(a));
+    return true;
+}
+
+// An ancestor scheduled for guarded deletion must not be a path the source
+// side claims (it must survive): skip it when it equals, or is a parent of,
+// any non-Extra row.
+bool IsClaimedBySource(const std::vector<std::wstring>& sortedNonExtra,
+                       const std::wstring& dir) {
+    auto it = std::lower_bound(sortedNonExtra.begin(), sortedNonExtra.end(), dir);
+    if (it != sortedNonExtra.end() && *it == dir) return true;
+    const std::wstring prefix = dir + L"\\";
+    it = std::lower_bound(sortedNonExtra.begin(), sortedNonExtra.end(), prefix);
+    return it != sortedNonExtra.end() && it->compare(0, prefix.size(), prefix) == 0;
 }
 
 } // namespace
@@ -61,13 +216,9 @@ SyncPlan BuildSyncPlan(const ResultSet& results, const std::wstring& sourceRoot,
     plan.sourceRoot = sourceRoot;
     plan.destRoot = destRoot;
     plan.sourceIsA = sourceIsA;
-
-    std::vector<SyncAction> createDirs;
-    std::vector<SyncAction> fileWrites; // CopyFile + ReplaceFile
-    std::vector<SyncAction> linkWrites; // CreateLink + ReplaceLink
-    std::vector<SyncAction> deletes;    // DeleteFile + DeleteLink
-    std::vector<SyncAction> deleteDirs;
-    std::vector<std::wstring> dirAncestors; // deduped later
+    Groups g;
+    std::vector<std::wstring> dirAncestors;
+    std::vector<std::wstring> nonExtraRels; // folded, sorted below
 
     for (const FileResult& r : results.problems) {
         // Containment first: a forged/stale row must never reach the executor.
@@ -75,82 +226,27 @@ SyncPlan BuildSyncPlan(const ResultSet& results, const std::wstring& sourceRoot,
             PushSkip(plan, r, "percorso fuori dalla radice di destinazione");
             continue;
         }
-        const ReparseKind kind = r.reparseKind;
-        const bool srcLink = kind != ReparseKind::None;
+        if (r.status != Status::Extra) {
+            nonExtraRels.push_back(pathutil::FoldForCompare(r.relativePath));
+        }
         switch (r.status) {
             case Status::Missing: {
-                if (srcLink && !IsSupportedLink(kind)) {
-                    PushSkip(plan, r, "link non supportato");
-                    break;
-                }
-                SyncAction a;
-                a.relativePath = r.relativePath;
-                a.isDirectory = r.isDirectory && !srcLink;
-                a.linkKind = kind;
-                if (srcLink) {
-                    a.op = SyncOp::LinkCreate;
-                    linkWrites.push_back(a);
-                } else if (r.isDirectory) {
-                    a.op = SyncOp::DirCreate;
-                    createDirs.push_back(a);
-                } else {
-                    a.op = SyncOp::FileCopy;
-                    a.bytes = r.sizeSource;
-                    fileWrites.push_back(a);
-                }
-                Tally(plan, a);
+                const OneSide src{r.srcIsDirectory, r.srcReparseKind, r.sizeSource};
+                AppendMissingLike(plan, g, r.relativePath, src, /*allowDir=*/true);
                 break;
             }
             case Status::Extra: {
-                if (srcLink && !IsSupportedLink(kind)) {
-                    PushSkip(plan, r, "link non supportato");
-                    break;
-                }
-                // Only planned rows join the deletable set: skipped
-                // (unsupported/error) entries must block, not join, the
-                // guarded recursion of an ancestor delete.
-                plan.extraFoldedRels.push_back(pathutil::FoldForCompare(r.relativePath));
-                SyncAction a;
-                a.relativePath = r.relativePath;
-                a.isDirectory = r.isDirectory && !srcLink;
-                a.linkKind = kind;
-                if (srcLink) {
-                    a.op = SyncOp::LinkDelete;
-                    deletes.push_back(a);
-                } else if (r.isDirectory) {
-                    a.op = SyncOp::DirDelete;
-                    deleteDirs.push_back(a);
-                } else {
-                    a.op = SyncOp::FileDelete;
-                    deletes.push_back(a);
-                }
-                Tally(plan, a);
-                // Non-empty extra dirs have no row of their own: schedule every
-                // ancestor for guarded deletion (deep-first, see below). Shared
-                // ancestors abort safely at execution (unexpected content).
-                Ancestors(r.relativePath, dirAncestors);
+                const OneSide dst{r.dstIsDirectory, r.reparseKind, 0};
+                AppendExtraLike(plan, g, r.relativePath, dst, dirAncestors,
+                                /*scheduleAncestors=*/true);
                 break;
             }
             case Status::SizeMismatch:
             case Status::ContentMismatch:
             case Status::ContentMismatchPartial: {
-                if (srcLink && !IsSupportedLink(kind)) {
-                    PushSkip(plan, r, "link non supportato");
-                    break;
-                }
-                SyncAction a;
-                a.relativePath = r.relativePath;
-                a.isDirectory = false;
-                a.linkKind = kind;
-                if (srcLink) {
-                    a.op = SyncOp::LinkReplace;
-                    linkWrites.push_back(a);
-                } else {
-                    a.op = SyncOp::FileReplace;
-                    a.bytes = r.sizeSource;
-                    fileWrites.push_back(a);
-                }
-                Tally(plan, a);
+                const OneSide src{r.srcIsDirectory, r.srcReparseKind, r.sizeSource};
+                const OneSide dst{r.dstIsDirectory, r.reparseKind, 0};
+                AppendMismatchReplace(plan, g, r.relativePath, src, dst);
                 break;
             }
             default:
@@ -161,8 +257,13 @@ SyncPlan BuildSyncPlan(const ResultSet& results, const std::wstring& sourceRoot,
         }
     }
 
-    // Ancestor dirs of extra rows: guarded DeleteDir, deepest first,
-    // deduplicated. Ancestors shared with the source abort at execution.
+    // Ancestor dirs of extra rows: guarded DirDelete, deepest first,
+    // deduplicated, minus source-claimed paths. Ancestors join the deletable
+    // set (sibling deletes may have emptied them; the recursion still
+    // verifies every entry, so shared content keeps aborting safely).
+    std::sort(nonExtraRels.begin(), nonExtraRels.end());
+    nonExtraRels.erase(std::unique(nonExtraRels.begin(), nonExtraRels.end()),
+                       nonExtraRels.end());
     std::sort(dirAncestors.begin(), dirAncestors.end());
     dirAncestors.erase(std::unique(dirAncestors.begin(), dirAncestors.end()),
                        dirAncestors.end());
@@ -171,8 +272,10 @@ SyncPlan BuildSyncPlan(const ResultSet& results, const std::wstring& sourceRoot,
                   return a.size() > b.size();
               });
     for (const std::wstring& dir : dirAncestors) {
+        // nonExtraRels is folded: fold the candidate too (case-insensitive).
+        if (IsClaimedBySource(nonExtraRels, pathutil::FoldForCompare(dir))) continue;
         bool known = false;
-        for (const SyncAction& d : deleteDirs) {
+        for (const SyncAction& d : g.deleteDirs) {
             if (d.relativePath == dir) {
                 known = true;
                 break;
@@ -183,34 +286,27 @@ SyncPlan BuildSyncPlan(const ResultSet& results, const std::wstring& sourceRoot,
         a.op = SyncOp::DirDelete;
         a.relativePath = dir;
         a.isDirectory = true;
-        deleteDirs.push_back(a);
+        g.deleteDirs.push_back(a);
         Tally(plan, a);
-        // Ancestors join the deletable set: sibling FileDelete actions may
-        // have emptied them already (the recursion still verifies every
-        // entry, so shared content keeps aborting safely).
         plan.extraFoldedRels.push_back(pathutil::FoldForCompare(dir));
     }
 
-    // Shallow-first directory creation.
-    std::sort(createDirs.begin(), createDirs.end(),
+    std::sort(g.createDirs.begin(), g.createDirs.end(),
               [](const SyncAction& a, const SyncAction& b) {
                   return a.relativePath.size() < b.relativePath.size();
               });
-
-    plan.actions.reserve(createDirs.size() + fileWrites.size() + linkWrites.size() +
-                         deletes.size() + deleteDirs.size());
-    plan.actions.insert(plan.actions.end(), createDirs.begin(), createDirs.end());
-    plan.actions.insert(plan.actions.end(), fileWrites.begin(), fileWrites.end());
-    plan.actions.insert(plan.actions.end(), linkWrites.begin(), linkWrites.end());
-    plan.actions.insert(plan.actions.end(), deletes.begin(), deletes.end());
-    // deleteDirs already holds childless-extra rows; ancestors appended above
-    // are deepest-first, but row order among themselves is arbitrary: sort the
-    // whole group deep-first for a safe bottom-up teardown.
-    std::sort(deleteDirs.begin(), deleteDirs.end(),
+    std::sort(g.deleteDirs.begin(), g.deleteDirs.end(),
               [](const SyncAction& a, const SyncAction& b) {
                   return a.relativePath.size() > b.relativePath.size();
               });
-    plan.actions.insert(plan.actions.end(), deleteDirs.begin(), deleteDirs.end());
+
+    plan.actions.reserve(g.createDirs.size() + g.deletes.size() + g.deleteDirs.size() +
+                         g.fileWrites.size() + g.linkWrites.size());
+    plan.actions.insert(plan.actions.end(), g.createDirs.begin(), g.createDirs.end());
+    plan.actions.insert(plan.actions.end(), g.deletes.begin(), g.deletes.end());
+    plan.actions.insert(plan.actions.end(), g.deleteDirs.begin(), g.deleteDirs.end());
+    plan.actions.insert(plan.actions.end(), g.fileWrites.begin(), g.fileWrites.end());
+    plan.actions.insert(plan.actions.end(), g.linkWrites.begin(), g.linkWrites.end());
     return plan;
 }
 
@@ -226,55 +322,37 @@ SyncPlan BuildSingleActionPlan(const FileResult& row, ManualOp op,
         PushSkip(plan, row, "percorso fuori radice");
         return plan;
     }
-    const ReparseKind kind = row.reparseKind;
-    const bool isLink = kind != ReparseKind::None;
-    if (isLink && !IsSupportedLink(kind)) {
-        PushSkip(plan, row, "link non supportato");
-        return plan;
-    }
-    // DeleteDir guard set: a single delete only trusts the row itself; any
-    // post-scan child aborts the recursion safely.
-    plan.extraFoldedRels.push_back(pathutil::FoldForCompare(row.relativePath));
-    SyncAction a;
-    a.relativePath = row.relativePath;
-    a.linkKind = kind;
-    // Byte estimate from the side the content comes from.
-    const uint64_t srcBytes = toA ? row.sizeDest : row.sizeSource;
+    Groups g;
+    std::vector<std::wstring> noAncestors;
+    // Source/destination sides from the row, oriented by the manual direction.
+    const OneSide sideA{row.srcIsDirectory, row.srcReparseKind,
+                        row.sizeSource};
+    const OneSide sideB{row.dstIsDirectory, row.reparseKind, row.sizeDest};
+    const OneSide& src = toA ? sideB : sideA;
+    const OneSide& dst = toA ? sideA : sideB;
     switch (op) {
         case ManualOp::CopyToDst:
-            a.isDirectory = false;
-            if (isLink) {
-                a.op = SyncOp::LinkCreate;
-            } else {
-                a.op = SyncOp::FileCopy;
-                a.bytes = srcBytes;
-            }
+            // Offered on Missing (src present) and Extra (B->A) rows: the
+            // source side must exist. Directory copies are not offered.
+            AppendMissingLike(plan, g, row.relativePath, src, /*allowDir=*/false);
             break;
         case ManualOp::ReplaceToDst:
-            a.isDirectory = false;
-            if (isLink) {
-                a.op = SyncOp::LinkReplace;
-            } else {
-                a.op = SyncOp::FileReplace;
-                a.bytes = srcBytes;
-            }
+            AppendMismatchReplace(plan, g, row.relativePath, src, dst);
             break;
         case ManualOp::DeleteAtDst:
-            a.isDirectory = row.isDirectory && !isLink;
-            if (isLink) {
-                a.op = SyncOp::LinkDelete;
-            } else if (a.isDirectory) {
-                a.op = SyncOp::DirDelete;
-            } else {
-                a.op = SyncOp::FileDelete;
-            }
+            AppendExtraLike(plan, g, row.relativePath, dst, noAncestors,
+                            /*scheduleAncestors=*/false);
             break;
         case ManualOp::CreateDirDst:
-            a.isDirectory = true;
-            a.op = SyncOp::DirCreate;
+            AppendMissingLike(plan, g, row.relativePath, src, /*allowDir=*/true);
             break;
     }
-    PushAction(plan, a);
+    plan.extraFoldedRels.push_back(pathutil::FoldForCompare(row.relativePath));
+    for (const SyncAction& a : g.createDirs) PushAction(plan, a);
+    for (const SyncAction& a : g.deletes) PushAction(plan, a);
+    for (const SyncAction& a : g.deleteDirs) PushAction(plan, a);
+    for (const SyncAction& a : g.fileWrites) PushAction(plan, a);
+    for (const SyncAction& a : g.linkWrites) PushAction(plan, a);
     return plan;
 }
 

@@ -57,7 +57,14 @@ bool PrepareFileDest(const std::wstring& dstAbs, std::wstring& error) {
     // cancel apart only by GetLastError, so stale codes must never leak.
     switch (StatLiveKind(dstAbs)) {
         case LiveKind::Absent:
+            error.clear();
+            SetLastError(ERROR_SUCCESS);
+            return true;
         case LiveKind::File:
+            // A read-only destination cannot be overwritten: clear the flag
+            // (the copy restores the source attributes afterwards).
+            SetFileAttributesW(pathutil::AddLongPathPrefix(dstAbs).c_str(),
+                               FILE_ATTRIBUTE_NORMAL);
             error.clear();
             SetLastError(ERROR_SUCCESS);
             return true;
@@ -69,8 +76,9 @@ bool PrepareFileDest(const std::wstring& dstAbs, std::wstring& error) {
             return ok;
         }
         case LiveKind::Dir: {
-            // Only an EMPTY dir may give way to a file (common TOCTOU shape);
-            // a non-empty one fails loudly instead of being wiped.
+            // Only an EMPTY dir may give way to a file (the planner clears
+            // known non-empty dirs first); a non-empty one fails loudly
+            // instead of being wiped.
             if (RemoveDirectoryW(pathutil::AddLongPathPrefix(dstAbs).c_str())) {
                 error.clear();
                 SetLastError(ERROR_SUCCESS);
@@ -81,6 +89,11 @@ bool PrepareFileDest(const std::wstring& dstAbs, std::wstring& error) {
             SetLastError(code);
             return false;
         }
+        case LiveKind::UnsupportedReparse:
+            error = L"destinazione e un reparse point non supportato (preservato): " +
+                    dstAbs;
+            SetLastError(ERROR_ACCESS_DENIED);
+            return false;
         default:
             error = L"destinazione illeggibile: " + dstAbs;
             SetLastError(ERROR_ACCESS_DENIED);
@@ -104,7 +117,7 @@ SyncActionResult RunCopy(const SyncPlan& plan, const SyncAction& a,
     std::wstring err;
     if (!EnsureParentDirs(plan, dstAbs, err)) return Fail(a.op, a.relativePath, err);
     if (!PrepareFileDest(dstAbs, err)) return Fail(a.op, a.relativePath, err);
-    if (!CopyFileAtomic(srcAbs, dstAbs, cancel, err)) {
+    if (!CopyFileDirect(plan.sourceRoot, srcAbs, plan.destRoot, dstAbs, cancel, err)) {
         const DWORD code = GetLastError();
         if (IsCancelCode(code, cancel)) {
             SyncActionResult r = Fail(a.op, a.relativePath, err);
@@ -130,25 +143,43 @@ SyncActionResult RunLink(const SyncPlan& plan, const SyncAction& a,
         return Fail(a.op, a.relativePath,
                     L"junction con target relativo non creabile: " + srcAbs);
     }
+    std::wstring chainWhy = CheckParentChain(plan.sourceRoot, srcAbs);
+    if (!chainWhy.empty()) {
+        return Fail(a.op, a.relativePath, L"sorgente non raggiungibile in sicurezza: " +
+                                              chainWhy);
+    }
     std::wstring err;
     if (!EnsureParentDirs(plan, dstAbs, err)) return Fail(a.op, a.relativePath, err);
+    // Delete-first replace (documented limit): the old object is removed and
+    // the new link is created from the fresh live target. If creation fails,
+    // the destination stays absent with a clear error: re-running the sync
+    // recreates it (the row becomes Missing). No temp-link dance: Windows
+    // offers no reliable atomic link swap across symlink/junction/dir kinds.
     if (replace || StatLiveKind(dstAbs) != LiveKind::Absent) {
         const LiveKind dk = StatLiveKind(dstAbs);
         if (dk == LiveKind::LinkFile || dk == LiveKind::LinkDir) {
             if (!DeleteLink(dstAbs, dk == LiveKind::LinkDir, err))
                 return Fail(a.op, a.relativePath, err);
         } else if (dk == LiveKind::File) {
-            if (!DeleteFileOne(dstAbs, err)) return Fail(a.op, a.relativePath, err);
+            if (!DeleteFileOne(plan.destRoot, dstAbs, err))
+                return Fail(a.op, a.relativePath, err);
         } else if (dk == LiveKind::Dir) {
             if (!RemoveDirectoryW(pathutil::AddLongPathPrefix(dstAbs).c_str())) {
                 return Fail(a.op, a.relativePath,
                             L"la destinazione e una cartella non vuota: " + dstAbs);
             }
+        } else {
+            return Fail(a.op, a.relativePath,
+                        L"destinazione non supportata (preservata): " + dstAbs);
         }
     }
     target = RebaseLinkTargetForWrite(target, plan.sourceRoot, plan.destRoot);
-    if (!CreateLink(dstAbs, target, a.linkKind, err))
-        return Fail(a.op, a.relativePath, err);
+    if (!CreateLink(dstAbs, target, a.linkKind, err)) {
+        return Fail(a.op, a.relativePath,
+                    L"link rimosso ma ricreazione fallita (rieseguire la "
+                    L"sincronizzazione): " +
+                        err);
+    }
     return Done(a.op, a.relativePath);
 }
 
@@ -233,7 +264,7 @@ SyncReport ExecutePlan(const SyncPlan& plan, const std::atomic_bool* cancel,
             }
             case SyncOp::FileDelete: {
                 std::wstring err;
-                if (DeleteFileOne(dstAbs, err)) {
+                if (DeleteFileOne(plan.destRoot, dstAbs, err)) {
                     finishItem(Done(a.op, a.relativePath, err)); // err holds no-op notes
                 } else {
                     finishItem(Fail(a.op, a.relativePath, err));
@@ -241,8 +272,30 @@ SyncReport ExecutePlan(const SyncPlan& plan, const std::atomic_bool* cancel,
                 break;
             }
             case SyncOp::DirCreate: {
+                // Adapts to a conflicting live destination: a file or a
+                // supported link gives way (the plan row describes this
+                // path); anything else fails loudly.
                 std::wstring err;
-                if (CreateDirAll(plan.destRoot, dstAbs, err)) {
+                bool clearOk = true;
+                switch (StatLiveKind(dstAbs)) {
+                    case LiveKind::Absent:
+                    case LiveKind::Dir:
+                        break;
+                    case LiveKind::File:
+                        clearOk = DeleteFileOne(plan.destRoot, dstAbs, err);
+                        break;
+                    case LiveKind::LinkFile:
+                    case LiveKind::LinkDir: {
+                        const LiveKind dk = StatLiveKind(dstAbs);
+                        clearOk = DeleteLink(dstAbs, dk == LiveKind::LinkDir, err);
+                        break;
+                    }
+                    default:
+                        clearOk = false;
+                        err = L"destinazione non supportata (preservata): " + dstAbs;
+                        break;
+                }
+                if (clearOk && CreateDirAll(plan.destRoot, dstAbs, err)) {
                     finishItem(Done(a.op, a.relativePath));
                 } else {
                     finishItem(Fail(a.op, a.relativePath, err));
@@ -270,6 +323,12 @@ SyncReport ExecutePlan(const SyncPlan& plan, const std::atomic_bool* cancel,
             }
             case SyncOp::LinkDelete: {
                 std::wstring err;
+                if (const std::wstring chainWhy = CheckParentChain(plan.destRoot, dstAbs);
+                    !chainWhy.empty()) {
+                    finishItem(Fail(a.op, a.relativePath,
+                                    L"link non raggiungibile in sicurezza: " + chainWhy));
+                    break;
+                }
                 const LiveKind dk = StatLiveKind(dstAbs);
                 if (dk == LiveKind::Absent) {
                     finishItem(Done(a.op, a.relativePath, L"gia assente"));
@@ -279,6 +338,10 @@ SyncReport ExecutePlan(const SyncPlan& plan, const std::atomic_bool* cancel,
                     } else {
                         finishItem(Fail(a.op, a.relativePath, err));
                     }
+                } else if (dk == LiveKind::UnsupportedReparse) {
+                    finishItem(Fail(a.op, a.relativePath,
+                                    L"reparse point non supportato (preservato): " +
+                                        dstAbs));
                 } else {
                     finishItem(Fail(a.op, a.relativePath,
                                     L"non e piu un link, preservato: " + dstAbs));

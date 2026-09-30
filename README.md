@@ -385,11 +385,15 @@ Successful actions retire their row through the same updater as "Riscansiona".
 Links are tree elements, never followed: file/dir symlinks and junctions are
 compared by (kind, target) — absolute targets inside their own root compare
 equal when mirrored and are rebased on write — created, replaced and deleted as
-units. Other reparse tags are reported as read errors and never synced. Copies
-go through a temp file + atomic rename (interrupted copies leave no truncated
-file), timestamps/attributes are preserved, every path is validated to stay
-inside its root, and guarded recursive deletes only remove listed extra content
-(shared directories abort safely).
+units. Other/unknown reparse tags are reported as read errors and never synced.
+File/dir type changes are handled by both sides (e.g. file over a directory:
+the directory is cleared first, then the file is written). Copies overwrite the
+destination directly by design (no temp file: an interrupted copy may truncate
+it, and the next comparison re-detects it for a retry), timestamps/attributes
+are preserved, every path is validated to stay inside its root including all
+intermediate components (a junction in the way refuses the operation instead of
+writing outside), and guarded recursive deletes only remove listed extra
+content (shared directories abort safely).
 
 ### With Visual Studio / MSVC and CMake (Windows 11)
 

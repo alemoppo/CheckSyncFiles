@@ -188,8 +188,11 @@ bool ReadSnapshot(const std::wstring& filePath, FileIndex& index,
         e.reparseKind = ReparseKind::None;
         if (version >= 2) {
             const uint8_t kind = r.GetU8();
-            if (kind <= static_cast<uint8_t>(ReparseKind::Other))
+            if (kind <= static_cast<uint8_t>(ReparseKind::Unknown)) {
                 e.reparseKind = static_cast<ReparseKind>(kind);
+            } else {
+                e.reparseKind = ReparseKind::Unknown; // corrupt: never sync
+            }
             std::string targetU8;
             if (!r.GetStr(targetU8)) {
                 error = L"snapshot corrotto (entry): " + filePath;

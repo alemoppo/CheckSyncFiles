@@ -36,7 +36,14 @@ struct FileResult {
     uint64_t sizeDest = 0;
     std::wstring errorMessage; // for ReadError / AccessDenied / ChangedDuringScan
     bool isDirectory = false;
-    ReparseKind reparseKind = ReparseKind::None; // link nature when relevant
+    ReparseKind reparseKind = ReparseKind::None; // DESTINATION-side link nature
+    // Source/destination nature for matched rows: the planner needs both
+    // sides (a single reparseKind cannot represent them together). For
+    // Missing rows the source side is set (destination absent); for Extra
+    // rows the destination side is set (source absent).
+    bool srcIsDirectory = false;
+    ReparseKind srcReparseKind = ReparseKind::None;
+    bool dstIsDirectory = false; // destination-side type (matched + Extra rows)
 
     // Digests captured during content verification (Content mode). Both are set
     // for ContentMismatch; on a read error only the verifying side may have one.

@@ -501,6 +501,8 @@ void ConcurrentComparer::finalizeMissingExtra(MatchTable& table, ResultSet& out)
             r.sizeSource = e.size;
             r.isDirectory = false;
             r.reparseKind = e.reparseKind;
+            r.srcIsDirectory = e.isDirectory;
+            r.srcReparseKind = e.reparseKind; // destination absent
             out.problems.push_back(std::move(r));
             emitSingle(Status::Missing, e, false);
         }
@@ -516,6 +518,8 @@ void ConcurrentComparer::finalizeMissingExtra(MatchTable& table, ResultSet& out)
         r.relativePath = e.relativePath;
         r.isDirectory = true;
         r.reparseKind = e.reparseKind;
+        r.srcIsDirectory = true;
+        r.srcReparseKind = e.reparseKind; // destination absent
         out.problems.push_back(std::move(r));
         emitSingle(Status::Missing, e, true);
     }
@@ -546,6 +550,7 @@ void ConcurrentComparer::finalizeMissingExtra(MatchTable& table, ResultSet& out)
         r.sizeDest = e.size;
         r.isDirectory = e.isDirectory;
         r.reparseKind = e.reparseKind;
+        r.dstIsDirectory = e.isDirectory; // source absent
         out.problems.push_back(std::move(r));
         emitSingle(Status::Extra, e, e.isDirectory);
     }

@@ -191,10 +191,14 @@ SingleVerifyOutcome VerifySingleFile(const SingleVerifyRequest& req) {
             r.status = Status::Missing;
             r.fullPath = pathutil::MakeAbsolute(req.sourceRoot, req.relativePath);
             r.sizeSource = a.size;
+            r.srcIsDirectory = a.isDirectory;
+            r.srcReparseKind = a.reparseKind;
         } else {
             r.status = Status::Extra;
             r.fullPath = pathutil::MakeAbsolute(req.destRoot, req.relativePath);
             r.sizeDest = b.size;
+            r.reparseKind = b.reparseKind;
+            r.dstIsDirectory = b.isDirectory;
         }
         r.relativePath = req.relativePath;
         out.result = std::move(r);
@@ -266,11 +270,19 @@ bool ApplySingleResult(ResultSet& set, const FileResult& fresh) {
             counter += 1;
         }
     };
-    const auto bumpStatus = [&](Status s, int delta) {
+    // File/dir-aware counter fix: Identical/Missing/Extra have per-type
+    // counters; every other verdict is type-neutral and ignores isDir.
+    const auto bumpStatus = [&](Status s, int delta, bool isDir) {
+        const auto bumpFileDir = [&](uint64_t& files, uint64_t& dirs) {
+            bump(isDir ? dirs : files, delta);
+        };
         switch (s) {
-            case Status::Identical: bump(set.stats.identicalFiles, delta); break;
-            case Status::Missing: bump(set.stats.missingFiles, delta); break;
-            case Status::Extra: bump(set.stats.extraFiles, delta); break;
+            case Status::Identical: bumpFileDir(set.stats.identicalFiles,
+                                               set.stats.identicalDirs); break;
+            case Status::Missing: bumpFileDir(set.stats.missingFiles,
+                                             set.stats.missingDirs); break;
+            case Status::Extra: bumpFileDir(set.stats.extraFiles,
+                                           set.stats.extraDirs); break;
             case Status::SizeMismatch: bump(set.stats.sizeMismatch, delta); break;
             case Status::ContentMismatch: bump(set.stats.contentMismatch, delta); break;
             case Status::IdenticalPartial: bump(set.stats.identicalPartialFiles, delta); break;
@@ -284,12 +296,19 @@ bool ApplySingleResult(ResultSet& set, const FileResult& fresh) {
     };
     for (size_t i = 0; i < set.problems.size(); ++i) {
         if (set.problems[i].relativePath != fresh.relativePath) continue;
-        bumpStatus(set.problems[i].status, -1);
+        const Status oldStatus = set.problems[i].status;
+        const bool oldIsDir = set.problems[i].isDirectory;
+        bumpStatus(oldStatus, -1, oldIsDir);
         if (fresh.status == Status::Identical || fresh.status == Status::IdenticalPartial) {
-            bumpStatus(fresh.status, +1);
+            // Retiring a row converges it: a replaced/copied path becomes a
+            // matched pair (counted), a deleted Extra path becomes absent
+            // (only the Extra counter drops, nothing is "identical").
+            if (oldStatus != Status::Extra) {
+                bumpStatus(fresh.status, +1, oldIsDir);
+            }
             set.problems.erase(set.problems.begin() + static_cast<ptrdiff_t>(i));
         } else {
-            bumpStatus(fresh.status, +1);
+            bumpStatus(fresh.status, +1, fresh.isDirectory);
             set.problems[i] = fresh;
         }
         return true;

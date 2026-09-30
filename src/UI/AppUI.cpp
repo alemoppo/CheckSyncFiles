@@ -1359,11 +1359,20 @@ void AppUI::OnRightClick(int mx, int my) {
 
     // Sync actions on the clicked row only (live results, idle engine).
     // Labels mirror the manual-operation matrix; unsupported links and error
-    // rows offer nothing.
+    // rows offer nothing. Copy/replace labels always follow the SOURCE side
+    // kind of that direction (a single reparseKind cannot describe both).
     if (!resultsOffline_ && idleOps) {
-        const bool isLink = p.reparseKind != bv::ReparseKind::None;
-        const bool linkOk =
-            isLink && p.reparseKind != bv::ReparseKind::Other;
+        const auto kindFor = [&](bool toA) {
+            return toA ? p.reparseKind : p.srcReparseKind;
+        };
+        const auto linkOkFor = [&](bool toA) {
+            const bv::ReparseKind k = kindFor(toA);
+            return k != bv::ReparseKind::None && k != bv::ReparseKind::Other &&
+                   k != bv::ReparseKind::Unknown;
+        };
+        const auto isLinkFor = [&](bool toA) {
+            return kindFor(toA) != bv::ReparseKind::None;
+        };
         const auto syncItem = [&](const char* label, bv::sync::ManualOp op, bool toA) {
             CtxMenuItem item;
             item.labelUtf8 = label;
@@ -1373,23 +1382,38 @@ void AppUI::OnRightClick(int mx, int my) {
             item.relPath = p.relativePath;
             ctxItems_.push_back(std::move(item));
         };
+        // One replace/copy item per direction, labelled by that direction's
+        // source kind; an unsupported source silences only its direction.
+        const auto replaceItems = [&](const char* fileAB, const char* fileBA,
+                                      const char* linkAB, const char* linkBA) {
+            using bv::sync::ManualOp;
+            if (!isLinkFor(false) || linkOkFor(false)) {
+                syncItem(isLinkFor(false) ? linkAB : fileAB, ManualOp::ReplaceToDst,
+                         false);
+            }
+            if (!isLinkFor(true) || linkOkFor(true)) {
+                syncItem(isLinkFor(true) ? linkBA : fileBA, ManualOp::ReplaceToDst,
+                         true);
+            }
+        };
         using bv::sync::ManualOp;
         switch (p.status) {
             case bv::Status::Missing:
-                if (isLink && !linkOk) break;
-                if (isLink) {
+                if (isLinkFor(false) && !linkOkFor(false)) break;
+                if (isLinkFor(false)) {
                     syncItem("Crea link in B", ManualOp::CopyToDst, false);
-                } else if (p.isDirectory) {
+                } else if (p.srcIsDirectory) {
                     syncItem("Crea cartella in B", ManualOp::CreateDirDst, false);
                 } else {
                     syncItem("Copia A -> B", ManualOp::CopyToDst, false);
                 }
                 break;
             case bv::Status::Extra:
-                if (isLink && !linkOk) break;
-                if (isLink) {
+                if (isLinkFor(true) && !linkOkFor(true)) break;
+                if (isLinkFor(true)) {
+                    syncItem("Crea link in A", ManualOp::CopyToDst, true);
                     syncItem("Elimina link da B", ManualOp::DeleteAtDst, false);
-                } else if (p.isDirectory) {
+                } else if (p.dstIsDirectory) {
                     syncItem("Elimina cartella da B", ManualOp::DeleteAtDst, false);
                 } else {
                     syncItem("Copia B -> A", ManualOp::CopyToDst, true);
@@ -1399,14 +1423,9 @@ void AppUI::OnRightClick(int mx, int my) {
             case bv::Status::SizeMismatch:
             case bv::Status::ContentMismatch:
             case bv::Status::ContentMismatchPartial:
-                if (isLink && !linkOk) break;
-                if (isLink) {
-                    syncItem("Sostituisci link con A -> B", ManualOp::ReplaceToDst, false);
-                    syncItem("Sostituisci link con B -> A", ManualOp::ReplaceToDst, true);
-                } else {
-                    syncItem("Sostituisci con A -> B", ManualOp::ReplaceToDst, false);
-                    syncItem("Sostituisci con B -> A", ManualOp::ReplaceToDst, true);
-                }
+                replaceItems("Sostituisci con A -> B", "Sostituisci con B -> A",
+                             "Sostituisci link con A -> B",
+                             "Sostituisci link con B -> A");
                 break;
             default:
                 break; // error rows and identicals: nothing to sync

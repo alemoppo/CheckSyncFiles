@@ -25,7 +25,19 @@ LinkDecision TryClassifyLinks(const FileEntry& src, const FileEntry& dst,
     d.row.fullPath = pathutil::MakeAbsolute(destRoot, dst.relativePath);
     d.row.isDirectory = false;
     d.row.reparseKind = dst.reparseKind;
+    d.row.srcIsDirectory = src.isDirectory;
+    d.row.srcReparseKind = src.reparseKind;
+    d.row.dstIsDirectory = dst.isDirectory;
 
+    // Any unknown/unsupported involvement is unreadable by definition: report,
+    // never guess (in particular never a SizeMismatch that the planner would
+    // execute as a plain replace).
+    if (src.reparseKind == ReparseKind::Unknown || dst.reparseKind == ReparseKind::Unknown ||
+        src.reparseKind == ReparseKind::Other || dst.reparseKind == ReparseKind::Other) {
+        d.row.status = Status::ReadError;
+        d.row.errorMessage = L"reparse point non supportato o non determinato";
+        return d;
+    }
     if (src.reparseKind != dst.reparseKind) {
         // Link vs plain entry (or link-kind change): a type mismatch.
         d.row.status = Status::SizeMismatch;
@@ -33,10 +45,9 @@ LinkDecision TryClassifyLinks(const FileEntry& src, const FileEntry& dst,
         d.row.sizeDest = dst.size;
         return d;
     }
-    if (!IsSupportedLink(src.reparseKind) || src.linkTarget.empty() || dst.linkTarget.empty()) {
+    if (src.linkTarget.empty() || dst.linkTarget.empty()) {
         d.row.status = Status::ReadError;
-        d.row.reparseKind = ReparseKind::Other;
-        d.row.errorMessage = L"reparse point non supportato dal confronto";
+        d.row.errorMessage = L"impossibile leggere il target del link";
         return d;
     }
     // Mirrored absolute targets (A\real vs B\real) compare equal; anything
@@ -127,6 +138,9 @@ bool ClassifyMatched(const FileEntry& src, const FileEntry& dst, ScanMode mode,
         r.sizeSource = src.size;
         r.sizeDest = dst.size;
         r.isDirectory = false;
+        r.srcIsDirectory = srcDir;
+        r.srcReparseKind = ReparseKind::None; // links never reach here
+        r.dstIsDirectory = dstDir;
         sink.addProblem(std::move(r));
         emit(Status::SizeMismatch, false);
         return false;
@@ -141,6 +155,9 @@ bool ClassifyMatched(const FileEntry& src, const FileEntry& dst, ScanMode mode,
         r.sizeSource = s.size;
         r.sizeDest = d.size;
         r.isDirectory = false;
+        r.srcIsDirectory = s.isDirectory;
+        r.srcReparseKind = ReparseKind::None; // links never reach here
+        r.dstIsDirectory = d.isDirectory;
         sink.addProblem(std::move(r));
         emit(Status::SizeMismatch, false);
     };

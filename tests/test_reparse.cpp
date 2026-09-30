@@ -154,6 +154,22 @@ TEST("links: different targets are ContentMismatch with digests", [] {
     CHECK_EQ(d.row.sizeDest, 6ull);
 });
 
+TEST("links: unknown or mixed reparse is ReadError, never SizeMismatch", [] {
+    // Plain file vs unreadable reparse: must not become a plain replace.
+    LinkDecision d =
+        TryClassifyLinks(LinkEntry(L"x", ReparseKind::None, L"", false),
+                         LinkEntry(L"x", ReparseKind::Unknown, L"", false), L"C:\\A",
+                         L"D:\\B");
+    CHECK(d.handled && !d.identical);
+    CHECK(d.row.status == Status::ReadError);
+    // Supported link vs Other: unreadable pair, not a type mismatch.
+    d = TryClassifyLinks(LinkEntry(L"y", ReparseKind::Junction, L"C:\\t", true),
+                         LinkEntry(L"y", ReparseKind::Other, L"", true), L"C:\\A",
+                         L"D:\\B");
+    CHECK(d.handled && !d.identical);
+    CHECK(d.row.status == Status::ReadError);
+});
+
 TEST("links: kind change is SizeMismatch, unsupported is ReadError", [] {
     LinkDecision d =
         TryClassifyLinks(LinkEntry(L"x", ReparseKind::Junction, L"C:\\t", true),

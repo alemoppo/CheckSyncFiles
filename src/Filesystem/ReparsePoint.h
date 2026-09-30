@@ -9,17 +9,20 @@ namespace bv {
 // FILE_ATTRIBUTE_REPARSE_POINT; this resolves the actual tag via
 // FSCTL_GET_REPARSE_POINT (see ReparsePoint.cpp).
 enum class ReparseKind : uint8_t {
-    None = 0,      // not a reparse point (or unknown on read error)
+    None = 0,      // surely not a reparse point
     SymlinkFile,   // IO_REPARSE_TAG_SYMLINK pointing at a file
     SymlinkDir,    // IO_REPARSE_TAG_SYMLINK pointing at a directory
     Junction,      // IO_REPARSE_TAG_MOUNT_POINT (always a directory)
-    Other,         // any other reparse tag: visible, never synced (MVP)
+    Other,         // known but unsupported reparse tag: visible, never synced
+    Unknown,       // reparse point present but the tag could not be read:
+                   // never treated as a plain file/dir, never synced
 };
 
 // Resolves the reparse tag of `absPath` WITHOUT following the link.
 // `isDirectory` is the caller-known entry type (from enumeration) and
-// decides SymlinkFile vs SymlinkDir. Returns None when the path is not a
-// reparse point or the tag cannot be read; `error` (optional) gets details.
+// decides SymlinkFile vs SymlinkDir. Returns None when the path is surely
+// not a reparse point, Unknown when it is (or may be) one whose tag cannot
+// be read; `error` (optional) gets details.
 ReparseKind GetReparseKind(const std::wstring& absPath, bool isDirectory,
                            std::wstring* error = nullptr);
 

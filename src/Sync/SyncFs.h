@@ -15,20 +15,26 @@ namespace sync {
 // Every function validates containment of its outputs via ResolveWithinRoot
 // and never follows a link/junction/reparse point. Italian error texts.
 
-// Copies srcAbs -> dstAbs through a temp file in the destination directory
-// + atomic rename, so an interrupted copy never leaves a truncated dst and
-// never destroys a previous dst early. Preserves mtime + attributes.
-// Refuses when src is a reparse point. `cancel` is polled during the copy.
-bool CopyFileAtomic(const std::wstring& srcAbs, const std::wstring& dstAbs,
+// Copies srcAbs -> dstAbs DIRECTLY over the destination (deliberate design:
+// no temp file, so huge files never need double space; an interrupted copy
+// may leave a truncated dst, which the next comparison re-detects for a
+// retry). Preserves mtime + attributes. Refuses when src is a reparse point.
+// Both parent chains must be link-free (CheckParentChain). `cancel` is polled
+// during the copy.
+bool CopyFileDirect(const std::wstring& srcRoot, const std::wstring& srcAbs,
+                    const std::wstring& dstRoot, const std::wstring& dstAbs,
                     const std::atomic_bool* cancel, std::wstring& error);
 
-// Creates every missing component of dirAbs (absent segments ok, file in the
-// way = error). Resolves the full chain inside `root`.
+// Creates every missing component of dirAbs (absent segments ok, file or
+// reparse point in the way = error). Every created level is verified
+// link-free, so a junction can never divert the creation outside `root`.
 bool CreateDirAll(const std::wstring& root, const std::wstring& dirAbs,
                   std::wstring& error);
 
 // Deletes one file (clears read-only first). Absent = success (no-op).
-bool DeleteFileOne(const std::wstring& abs, std::wstring& error);
+// The parent chain must be link-free.
+bool DeleteFileOne(const std::wstring& root, const std::wstring& abs,
+                   std::wstring& error);
 
 // Guarded recursive delete of dirAbs: only entries whose folded rel is in
 // `allowedRels` (or dirs that become empty on the way) are removed; links are
@@ -44,7 +50,10 @@ DeleteDirOutcome DeleteDirGuarded(const std::wstring& root, const std::wstring& 
                                   const std::vector<std::wstring>& allowedFoldedRels);
 
 // Live kind of a path: what the executor adapts to (TOCTOU-safe planning).
-enum class LiveKind { Absent, File, Dir, LinkFile, LinkDir, Other };
+// Supported links resolve to LinkFile/LinkDir; anything else reparse-shaped
+// (unknown tag, unreadable, unsupported) is UnsupportedReparse and must never
+// be mistaken for a normal link: the executor preserves instead of acting.
+enum class LiveKind { Absent, File, Dir, LinkFile, LinkDir, UnsupportedReparse, Other };
 LiveKind StatLiveKind(const std::wstring& abs);
 
 } // namespace sync
