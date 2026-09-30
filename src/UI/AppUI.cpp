@@ -25,6 +25,8 @@
 #include "Filesystem/PathUtil.h"
 #include "Profiling/HashProfile.h"
 #include "ScanController.h"
+#include "Sync/SyncExecutor.h"
+#include "Sync/SyncPlan.h"
 #include "UI/Utf.h"
 
 namespace bv::ui {
@@ -142,6 +144,8 @@ struct Layout {
     SDL_FRect startBtn, snapBtn, exportBtn, caricaBtn;
     // Phase 3: session capture arming + resume (right of CARICA SNAP.).
     SDL_FRect sessionBtn, resumeBtn;
+    // Sync: global "Sincronizza tutto" A -> B (right of RIPRENDI).
+    SDL_FRect syncBtn;
 };
 
 Layout ComputeLayout(int W, int H) {
@@ -184,6 +188,7 @@ Layout ComputeLayout(int W, int H) {
     L.caricaBtn = {static_cast<float>(kMargin + 390), static_cast<float>(L.y5), 150.0f, 30.0f};
     L.sessionBtn = {static_cast<float>(kMargin + 550), static_cast<float>(L.y5), 120.0f, 30.0f};
     L.resumeBtn = {static_cast<float>(kMargin + 680), static_cast<float>(L.y5), 130.0f, 30.0f};
+    L.syncBtn = {static_cast<float>(kMargin + 820), static_cast<float>(L.y5), 140.0f, 30.0f};
     return L;
 }
 
@@ -1143,7 +1148,8 @@ void AppUI::OnMouseDown(int mx, int my) {
         }
     }
 
-    if (hit(mx, my, L.startBtn) && running) {
+    // INTERROMPI stops a scan and a sync alike (stop() raises every cancel).
+    if (hit(mx, my, L.startBtn) && (running || st.syncRunning)) {
         orch_.stop();
         dirty_.store(true);
     }
@@ -1175,6 +1181,10 @@ void AppUI::OnMouseDown(int mx, int my) {
     }
     if (hit(mx, my, L.resumeBtn) && !running) {
         onLoadResumeSession();
+        dirty_.store(true);
+    }
+    if (hit(mx, my, L.syncBtn) && !running && !st.verifyRunning && !st.syncRunning) {
+        onSyncAll();
         dirty_.store(true);
     }
     // Standby checkbox: toggling is always allowed, even mid-run (the main
@@ -1336,15 +1346,70 @@ void AppUI::OnRightClick(int mx, int my) {
     // only: directories are excluded for now, offline results have no live A
     // side to verify against, and nothing is offered while a scan or another
     // single verification is already running.
-    if (!p.isDirectory && !resultsOffline_) {
-        const bv::ScanOrchestrator::UiSnapshot vs = orch_.snapshot();
-        if (!vs.running && !vs.verifyRunning && !resultsSourceRoot_.empty() &&
-            !resultsDestRoot_.empty()) {
+    const bv::ScanOrchestrator::UiSnapshot vs = orch_.snapshot();
+    const bool idleOps = !vs.running && !vs.verifyRunning && !vs.syncRunning &&
+                         !resultsSourceRoot_.empty() && !resultsDestRoot_.empty();
+    if (!p.isDirectory && !resultsOffline_ && idleOps) {
+        CtxMenuItem item;
+        item.labelUtf8 = "Riscansiona";
+        item.isRescan = true;
+        item.relPath = p.relativePath;
+        ctxItems_.push_back(std::move(item));
+    }
+
+    // Sync actions on the clicked row only (live results, idle engine).
+    // Labels mirror the manual-operation matrix; unsupported links and error
+    // rows offer nothing.
+    if (!resultsOffline_ && idleOps) {
+        const bool isLink = p.reparseKind != bv::ReparseKind::None;
+        const bool linkOk =
+            isLink && p.reparseKind != bv::ReparseKind::Other;
+        const auto syncItem = [&](const char* label, bv::sync::ManualOp op, bool toA) {
             CtxMenuItem item;
-            item.labelUtf8 = "Riscansiona";
-            item.isRescan = true;
+            item.labelUtf8 = label;
+            item.isSync = true;
+            item.syncOp = op;
+            item.syncToA = toA;
             item.relPath = p.relativePath;
             ctxItems_.push_back(std::move(item));
+        };
+        using bv::sync::ManualOp;
+        switch (p.status) {
+            case bv::Status::Missing:
+                if (isLink && !linkOk) break;
+                if (isLink) {
+                    syncItem("Crea link in B", ManualOp::CopyToDst, false);
+                } else if (p.isDirectory) {
+                    syncItem("Crea cartella in B", ManualOp::CreateDirDst, false);
+                } else {
+                    syncItem("Copia A -> B", ManualOp::CopyToDst, false);
+                }
+                break;
+            case bv::Status::Extra:
+                if (isLink && !linkOk) break;
+                if (isLink) {
+                    syncItem("Elimina link da B", ManualOp::DeleteAtDst, false);
+                } else if (p.isDirectory) {
+                    syncItem("Elimina cartella da B", ManualOp::DeleteAtDst, false);
+                } else {
+                    syncItem("Copia B -> A", ManualOp::CopyToDst, true);
+                    syncItem("Elimina da B", ManualOp::DeleteAtDst, false);
+                }
+                break;
+            case bv::Status::SizeMismatch:
+            case bv::Status::ContentMismatch:
+            case bv::Status::ContentMismatchPartial:
+                if (isLink && !linkOk) break;
+                if (isLink) {
+                    syncItem("Sostituisci link con A -> B", ManualOp::ReplaceToDst, false);
+                    syncItem("Sostituisci link con B -> A", ManualOp::ReplaceToDst, true);
+                } else {
+                    syncItem("Sostituisci con A -> B", ManualOp::ReplaceToDst, false);
+                    syncItem("Sostituisci con B -> A", ManualOp::ReplaceToDst, true);
+                }
+                break;
+            default:
+                break; // error rows and identicals: nothing to sync
         }
     }
 
@@ -1399,11 +1464,15 @@ void AppUI::OnContextMenuClick(int mx, int my) {
     }
     const bool rescan =
         hitIdx < ctxItems_.size() && ctxItems_[hitIdx].isRescan;
+    const bool syncAct =
+        hitIdx < ctxItems_.size() && ctxItems_[hitIdx].isSync;
     std::wstring target;
     std::wstring rel;
+    CtxMenuItem syncItem;
     if (hitIdx < ctxItems_.size()) {
         target = ctxItems_[hitIdx].targetPath;
         rel = ctxItems_[hitIdx].relPath;
+        if (syncAct) syncItem = ctxItems_[hitIdx];
     }
     CloseContextMenu();
     if (rescan) {
@@ -1411,6 +1480,9 @@ void AppUI::OnContextMenuClick(int mx, int my) {
         // a stale result behind, then forward with settings frozen now.
         PollSingleVerify();
         RequestSingleVerify(rel);
+    } else if (syncAct) {
+        PollSyncReport(); // drain a previous report before starting
+        RequestSyncAction(syncItem);
     } else if (!target.empty()) {
         // Re-check: the file may have vanished between menu and click.
         std::error_code ec;
@@ -1422,7 +1494,7 @@ void AppUI::OnContextMenuClick(int mx, int my) {
 void AppUI::RequestSingleVerify(const std::wstring& rel) {
     if (rel.empty() || resultsOffline_) return;
     bv::ScanOrchestrator::UiSnapshot st = orch_.snapshot();
-    if (st.running || st.verifyRunning) return;
+    if (st.running || st.verifyRunning || st.syncRunning) return;
     bv::ScanOrchestrator::SingleVerifyParams params;
     params.relativePath = rel;
     params.sourceRoot = resultsSourceRoot_; // frozen with the displayed rows
@@ -1445,6 +1517,169 @@ void AppUI::PollSingleVerify() {
     // draw; a vanished current filter entry simply disappears from view.
     if (bv::ApplySingleResult(uiResults_, out.result)) {
         rebuildFilteredCache();
+    }
+    dirty_.store(true);
+}
+
+void AppUI::RequestSyncAction(const CtxMenuItem& item) {
+    const FileResult* found = nullptr;
+    for (const FileResult& r : uiResults_.problems) {
+        if (r.relativePath == item.relPath) {
+            found = &r;
+            break;
+        }
+    }
+    if (!found) {
+        localNote_ = L"Riga non piu presente nei risultati.";
+        dirty_.store(true);
+        return;
+    }
+    bv::sync::SyncPlan plan = bv::sync::BuildSingleActionPlan(
+        *found, item.syncOp, resultsSourceRoot_, resultsDestRoot_, item.syncToA);
+    if (plan.actions.empty()) {
+        localNote_ = plan.skipped.empty()
+                         ? L"Azione non eseguibile su questa riga."
+                         : L"Azione saltata: " + pathutil::FromUtf8(plan.skipped[0]);
+        dirty_.store(true);
+        return;
+    }
+    // Recursive directory deletes always confirm (the blast radius is a
+    // whole subtree, unlike a single file).
+    if (item.syncOp == bv::sync::ManualOp::DeleteAtDst &&
+        plan.actions[0].op == bv::sync::SyncOp::DirDelete) {
+        std::wstring rel = item.relPath;
+        if (rel.size() > 60) rel = L"..." + rel.substr(rel.size() - 57);
+        const std::wstring q =
+            L"Eliminare ricorsivamente la cartella in B:\n" + rel +
+            L"\n\nIl contenuto viene eliminato senza backup. Procedere?";
+        if (MessageBoxW(nullptr, q.c_str(), L"Elimina cartella",
+                        MB_OKCANCEL | MB_ICONWARNING) != IDOK) {
+            dirty_.store(true);
+            return;
+        }
+    }
+    syncWasGlobal_ = false;
+    localNote_.clear();
+    if (!orch_.requestSync(plan)) {
+        localNote_ = L"Attendi il termine dell'operazione in corso.";
+    }
+    dirty_.store(true);
+}
+
+std::wstring SyncConfirmText(const bv::sync::SyncPlan& plan) {
+    const auto& s = plan.summary;
+    std::wstring t = L"Sincronizza tutto: rendi B uguale ad A.\n\n";
+    t += L"File da copiare: " + std::to_wstring(s.copyFiles) + L"\n";
+    t += L"File da sostituire: " + std::to_wstring(s.replaceFiles) + L"\n";
+    t += L"File da eliminare: " + std::to_wstring(s.deleteFiles) + L"\n";
+    t += L"Cartelle da creare: " + std::to_wstring(s.createDirs) + L"\n";
+    t += L"Cartelle da eliminare: " + std::to_wstring(s.deleteDirs) + L"\n";
+    t += L"Link da creare: " + std::to_wstring(s.createLinks) +
+         L"   da sostituire: " + std::to_wstring(s.replaceLinks) +
+         L"   da eliminare: " + std::to_wstring(s.deleteLinks) + L"\n";
+    t += L"Bytes stimati in ingresso: " + std::to_wstring(s.bytesToCopy) + L"\n";
+    if (!plan.skipped.empty()) {
+        t += L"\nNon sincronizzabili (" + std::to_wstring(plan.skipped.size()) + L"):";
+        for (size_t i = 0; i < plan.skipped.size() && i < 8; ++i) {
+            t += L"\n- " + pathutil::FromUtf8(plan.skipped[i]);
+        }
+        if (plan.skipped.size() > 8) t += L"\n- ...";
+    }
+    t += L"\n\nProcedere? Eliminazioni e sostituzioni non si possono annullare.";
+    return t;
+}
+
+void AppUI::onSyncAll() {
+    if (resultsOffline_) {
+        localNote_ = L"Sincronizzazione non disponibile: i risultati vengono da uno "
+                     L"snapshot (lato A non live).";
+        dirty_.store(true);
+        return;
+    }
+    const bv::ScanOrchestrator::UiSnapshot st = orch_.snapshot();
+    if (st.running || st.verifyRunning || st.syncRunning) {
+        localNote_ = L"Attendi il termine dell'operazione in corso.";
+        dirty_.store(true);
+        return;
+    }
+    if (!st.resultsReady || !st.sourceOk || !st.destinationOk ||
+        resultsSourceRoot_.empty() || resultsDestRoot_.empty()) {
+        localNote_ = L"Serve un confronto completato tra cartelle live.";
+        dirty_.store(true);
+        return;
+    }
+    const bv::sync::SyncPlan plan =
+        bv::sync::BuildSyncPlan(uiResults_, resultsSourceRoot_, resultsDestRoot_, true);
+    if (plan.actions.empty()) {
+        if (plan.skipped.empty()) {
+            localNote_ = L"Niente da sincronizzare: B e gia uguale ad A.";
+        } else {
+            localNote_ = L"Niente da sincronizzare (" +
+                         std::to_wstring(plan.skipped.size()) +
+                         L" elementi non sincronizzabili).";
+        }
+        dirty_.store(true);
+        return;
+    }
+    if (MessageBoxW(nullptr, SyncConfirmText(plan).c_str(), L"Sincronizza tutto (A -> B)",
+                    MB_OKCANCEL | MB_ICONWARNING) != IDOK) {
+        dirty_.store(true);
+        return;
+    }
+    syncWasGlobal_ = true;
+    localNote_.clear();
+    if (!orch_.requestSync(plan)) {
+        localNote_ = L"Attendi il termine dell'operazione in corso.";
+    }
+    dirty_.store(true);
+}
+
+void AppUI::PollSyncReport() {
+    bv::sync::SyncReport rep;
+    if (!orch_.takeSyncReport(rep)) return;
+    size_t failed = 0;
+    std::wstring failedLines;
+    size_t failsShown = 0;
+    for (const bv::sync::SyncActionResult& it : rep.items) {
+        if (it.ok && !it.cancelled) {
+            // The action converged this path to Identical: retire the row
+            // through the single shared updater (false = no row, e.g. an
+            // ancestor dir with no row of its own: nothing to do).
+            FileResult fresh;
+            fresh.status = Status::Identical;
+            fresh.relativePath = it.relativePath;
+            bv::ApplySingleResult(uiResults_, fresh);
+        } else if (it.skipped || it.cancelled) {
+            // No table change: skipped content stays visible on purpose.
+        } else {
+            ++failed;
+            if (failsShown < 12) {
+                std::wstring rel = it.relativePath;
+                if (rel.size() > 60) rel = L"..." + rel.substr(rel.size() - 57);
+                failedLines += L"\n- " + rel + L": " + it.message;
+                ++failsShown;
+            }
+        }
+    }
+    rebuildFilteredCache();
+    localNote_ = L"Sincronizzazione: " + std::to_wstring(rep.doneCount) + L" completate, " +
+                 std::to_wstring(failed) + L" fallite, " +
+                 std::to_wstring(rep.skippedCount) + L" saltate.";
+    if (rep.diskFullAbort) localNote_ += L" Disco pieno.";
+    if (rep.cancelled && !rep.diskFullAbort) localNote_ += L" Interrotta.";
+    if (syncWasGlobal_ || failed > 0) {
+        std::wstring box = localNote_;
+        if (!failedLines.empty()) box += L"\nDettagli:" + failedLines;
+        MessageBoxW(nullptr, box.c_str(), L"Sincronizzazione",
+                    failed > 0 ? MB_ICONERROR : MB_ICONINFORMATION);
+    }
+    // Standby-after-run covers sync too: a clean sync (something completed,
+    // nothing failed, not interrupted) suspends like a clean scan. Cancelled,
+    // disk-full and failed syncs need attention, so they never suspend. After
+    // the summary dialog above, so the user sees the outcome on wake.
+    if (standbyAfterRun_ && rep.doneCount > 0 && failed == 0 && !rep.cancelled &&
+        !rep.diskFullAbort) {
+        SuspendOnce();
     }
     dirty_.store(true);
 }
@@ -1654,6 +1889,7 @@ void AppUI::OnTextInput(const char* text) {
 void AppUI::startScanFromUi() {
     // startLiveScan ignores invalid inputs (no source/destination), mirroring
     // the previous behaviour of silently doing nothing on an empty AVVIA click.
+    localNote_.clear();
     orch_.startLiveScan();
 }
 
@@ -1753,6 +1989,7 @@ void AppUI::syncResultsCache(const bv::ScanOrchestrator::UiSnapshot& st) {
         resultsReadySeen_ = true;
         scroll_ = 0;
         timingScroll_ = 0;
+        localNote_.clear(); // a new run replaces any sync feedback
         CloseContextMenu();
         rebuildFilteredCache();
     }
@@ -1819,6 +2056,8 @@ void AppUI::render(const bv::ScanOrchestrator::UiSnapshot& st) {
     // Fold in a finished single-file re-verification, if any. Same frame,
     // same main thread: no race with the list draw below.
     PollSingleVerify();
+    // Fold in a finished sync report: retire converged rows, show the summary.
+    PollSyncReport();
 
     // Standby-after-run: fire once per successfully completed scan. Cancelled
     // or incomplete runs never suspend (the user is either present or the run
@@ -2057,15 +2296,16 @@ void AppUI::render(const bv::ScanOrchestrator::UiSnapshot& st) {
         }
     }
 
-    // ---- Button AVVIA / INTERROMPI (single toggle) ----
+    // ---- Button AVVIA / INTERROMPI (single toggle; INTERROMPI also stops a sync) ----
+    const bool stoppable = running || st.syncRunning;
     const bool overStart = hit(static_cast<int>(mx), static_cast<int>(my), L.startBtn);
-    const RGBA startFill = running ? (overStart ? kBadHover : kBad)
-                                   : (overStart ? kAccentHover : kAccent);
+    const RGBA startFill = stoppable ? (overStart ? kBadHover : kBad)
+                                     : (overStart ? kAccentHover : kAccent);
     FillRect(renderer_, static_cast<int>(L.startBtn.x), static_cast<int>(L.startBtn.y),
              static_cast<int>(L.startBtn.w), static_cast<int>(L.startBtn.h), startFill);
     DrawRect(renderer_, static_cast<int>(L.startBtn.x), static_cast<int>(L.startBtn.y),
              static_cast<int>(L.startBtn.w), static_cast<int>(L.startBtn.h), kBorder);
-    DrawTextCenterIn(renderer_, fontBold_, running ? "INTERROMPI" : "AVVIA",
+    DrawTextCenterIn(renderer_, fontBold_, stoppable ? "INTERROMPI" : "AVVIA",
                      static_cast<int>(L.startBtn.x), static_cast<int>(L.startBtn.y),
                      static_cast<int>(L.startBtn.w), static_cast<int>(L.startBtn.h), kTextHi);
     const bool overSnap = !running && hit(static_cast<int>(mx), static_cast<int>(my), L.snapBtn);
@@ -2138,11 +2378,30 @@ void AppUI::render(const bv::ScanOrchestrator::UiSnapshot& st) {
                          kTextHi);
     }
 
+    // ---- Button SINCRONIZZA (global A -> B sync; idle with results only) ----
+    const bool syncIdle =
+        !running && !st.verifyRunning && !st.syncRunning && st.resultsReady;
+    const bool overSync =
+        syncIdle && hit(static_cast<int>(mx), static_cast<int>(my), L.syncBtn);
+    FillRect(renderer_, static_cast<int>(L.syncBtn.x), static_cast<int>(L.syncBtn.y),
+             static_cast<int>(L.syncBtn.w), static_cast<int>(L.syncBtn.h),
+             overSync ? kAccentHover : (st.syncRunning ? kAccent : kPanel));
+    DrawRect(renderer_, static_cast<int>(L.syncBtn.x), static_cast<int>(L.syncBtn.y),
+             static_cast<int>(L.syncBtn.w), static_cast<int>(L.syncBtn.h), kBorder);
+    DrawTextCenterIn(renderer_, fontBold_, "SINCRONIZZA",
+                     static_cast<int>(L.syncBtn.x), static_cast<int>(L.syncBtn.y),
+                     static_cast<int>(L.syncBtn.w), static_cast<int>(L.syncBtn.h), kTextHi);
+
     // ---- Status ----
     std::wstring status = L"Pronto. Specificare sorgente e destinazione.";
-    // A single-file re-verification never runs together with a full scan
-    // (both entry points refuse it), so the two states are exclusive here.
-    if (st.verifyRunning) {
+    // Scan, verify and sync never run together (every entry point refuses
+    // the others), so the three states are exclusive here.
+    if (st.syncRunning) {
+        std::wstring shortC = st.syncCurrent;
+        if (shortC.size() > 60) shortC = L"..." + shortC.substr(shortC.size() - 57);
+        status = L"Sincronizzazione " + std::to_wstring(st.syncDone) + L"/" +
+                 std::to_wstring(st.syncTotal) + L"  [" + shortC + L"]";
+    } else if (st.verifyRunning) {
         std::wstring shortP = st.verifyPath;
         if (shortP.size() > 60) shortP = L"..." + shortP.substr(shortP.size() - 57);
         status = L"Riscansione di " + shortP + L" in corso...";
@@ -2220,6 +2479,10 @@ void AppUI::render(const bv::ScanOrchestrator::UiSnapshot& st) {
         status += (status == L"Pronto. Specificare sorgente e destinazione." ? L"" : L"   —  ") +
                   statusNote;
     }
+    if (!localNote_.empty()) {
+        status += (status == L"Pronto. Specificare sorgente e destinazione." ? L"" : L"   —  ") +
+                  localNote_;
+    }
     DrawText(renderer_, fontBody_, ToUtf8(status), kMargin, L.y6, kTextHi);
 
     // ---- Standby-after-run checkbox (footer row above counters, right end) ----
@@ -2251,7 +2514,12 @@ void AppUI::render(const bv::ScanOrchestrator::UiSnapshot& st) {
     const int barW = winW_ - 2 * kMargin;
     FillRect(renderer_, kMargin, L.y7, barW, 14, kPanel);
     DrawRect(renderer_, kMargin, L.y7, barW, 14, kBorder);
-    if (running) {
+    if (st.syncRunning && st.syncTotal > 0) {
+        // Determinate: the plan size is known up front.
+        const int fillW =
+            static_cast<int>(barW * st.syncDone / std::max<size_t>(st.syncTotal, 1));
+        FillRect(renderer_, kMargin, L.y7 + 1, std::max(0, fillW - 2), 12, kAccent);
+    } else if (running) {
         const Uint64 ticks = SDL_GetTicks();
         const float frac = (ticks % 2000) / 2000.0f;
         const int seg = static_cast<int>(barW * 0.25f);

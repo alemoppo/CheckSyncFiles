@@ -13,7 +13,7 @@ namespace indexio {
 namespace {
 
 constexpr uint32_t kMagic = 0x49535642;      // "BVSI"
-constexpr uint32_t kVersion = 1;
+constexpr uint32_t kVersion = 2; // v2 adds FileEntry::reparseKind (U8 per entry)
 constexpr uint64_t kMaxPathLen = 1ull << 24;  // sanity bound on corrupt input
 constexpr uint64_t kMaxEntries = 1ull << 31;
 
@@ -116,7 +116,9 @@ bool WriteSnapshot(const std::wstring& filePath, const FileIndex& index,
         const bool hasHash = index.getHash(e.relativePath, digest);
         bool entryOk = w.PutStr(u8) && w.PutU64(e.size) && w.PutU64(e.lastWriteTime) &&
                        w.PutU32(e.attributes) && w.PutU64(e.fileId) &&
-                       w.PutU8(e.isDirectory ? 1 : 0) && w.PutU8(hasHash ? 1 : 0);
+                       w.PutU8(e.isDirectory ? 1 : 0) && w.PutU8(hasHash ? 1 : 0) &&
+                       w.PutU8(static_cast<uint8_t>(e.reparseKind)) &&
+                       w.PutStr(pathutil::ToUtf8(e.linkTarget));
         if (hasHash) entryOk = entryOk && w.PutBytes(digest.data(), digest.size());
         if (!entryOk) {
             error = L"errore di scrittura dello snapshot (entry): " + filePath;
@@ -141,8 +143,13 @@ bool ReadSnapshot(const std::wstring& filePath, FileIndex& index,
         return false;
     }
 
-    if (r.GetU32() != kMagic || r.GetU32() != kVersion) {
+    if (r.GetU32() != kMagic) {
         error = L"file non riconosciuto come snapshot BackupVerifier: " + filePath;
+        return false;
+    }
+    const uint32_t version = r.GetU32();
+    if (version != 1 && version != kVersion) {
+        error = L"versione snapshot non supportata: " + filePath;
         return false;
     }
     const bool caseSensitive = r.GetU8() != 0;
@@ -178,6 +185,18 @@ bool ReadSnapshot(const std::wstring& filePath, FileIndex& index,
         e.fileId = r.GetU64();
         e.isDirectory = r.GetU8() != 0;
         const bool hasHash = r.GetU8() != 0;
+        e.reparseKind = ReparseKind::None;
+        if (version >= 2) {
+            const uint8_t kind = r.GetU8();
+            if (kind <= static_cast<uint8_t>(ReparseKind::Other))
+                e.reparseKind = static_cast<ReparseKind>(kind);
+            std::string targetU8;
+            if (!r.GetStr(targetU8)) {
+                error = L"snapshot corrotto (entry): " + filePath;
+                return false;
+            }
+            e.linkTarget = pathutil::FromUtf8(targetU8);
+        }
         if (!r.valid) {
             error = L"snapshot corrotto (entry): " + filePath;
             return false;

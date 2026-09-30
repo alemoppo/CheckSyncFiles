@@ -23,7 +23,10 @@ int g_counter = 0;
 
 std::wstring MakeTempDir() {
     const fs::path tmp = fs::temp_directory_path();
-    const fs::path dir = tmp / (L"bvtest_" + std::to_wstring(GetCurrentProcessId()) +
+    // NOTE: distinct "bvtestutil_" prefix (not "bvtest_"): test_main.cpp has
+    // its own same-shaped helper with an independent counter, so sharing the
+    // prefix reuses live directories across translation units.
+    const fs::path dir = tmp / (L"bvtestutil_" + std::to_wstring(GetCurrentProcessId()) +
                                 L"_" + std::to_wstring(g_counter++));
     fs::create_directories(dir);
     g_cleanup.push_back(dir);

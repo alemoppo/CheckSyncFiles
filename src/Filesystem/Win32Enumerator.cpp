@@ -5,6 +5,7 @@
 
 #include "Errors.h"
 #include "PathUtil.h"
+#include "ReparsePoint.h"
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -133,6 +134,24 @@ bool Win32Enumerator::enumerate(const std::wstring& root,
             e.attributes = fd.dwFileAttributes;
             e.fileId = 0;
             e.isDirectory = isDir;
+
+            // Links are tree elements, never followed: resolve the tag and
+            // normalize to (kind, target, target-length size, own mtime) so
+            // both backends classify them identically.
+            if (isReparse) {
+                ReparseKind kind = ReparseKind::None;
+                std::wstring target;
+                uint64_t linkSize = 0, linkMtime = 0;
+                if (ResolveLinkEntry(f.abs + L"\\" + name, isDir, kind, target, linkSize,
+                                     linkMtime)) {
+                    e.reparseKind = kind;
+                    e.linkTarget = std::move(target);
+                    e.size = linkSize;
+                    if (linkMtime != 0) e.lastWriteTime = linkMtime;
+                } else {
+                    e.reparseKind = kind; // Other, or tag known but target unreadable
+                }
+            }
 
             if (isDir) {
                 ++totalDirs;

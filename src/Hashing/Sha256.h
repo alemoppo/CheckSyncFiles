@@ -38,6 +38,11 @@ HashStatus Sha256File(const std::wstring& path, std::array<uint8_t, 32>& digest,
                       profiling::FileTimings* timings = nullptr,
                       const std::atomic_bool* cancel = nullptr);
 
+// SHA-256 of an in-memory buffer (e.g. a link target string) into digest.
+// Used for link-vs-link comparison rows, which carry digests like content
+// mismatches but never read file bytes. Returns false on provider failure.
+bool Sha256Bytes(const void* data, size_t size, std::array<uint8_t, 32>& digest);
+
 // Opens the file read-only and reports its current size and last-write time
 // (FILETIME ticks). Returns false when the file cannot be opened. Used by the
 // hash cache (path+size+mtime key) and by "changed during scan" detection.

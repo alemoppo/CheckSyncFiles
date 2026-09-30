@@ -363,7 +363,33 @@ periodic flush while a session is armed (rows and seconds steppers cycling fixed
 0 = that trigger off, both 0 = save at the end only; defaults 1000 rows / 30 s). The "Standby
 alla fine" checkbox (status row, right end; toggling allowed even mid-run) puts the PC to sleep
 once when a scan completes successfully (cancelled/incomplete runs never suspend; the checkbox
-stays as set for the next runs).
+stays as set for the next runs). It also fires after a clean synchronization (at least one
+action completed, none failed, not interrupted).
+
+### Sincronizzazione (A -> B, solo GUI live)
+
+The right-click menu also offers per-row sync actions (live results only, never
+with a snapshot): "Copia A -> B" / "Copia B -> A", "Sostituisci con A -> B" /
+"Sostituisci con B -> A" (files and links), "Elimina da B", "Crea cartella in
+B", "Crea link in B", "Elimina cartella/link da B" (recursive deletes ask for
+confirmation). The SINCRONIZZA button makes B equal to A: it builds a plan
+(create dirs -> copy/replace files -> create/replace links -> delete files and
+links -> delete dirs, deepest first), shows a summary with counts, estimated
+bytes and non-syncable items, and runs only after confirmation, with a
+determinate progress bar, current operation, INTERROMPI to stop, and a final
+report (completed/failed/skipped). Errors are collected and independent actions
+continue; user cancel and disk-full stop the plan (completed actions stay, no
+rollback, no backup: destructive steps run only after your confirmation).
+Successful actions retire their row through the same updater as "Riscansiona".
+
+Links are tree elements, never followed: file/dir symlinks and junctions are
+compared by (kind, target) — absolute targets inside their own root compare
+equal when mirrored and are rebased on write — created, replaced and deleted as
+units. Other reparse tags are reported as read errors and never synced. Copies
+go through a temp file + atomic rename (interrupted copies leave no truncated
+file), timestamps/attributes are preserved, every path is validated to stay
+inside its root, and guarded recursive deletes only remove listed extra content
+(shared directories abort safely).
 
 ### With Visual Studio / MSVC and CMake (Windows 11)
 

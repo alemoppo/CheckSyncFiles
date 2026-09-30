@@ -10,6 +10,7 @@
 #include "Comparison/ConcurrentSink.h"
 #include "Comparison/HashPhase.h"
 #include "Filesystem/PathUtil.h"
+#include "Filesystem/ReparsePoint.h"
 #include "Hashing/HashCache.h"
 #include "Hashing/PartialRead.h"
 #include "Hashing/Sha256.h"
@@ -44,6 +45,8 @@ struct SideStat {
     uint64_t size = 0;
     uint64_t mtime = 0; // Windows FILETIME, like FileEntry
     uint32_t attributes = 0;
+    ReparseKind reparseKind = ReparseKind::None;
+    std::wstring linkTarget; // set for supported readable links
 };
 
 SideStat StatOneSide(const std::wstring& absPath) {
@@ -65,6 +68,21 @@ SideStat StatOneSide(const std::wstring& absPath) {
         st.mtime = (static_cast<uint64_t>(data.ftLastWriteTime.dwHighDateTime) << 32) |
                    data.ftLastWriteTime.dwLowDateTime;
     }
+    // Links are compared by (kind, target): GetFileAttributesExW follows
+    // them, so re-resolve the link itself like the enumerators do.
+    if ((data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+        ReparseKind kind = ReparseKind::None;
+        std::wstring target;
+        uint64_t linkSize = 0, linkMtime = 0;
+        if (ResolveLinkEntry(absPath, st.isDirectory, kind, target, linkSize, linkMtime)) {
+            st.reparseKind = kind;
+            st.linkTarget = std::move(target);
+            st.size = linkSize;
+            if (linkMtime != 0) st.mtime = linkMtime;
+        } else {
+            st.reparseKind = kind;
+        }
+    }
     return st;
 }
 
@@ -76,6 +94,8 @@ FileEntry ToEntry(const std::wstring& rel, const SideStat& st) {
     e.attributes = st.attributes;
     e.fileId = 0;
     e.isDirectory = st.isDirectory;
+    e.reparseKind = st.reparseKind;
+    e.linkTarget = st.linkTarget;
     return e;
 }
 
@@ -189,11 +209,11 @@ SingleVerifyOutcome VerifySingleFile(const SingleVerifyRequest& req) {
     if (req.mode == ScanMode::Size) {
         std::vector<ContentCandidate> noCandidates;
         ClassifyMatched(ToEntry(req.relativePath, a), ToEntry(req.relativePath, b),
-                        ScanMode::Size, sink, noCandidates, req.destRoot);
+                        ScanMode::Size, sink, noCandidates, req.destRoot, req.sourceRoot);
     } else {
         std::vector<ContentCandidate> candidates;
         ClassifyMatched(ToEntry(req.relativePath, a), ToEntry(req.relativePath, b),
-                        ScanMode::Content, sink, candidates, req.destRoot);
+                        ScanMode::Content, sink, candidates, req.destRoot, req.sourceRoot);
         for (const ContentCandidate& c : candidates) {
             HashOneCandidateInto(c, /*offlineSource=*/false, /*index=*/nullptr,
                                  req.sourceRoot, req.destRoot, sink, req.cancel, req.cache,

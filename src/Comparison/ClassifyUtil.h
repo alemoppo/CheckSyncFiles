@@ -36,6 +36,28 @@ struct ContentCandidate {
 // final here -- they are observed later by the hash phase).
 bool ClassifyMatched(const FileEntry& src, const FileEntry& dst, ScanMode mode,
                      ConcurrentSink& sink, std::vector<ContentCandidate>& candidates,
-                     const std::wstring& destRoot, IRowSink* rowSink = nullptr);
+                     const std::wstring& destRoot, const std::wstring& sourceRoot,
+                     IRowSink* rowSink = nullptr);
+
+// Link-aware verdict for a matched pair where at least one side is a reparse
+// point. Pure function (no sink): lets the serial and concurrent classifiers
+// share the exact same link semantics while keeping their own stats/rows.
+//
+// - `handled=false`: neither side is a link; classify normally.
+// - `handled=true, identical=true`: same supported link kind + equal targets
+//   (`identicalIsDir` selects the identical files/dirs counter).
+// - `handled=true, identical=false`: `row` carries the verdict
+//   (SizeMismatch for kind changes, ContentMismatch for different targets
+//   with sha256(target) digests, ReadError for unsupported/unreadable links).
+struct LinkDecision {
+    bool handled = false;
+    bool identical = false;
+    bool identicalIsDir = false;
+    FileResult row;
+};
+
+LinkDecision TryClassifyLinks(const FileEntry& src, const FileEntry& dst,
+                              const std::wstring& sourceRoot,
+                              const std::wstring& destRoot);
 
 } // namespace bv

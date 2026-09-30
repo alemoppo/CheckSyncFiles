@@ -6,6 +6,12 @@ add_library(bv_core STATIC
   Filesystem/FileIndexSerializer.cpp
   Filesystem/MftEnumerator.cpp
   Filesystem/PathUtil.cpp
+  Filesystem/ReparsePoint.cpp
+  Sync/SyncAction.cpp
+  Sync/SyncExecutor.cpp
+  Sync/SyncFs.cpp
+  Sync/SyncPath.cpp
+  Sync/SyncPlan.cpp
   Filesystem/Win32Enumerator.cpp
   Comparison/ClassifyUtil.cpp
   Comparison/ConcurrentComparer.cpp

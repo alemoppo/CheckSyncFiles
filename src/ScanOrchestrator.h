@@ -13,6 +13,8 @@
 #include "Comparison/ScanMode.h"
 #include "Comparison/SingleVerify.h"
 #include "ScanController.h"
+#include "Sync/SyncExecutor.h"
+#include "Sync/SyncPlan.h"
 
 namespace bv {
 
@@ -65,6 +67,12 @@ public:
         // and which relative path it is checking, for status display.
         bool verifyRunning = false;
         std::wstring verifyPath;
+        // A filesystem sync is in flight (see requestSync): done/total/current
+        // for the determinate progress bar and status line.
+        bool syncRunning = false;
+        size_t syncDone = 0;
+        size_t syncTotal = 0;
+        std::wstring syncCurrent;
         // Last run outcome: whether each side was enumerated cleanly (mirrors
         // ScanReport::sourceOk / destinationOk). False when the side failed or
         // was cancelled; the UI must then never present the run as completed.
@@ -146,6 +154,16 @@ public:
     // when none is pending; the slot is cleared on take.
     bool takeSingleVerifyResult(SingleVerifyOutcome& out);
 
+    // -- Filesystem sync ("Sincronizza tutto" + single-row actions) ---------
+    // Runs a frozen SyncPlan on a dedicated worker (same pattern as the
+    // single verify: by-value plan, own cancel flag, outcome published for
+    // the GUI to consume). Returns false when a scan, a verification or
+    // another sync is already running. The outcome lands in takeSyncReport().
+    bool requestSync(const sync::SyncPlan& plan);
+    // Takes a finished sync report (main thread). Returns false when none is
+    // pending; the slot is cleared on take.
+    bool takeSyncReport(sync::SyncReport& out);
+
     // -- Commands -------------------------------------------------------------
     // startLiveScan handles both the live case (source + destination) and the
     // offline case (snapshot + destination), mirroring the previous UI logic.
@@ -187,6 +205,10 @@ private:
     // publishes the outcome and clears verifyRunning_ under mtx_. Touches
     // only its by-value request plus verify* state; never GUI objects.
     void verifyThread(SingleVerifyRequest req);
+    // Dedicated sync worker: runs ExecutePlan, then publishes the report and
+    // clears syncRunning_ under mtx_. Touches only its by-value plan plus
+    // sync* state; never GUI objects.
+    void syncThread(sync::SyncPlan plan);
     // Stores a progress tick; ticks emitted without a live MatchTable (index
     // build, capture hashing, final Done) carry matchHighWater == 0 and must
     // not wipe the gauges: the previous readings are preserved. Caller holds
@@ -249,6 +271,16 @@ private:
     bool verifyReady_ = false;
     SingleVerifyOutcome pendingVerify_;
     std::wstring verifyPath_;
+    // Sync state. syncCancel_ is deliberately separate (same rationale as
+    // verifyCancel_): the three operations never run concurrently.
+    std::atomic_bool syncCancel_{false};
+    std::thread syncThread_;
+    bool syncRunning_ = false;
+    bool syncReady_ = false;
+    sync::SyncReport pendingSync_;
+    size_t syncDone_ = 0;
+    size_t syncTotal_ = 0;
+    std::wstring syncCurrent_;
     ScanProgress progress_;
     bool resultsReady_ = false;
     ResultSet results_;

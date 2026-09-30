@@ -219,7 +219,7 @@ void ConcurrentComparer::onEntry(int side, FileEntry e, MatchTable& table, Concu
         dst = std::move(e);
     }
     const bool addedCandidate = ClassifyMatched(src, dst, mode_, sink, candidates,
-                                                  destRoot_, rowSink_);
+                                                  destRoot_, sourceRoot_, rowSink_);
     if (addedCandidate) {
         totalCandidates_.fetch_add(1, std::memory_order_relaxed);
         // Once a full batch of same-size pairs has accumulated, push it to the
@@ -500,6 +500,7 @@ void ConcurrentComparer::finalizeMissingExtra(MatchTable& table, ResultSet& out)
             r.relativePath = e.relativePath;
             r.sizeSource = e.size;
             r.isDirectory = false;
+            r.reparseKind = e.reparseKind;
             out.problems.push_back(std::move(r));
             emitSingle(Status::Missing, e, false);
         }
@@ -514,6 +515,7 @@ void ConcurrentComparer::finalizeMissingExtra(MatchTable& table, ResultSet& out)
         r.fullPath = pathutil::MakeAbsolute(sourceRoot_, e.relativePath);
         r.relativePath = e.relativePath;
         r.isDirectory = true;
+        r.reparseKind = e.reparseKind;
         out.problems.push_back(std::move(r));
         emitSingle(Status::Missing, e, true);
     }
@@ -543,6 +545,7 @@ void ConcurrentComparer::finalizeMissingExtra(MatchTable& table, ResultSet& out)
         r.relativePath = e.relativePath;
         r.sizeDest = e.size;
         r.isDirectory = e.isDirectory;
+        r.reparseKind = e.reparseKind;
         out.problems.push_back(std::move(r));
         emitSingle(Status::Extra, e, e.isDirectory);
     }

@@ -11,6 +11,7 @@
 #include <cstring>
 
 #include "PathUtil.h"
+#include "ReparsePoint.h"
 #include "Win32Enumerator.h"
 
 #define WIN32_LEAN_AND_MEAN
@@ -1647,6 +1648,22 @@ const uint64_t segSize = vd.BytesPerFileRecordSegment;
             e.attributes = (cRec.isDir ? FILE_ATTRIBUTE_DIRECTORY : 0) |
                            (cRec.isReparse ? FILE_ATTRIBUTE_REPARSE_POINT : 0);
             e.isDirectory = cRec.isDir;
+            // Same link normalization as the Win32 backend (see
+            // ResolveLinkEntry): absolute path from the normalized root.
+            if (cRec.isReparse) {
+                ReparseKind kind = ReparseKind::None;
+                std::wstring target;
+                uint64_t linkSize = 0, linkMtime = 0;
+                if (ResolveLinkEntry(pathutil::MakeAbsolute(normRoot, childRel), cRec.isDir,
+                                     kind, target, linkSize, linkMtime)) {
+                    e.reparseKind = kind;
+                    e.linkTarget = std::move(target);
+                    e.size = linkSize;
+                    if (linkMtime != 0) e.lastWriteTime = linkMtime;
+                } else {
+                    e.reparseKind = kind;
+                }
+            }
             if (cRec.isDir) {
                 ++dirs;
             } else {

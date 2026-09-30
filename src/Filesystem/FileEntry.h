@@ -3,6 +3,8 @@
 #include <cstdint>
 #include <string>
 
+#include "ReparsePoint.h"
+
 namespace bv {
 
 // A single record collected during a filesystem scan.
@@ -18,6 +20,8 @@ struct FileEntry {
     uint32_t attributes = 0;     // Win32 file attributes
     uint64_t fileId = 0;         // filesystem-unique file id (0 if unknown; MFT scanner will fill it)
     bool isDirectory = false;
+    ReparseKind reparseKind = ReparseKind::None; // resolved reparse tag (None = ordinary entry)
+    std::wstring linkTarget; // link target for supported links (empty otherwise)
 };
 
 } // namespace bv

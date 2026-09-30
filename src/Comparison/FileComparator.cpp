@@ -44,6 +44,7 @@ bool FileComparator::run(const std::wstring& destRoot,
                 r.relativePath = std::move(e.relativePath);
                 r.sizeDest = e.size;
                 r.isDirectory = e.isDirectory;
+                r.reparseKind = e.reparseKind;
                 extraFolded.push_back(pathutil::FoldForCompare(r.relativePath));
                 if (e.isDirectory) {
                     ++out.stats.extraDirs;
@@ -102,6 +103,25 @@ bool FileComparator::run(const std::wstring& destRoot,
 }
 
 void FileComparator::classifyMatched(FileEntry& src, FileEntry& dst, ResultSet& out) {
+    // Same link semantics as the concurrent path (see TryClassifyLinks).
+    if (LinkDecision link = TryClassifyLinks(src, dst, sourceRoot_, destRoot_); link.handled) {
+        if (link.identical) {
+            if (link.identicalIsDir) {
+                ++out.stats.identicalDirs;
+            } else {
+                ++out.stats.identicalFiles;
+            }
+        } else {
+            switch (link.row.status) {
+                case Status::ContentMismatch: ++out.stats.contentMismatch; break;
+                case Status::ReadError: ++out.stats.readErrors; break;
+                default: ++out.stats.sizeMismatch; break;
+            }
+            out.problems.push_back(std::move(link.row));
+        }
+        return;
+    }
+
     const bool srcDir = src.isDirectory;
     const bool dstDir = dst.isDirectory;
 
@@ -209,6 +229,7 @@ void FileComparator::recordMissing(ResultSet& out) {
             r.relativePath = e.relativePath;
             r.sizeSource = e.size;
             r.isDirectory = false;
+            r.reparseKind = e.reparseKind;
             out.problems.push_back(std::move(r));
         }
     }
@@ -222,6 +243,7 @@ void FileComparator::recordMissing(ResultSet& out) {
         r.fullPath = pathutil::MakeAbsolute(sourceRoot_, it.entry->relativePath);
         r.relativePath = it.entry->relativePath;
         r.isDirectory = true;
+        r.reparseKind = it.entry->reparseKind;
         out.problems.push_back(std::move(r));
     }
 }

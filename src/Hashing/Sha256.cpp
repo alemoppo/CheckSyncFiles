@@ -209,6 +209,31 @@ bool StatHandle(HANDLE h, uint64_t& size, uint64_t& lastWriteTime) {
     return true;
 }
 
+bool Sha256Bytes(const void* data, size_t size, std::array<uint8_t, 32>& digest) {
+    digest.fill(0);
+    BCRYPT_ALG_HANDLE alg = nullptr;
+    if (!BCRYPT_SUCCESS(BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM,
+                                                    nullptr, 0)))
+        return false;
+    BCRYPT_HASH_HANDLE hash = nullptr;
+    if (!BCRYPT_SUCCESS(BCryptCreateHash(alg, &hash, nullptr, 0, nullptr, 0, 0))) {
+        BCryptCloseAlgorithmProvider(alg, 0);
+        return false;
+    }
+    const NTSTATUS hs = (size == 0)
+        ? BCryptHashData(hash, nullptr, 0, 0)
+        : BCryptHashData(hash, static_cast<PUCHAR>(const_cast<void*>(data)),
+                         static_cast<ULONG>(size), 0);
+    bool ok = BCRYPT_SUCCESS(hs);
+    if (ok) {
+        ok = BCRYPT_SUCCESS(
+            BCryptFinishHash(hash, digest.data(), static_cast<ULONG>(digest.size()), 0));
+    }
+    BCryptDestroyHash(hash);
+    BCryptCloseAlgorithmProvider(alg, 0);
+    return ok;
+}
+
 bool StatFile(const std::wstring& path, uint64_t& size, uint64_t& lastWriteTime) {
     const std::wstring win = pathutil::AddLongPathPrefix(path);
     HANDLE h = CreateFileW(win.c_str(), GENERIC_READ,

@@ -13,12 +13,14 @@ namespace indexio {
 // capture, which is what makes offline content verification possible.
 //
 // Layout (all integers little-endian):
-//   "BVSI", u32 version (1), u8 caseSensitive,
+//   "BVSI", u32 version (2), u8 caseSensitive,
 //   u32 sourceRootLen + UTF-8 source root,
 //   u64 files, u64 dirs, u64 bytes, u64 count,
 //   per entry: u64 pathLen + UTF-8 path, u64 size, u64 lastWriteTime,
 //              u32 attributes, u64 fileId, u8 isDirectory,
-//              u8 hasHash + 32 hash bytes (only when hasHash)
+//              u8 hasHash + 32 hash bytes (only when hasHash),
+//              [v2] u8 reparseKind + u32 targetLen + UTF-8 link target
+// A v1 file (no reparse fields) still loads: kind None, empty target.
 bool WriteSnapshot(const std::wstring& filePath, const FileIndex& index,
                    const std::wstring& sourceRoot, std::wstring& error);
 

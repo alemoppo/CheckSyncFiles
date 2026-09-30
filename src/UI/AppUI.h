@@ -10,6 +10,7 @@
 #include "Comparison/ComparisonResult.h"
 #include "Profiling/DirTiming.h"
 #include "ScanOrchestrator.h"
+#include "Sync/SyncPlan.h"
 
 struct TTF_Font;
 
@@ -192,16 +193,25 @@ private:
     // that produced the results). The A side is then an index, not a live
     // filesystem, so "Apri A" is never offered.
     bool resultsOffline_ = false;
+    // GUI-side transient note appended to the status line (sync feedback,
+    // preconditions). Cleared on new results / new scan / new sync.
+    std::wstring localNote_;
+    // True when the in-flight sync came from "Sincronizza tutto" (report
+    // dialog always shown) vs a single-row action (dialog only on failure).
+    bool syncWasGlobal_ = false;
 
     // Right-click context menu over a result row ("Apri A/B in Esplora
-    // risorse", "Riscansiona"). Only the items whose side path exists are
-    // shown, so the menu stores resolved target paths (or the row's relative
-    // path for a rescan), never row indices.
+    // risorse", "Riscansiona", sync actions). Only the items whose side path
+    // exists are shown, so the menu stores resolved target paths (or the
+    // row's relative path for a rescan/sync item), never row indices.
     struct CtxMenuItem {
         std::string labelUtf8;
-        std::wstring targetPath; // explorer target; empty for a rescan item
+        std::wstring targetPath; // explorer target; empty for rescan/sync items
         bool isRescan = false;
-        std::wstring relPath; // row identity for a rescan item
+        std::wstring relPath; // row identity for rescan/sync items
+        bool isSync = false;
+        sync::ManualOp syncOp = sync::ManualOp::CopyToDst;
+        bool syncToA = false; // manual direction: content flows B -> A
     };
     // Forwards one single-file re-verification to the orchestrator with the
     // settings frozen at click time. Silently ignored when busy/offline.
@@ -209,6 +219,17 @@ private:
     // Picks up a finished single-verify outcome (if any) and folds it into
     // uiResults_ (row replace/remove, stats fix, cache rebuild).
     void PollSingleVerify();
+    // Forwards one manual sync action from a context-menu item: builds the
+    // single-action plan from the live row and runs it on the sync worker.
+    // Recursive directory deletes ask for confirmation first.
+    void RequestSyncAction(const CtxMenuItem& item);
+    // Global "Sincronizza tutto" (A -> B): builds the plan from the displayed
+    // results, shows the summary/confirm dialog, runs it on the sync worker.
+    void onSyncAll();
+    // Picks up a finished sync report (if any): retires successful rows via
+    // ApplySingleResult, then shows the summary note (plus a dialog for full
+    // syncs and failures).
+    void PollSyncReport();
     bool ctxOpen_ = false;
     int ctxX_ = 0, ctxY_ = 0, ctxW_ = 0, ctxH_ = 0;
     std::vector<CtxMenuItem> ctxItems_;

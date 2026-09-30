@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "Comparison/ScanMode.h"
+#include "Filesystem/ReparsePoint.h"
 
 namespace bv {
 
@@ -35,6 +36,7 @@ struct FileResult {
     uint64_t sizeDest = 0;
     std::wstring errorMessage; // for ReadError / AccessDenied / ChangedDuringScan
     bool isDirectory = false;
+    ReparseKind reparseKind = ReparseKind::None; // link nature when relevant
 
     // Digests captured during content verification (Content mode). Both are set
     // for ContentMismatch; on a read error only the verifying side may have one.

@@ -280,7 +280,7 @@ void ScanOrchestrator::setCheckpointSecs(uint64_t n) {
 bool ScanOrchestrator::requestSingleVerify(const SingleVerifyParams& params) {
     {
         std::lock_guard<std::mutex> lk(mtx_);
-        if (running_ || verifyRunning_) return false;
+        if (running_ || verifyRunning_ || syncRunning_) return false;
     }
     // Never join while holding mtx_ (same deadlock rationale as the scan
     // starts below): the verify worker's final update takes the lock.
@@ -309,7 +309,7 @@ bool ScanOrchestrator::requestSingleVerify(const SingleVerifyParams& params) {
 
     {
         std::lock_guard<std::mutex> lk(mtx_);
-        if (running_ || verifyRunning_) return false; // defensive re-check
+        if (running_ || verifyRunning_ || syncRunning_) return false; // defensive re-check
         verifyCancel_.store(false);
         verifyRunning_ = true;
         verifyReady_ = false;
@@ -354,10 +354,83 @@ void ScanOrchestrator::verifyThread(SingleVerifyRequest req) {
     notify();
 }
 
+bool ScanOrchestrator::requestSync(const sync::SyncPlan& plan) {
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        if (running_ || verifyRunning_ || syncRunning_) return false;
+    }
+    // Never join while holding mtx_: the sync worker's final update takes
+    // the lock (same rationale as the verify worker above).
+    if (syncThread_.joinable()) syncThread_.join();
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        if (running_ || verifyRunning_ || syncRunning_) return false; // defensive
+        syncCancel_.store(false);
+        syncRunning_ = true;
+        syncReady_ = false;
+        pendingSync_ = sync::SyncReport{};
+        syncDone_ = 0;
+        syncTotal_ = plan.actions.size();
+        syncCurrent_.clear();
+        syncThread_ = std::thread(&ScanOrchestrator::syncThread, this, plan);
+    }
+    notify();
+    return true;
+}
+
+bool ScanOrchestrator::takeSyncReport(sync::SyncReport& out) {
+    std::lock_guard<std::mutex> lk(mtx_);
+    if (!syncReady_) return false;
+    out = std::move(pendingSync_);
+    pendingSync_ = sync::SyncReport{};
+    syncReady_ = false;
+    return true;
+}
+
+void ScanOrchestrator::syncThread(sync::SyncPlan plan) {
+    // Same no-terminate discipline as verifyThread: on throw, publish a
+    // coherent report instead of crossing the thread boundary.
+    sync::SyncReport report;
+    try {
+        report = sync::ExecutePlan(
+            plan, &syncCancel_,
+            [this](size_t done, size_t total, const std::wstring& current) {
+                {
+                    std::lock_guard<std::mutex> lk(mtx_);
+                    syncDone_ = done;
+                    syncTotal_ = total;
+                    syncCurrent_ = current;
+                }
+                // Lock released before notify(): notify() takes mtx_ briefly
+                // to copy the GUI callback, so calling it under the lock
+                // would deadlock. The callback only requests a repaint.
+                notify();
+            });
+    } catch (const std::exception& e) {
+        sync::SyncActionResult r;
+        r.message = L"errore interno della sincronizzazione: " +
+                    pathutil::FromUtf8(e.what());
+        report.items.push_back(std::move(r));
+        ++report.failedCount;
+    } catch (...) {
+        sync::SyncActionResult r;
+        r.message = L"errore interno della sincronizzazione.";
+        report.items.push_back(std::move(r));
+        ++report.failedCount;
+    }
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        pendingSync_ = std::move(report);
+        syncReady_ = true;
+        syncRunning_ = false;
+    }
+    notify();
+}
+
 bool ScanOrchestrator::startLiveScan() {
     {
         std::lock_guard<std::mutex> lk(mtx_);
-        if (running_ || verifyRunning_) return false;
+        if (running_ || verifyRunning_ || syncRunning_) return false;
         if (useSnapshot_ && useResume_) return false; // mutually exclusive
         if (useSnapshot_) {
             if (snapshotFile_.empty() || dest_.empty()) return false;
@@ -435,7 +508,7 @@ bool ScanOrchestrator::startLiveScan() {
 bool ScanOrchestrator::startSnapshotScan(const std::wstring& outFile) {
     {
         std::lock_guard<std::mutex> lk(mtx_);
-        if (running_ || verifyRunning_) return false;
+        if (running_ || verifyRunning_ || syncRunning_) return false;
         if (source_.empty()) {
             statusNote_ = L"Specificare la sorgente prima di creare uno snapshot.";
             return false;
@@ -485,6 +558,7 @@ bool ScanOrchestrator::startSnapshotScan(const std::wstring& outFile) {
 void ScanOrchestrator::stop() {
     cancel_.store(true);
     verifyCancel_.store(true); // also winds down a single verification, if any
+    syncCancel_.store(true);   // and a filesystem sync, if any
 }
 
 bool ScanOrchestrator::exportCsv(const std::wstring& path) {
@@ -507,10 +581,12 @@ void ScanOrchestrator::shutdown() {
         std::lock_guard<std::mutex> lk(mtx_);
         cancel_.store(true);
         verifyCancel_.store(true);
+        syncCancel_.store(true);
     }
     // Never join while holding mtx_: the workers' final updates take the lock.
     if (worker_.joinable()) worker_.join();
     if (verifyThread_.joinable()) verifyThread_.join();
+    if (syncThread_.joinable()) syncThread_.join();
 }
 
 ScanOrchestrator::UiSnapshot ScanOrchestrator::snapshot() const {
@@ -541,6 +617,10 @@ ScanOrchestrator::UiSnapshot ScanOrchestrator::snapshot() const {
     s.cancelled = cancel_.load();
     s.verifyRunning = verifyRunning_;
     s.verifyPath = verifyPath_;
+    s.syncRunning = syncRunning_;
+    s.syncDone = syncDone_;
+    s.syncTotal = syncTotal_;
+    s.syncCurrent = syncCurrent_;
     s.sourceOk = sourceOk_;
     s.destinationOk = destinationOk_;
     s.progress = progress_;
