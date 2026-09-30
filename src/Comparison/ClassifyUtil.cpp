@@ -39,10 +39,13 @@ LinkDecision TryClassifyLinks(const FileEntry& src, const FileEntry& dst,
         return d;
     }
     if (src.reparseKind != dst.reparseKind) {
-        // Link vs plain entry (or link-kind change): a type mismatch.
+        // Link vs plain entry (or link-kind change): a type mismatch. The
+        // row carries the SOURCE side type: a sync converges the destination
+        // to the source, so the follow-up Identical counts the right side.
         d.row.status = Status::SizeMismatch;
         d.row.sizeSource = src.size;
         d.row.sizeDest = dst.size;
+        d.row.isDirectory = src.isDirectory;
         return d;
     }
     if (src.linkTarget.empty() || dst.linkTarget.empty()) {
@@ -129,7 +132,9 @@ bool ClassifyMatched(const FileEntry& src, const FileEntry& dst, ScanMode mode,
     }
     if (srcDir != dstDir) {
         // File where a directory is expected (or vice versa): definitely
-        // different, classified as a size/type mismatch.
+        // different, classified as a size/type mismatch. The row carries the
+        // SOURCE side type: a sync converges the destination to the source,
+        // so the follow-up Identical counts the right side.
         inc(stats.sizeMismatch);
         FileResult r;
         r.status = Status::SizeMismatch;
@@ -137,7 +142,7 @@ bool ClassifyMatched(const FileEntry& src, const FileEntry& dst, ScanMode mode,
         r.relativePath = dst.relativePath;
         r.sizeSource = src.size;
         r.sizeDest = dst.size;
-        r.isDirectory = false;
+        r.isDirectory = srcDir;
         r.srcIsDirectory = srcDir;
         r.srcReparseKind = ReparseKind::None; // links never reach here
         r.dstIsDirectory = dstDir;
@@ -154,7 +159,7 @@ bool ClassifyMatched(const FileEntry& src, const FileEntry& dst, ScanMode mode,
         r.relativePath = d.relativePath;
         r.sizeSource = s.size;
         r.sizeDest = d.size;
-        r.isDirectory = false;
+        r.isDirectory = s.isDirectory; // source side (see above)
         r.srcIsDirectory = s.isDirectory;
         r.srcReparseKind = ReparseKind::None; // links never reach here
         r.dstIsDirectory = d.isDirectory;

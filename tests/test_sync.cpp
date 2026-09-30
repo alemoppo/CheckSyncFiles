@@ -673,6 +673,111 @@ TEST("sync-exec: write through a dest junction is refused, outside untouched", [
     CHECK(!fs::exists(ext + L"\\payload.txt"));
 });
 
+TEST("sync-mismatch-type: dir-over-file retires to identicalDirs", [] {
+    const std::wstring a = MakeTempDir();
+    const std::wstring b = MakeTempDir();
+    CHECK(fs::create_directories(a + L"\\foo"));
+    CHECK(WriteFileBytes(a + L"\\foo\\child.txt", "child", 5));
+    CHECK(WriteFileBytes(b + L"\\foo", "blocker", 7));
+
+    auto r = RunScan(a, b, ScanMode::Content);
+    // The mismatch row carries the SOURCE side type (directory).
+    const FileResult* mm = nullptr;
+    for (const FileResult& p : r.results.problems) {
+        if (p.relativePath == L"foo") mm = &p;
+    }
+    CHECK(mm != nullptr);
+    CHECK(mm->status == Status::SizeMismatch);
+    CHECK(mm->isDirectory);
+
+    const SyncReport rep =
+        ExecutePlan(BuildSyncPlan(r.results, a, b, true), nullptr);
+    CHECK_EQ(rep.failedCount, 0ull);
+    CHECK(fs::is_directory(b + L"\\foo"));
+    CHECK(ReadAll(b + L"\\foo\\child.txt") == "child");
+
+    // Retire exactly like the GUI: identicalDirs grows, identicalFiles only
+    // for the file child, never for the directory itself.
+    for (const sync::SyncActionResult& it : rep.items) {
+        if (it.ok && !it.cancelled) {
+            FileResult fresh;
+            fresh.status = Status::Identical;
+            fresh.relativePath = it.relativePath;
+            ApplySingleResult(r.results, fresh);
+        }
+    }
+    CHECK(r.results.problems.empty());
+    CHECK_EQ(r.results.stats.sizeMismatch, 0ull);
+    CHECK_EQ(r.results.stats.missingFiles, 0ull);
+    CHECK_EQ(r.results.stats.identicalFiles, 1ull); // the child only
+    CHECK_EQ(r.results.stats.identicalDirs, 1ull);  // foo, not identicalFiles
+});
+
+TEST("sync-mismatch-type: file-over-dir retires to identicalFiles", [] {
+    const std::wstring a = MakeTempDir();
+    const std::wstring b = MakeTempDir();
+    CHECK(WriteFileBytes(a + L"\\foo", "content", 7));
+    CHECK(fs::create_directories(b + L"\\foo"));
+    CHECK(WriteFileBytes(b + L"\\foo\\stale.txt", "s", 1));
+
+    auto r = RunScan(a, b, ScanMode::Content);
+    const FileResult* mm = nullptr;
+    for (const FileResult& p : r.results.problems) {
+        if (p.relativePath == L"foo") mm = &p;
+    }
+    CHECK(mm != nullptr);
+    CHECK(mm->status == Status::SizeMismatch);
+    CHECK(!mm->isDirectory); // source side is a file
+
+    const SyncReport rep =
+        ExecutePlan(BuildSyncPlan(r.results, a, b, true), nullptr);
+    CHECK_EQ(rep.failedCount, 0ull);
+    CHECK(!fs::is_directory(b + L"\\foo"));
+    CHECK(ReadAll(b + L"\\foo") == "content");
+    CHECK(!fs::exists(b + L"\\foo\\stale.txt"));
+
+    for (const sync::SyncActionResult& it : rep.items) {
+        if (it.ok && !it.cancelled) {
+            FileResult fresh;
+            fresh.status = Status::Identical;
+            fresh.relativePath = it.relativePath;
+            ApplySingleResult(r.results, fresh);
+        }
+    }
+    CHECK(r.results.problems.empty());
+    CHECK_EQ(r.results.stats.sizeMismatch, 0ull);
+    CHECK_EQ(r.results.stats.extraFiles, 0ull);
+    CHECK_EQ(r.results.stats.identicalFiles, 1ull); // foo converged to a file
+    CHECK_EQ(r.results.stats.identicalDirs, 0ull);
+});
+
+TEST("sync-resultset: missing/extra file/dir retire to the right counters", [] {
+    ResultSet rs;
+    rs.problems.push_back(MakeRow(Status::Missing, L"f.txt", false, 5));
+    rs.problems.push_back(MakeRow(Status::Missing, L"d", true));
+    rs.problems.push_back(MakeRow(Status::Extra, L"e.txt", false));
+    rs.problems.push_back(MakeRow(Status::Extra, L"ed", true));
+    rs.stats.missingFiles = 1;
+    rs.stats.missingDirs = 1;
+    rs.stats.extraFiles = 1;
+    rs.stats.extraDirs = 1;
+    for (const wchar_t* rel : {L"f.txt", L"d", L"e.txt", L"ed"}) {
+        FileResult fresh;
+        fresh.status = Status::Identical;
+        fresh.relativePath = rel;
+        CHECK(ApplySingleResult(rs, fresh));
+    }
+    CHECK(rs.problems.empty());
+    CHECK_EQ(rs.stats.missingFiles, 0ull);
+    CHECK_EQ(rs.stats.missingDirs, 0ull);
+    CHECK_EQ(rs.stats.extraFiles, 0ull);
+    CHECK_EQ(rs.stats.extraDirs, 0ull);
+    // Only converged pairs count as identical: the two Missing rows. Deleted
+    // Extra rows become absent and bump nothing.
+    CHECK_EQ(rs.stats.identicalFiles, 1ull);
+    CHECK_EQ(rs.stats.identicalDirs, 1ull);
+});
+
 TEST("sync-resultset: directory counters retire correctly", [] {
     // Missing dir -> created: missingDirs down, identicalDirs up.
     {

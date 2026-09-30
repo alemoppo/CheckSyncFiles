@@ -132,7 +132,8 @@ void FileComparator::classifyMatched(FileEntry& src, FileEntry& dst, ResultSet& 
     }
     if (srcDir != dstDir) {
         // File where a directory is expected (or vice versa): definitely
-        // different, classified as a size/type mismatch.
+        // different, classified as a size/type mismatch. The row carries the
+        // SOURCE side type (sync converges destination to source).
         ++out.stats.sizeMismatch;
         FileResult r;
         r.status = Status::SizeMismatch;
@@ -140,7 +141,7 @@ void FileComparator::classifyMatched(FileEntry& src, FileEntry& dst, ResultSet& 
         r.relativePath = std::move(dst.relativePath);
         r.sizeSource = src.size;
         r.sizeDest = dst.size;
-        r.isDirectory = false;
+        r.isDirectory = srcDir;
         r.srcIsDirectory = srcDir;
         r.srcReparseKind = ReparseKind::None; // links never reach here
         r.dstIsDirectory = dstDir;
@@ -163,7 +164,7 @@ void FileComparator::classifyMatched(FileEntry& src, FileEntry& dst, ResultSet& 
                 r.relativePath = std::move(dst.relativePath);
                 r.sizeSource = src.size;
                 r.sizeDest = dst.size;
-                r.isDirectory = false;
+                r.isDirectory = src.isDirectory; // file-file here, always false
                 r.srcIsDirectory = false; // file-file here (dirs/links above)
                 r.srcReparseKind = ReparseKind::None;
                 r.dstIsDirectory = false;
@@ -189,7 +190,7 @@ void FileComparator::classifyMatched(FileEntry& src, FileEntry& dst, ResultSet& 
                 r.relativePath = dst.relativePath;
                 r.sizeSource = src.size;
                 r.sizeDest = dst.size;
-                r.isDirectory = false;
+                r.isDirectory = src.isDirectory; // file-file here, always false
                 r.srcIsDirectory = false; // file-file here (dirs/links above)
                 r.srcReparseKind = ReparseKind::None;
                 r.dstIsDirectory = false;
