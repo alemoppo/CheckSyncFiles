@@ -32,6 +32,19 @@ ReparseKind GetReparseKind(const std::wstring& absPath, bool isDirectory,
 std::wstring ReadLinkTarget(const std::wstring& absPath, ReparseKind* kindOut = nullptr,
                             std::wstring* error = nullptr);
 
+// Low-level parse of a raw FSCTL_GET_REPARSE_POINT payload (`bytes` valid
+// bytes at `data`). `isDirectory` decides SymlinkFile vs SymlinkDir exactly
+// like GetReparseKind. Returns true with kind+target for a supported link;
+// otherwise false with `targetOut` cleared and `kindOut` set to Unknown
+// (truncated payload or offsets escaping `bytes`: never overread, never
+// trusted) or Other (known-unsupported tag, needs only the tag itself).
+// Exposed for unit tests with synthetic buffers: NTFS rejects malformed
+// FSCTL_SET_REPARSE_POINT with ERROR_INVALID_REPARSE_DATA, so truncated
+// states cannot be fabricated on disk and are injected here instead.
+bool ParseReparsePayload(const uint8_t* data, size_t bytes, bool isDirectory,
+                         ReparseKind& kindOut, std::wstring& targetOut,
+                         std::wstring* error = nullptr);
+
 // Creates a file symlink, directory symlink or junction at `linkPath`
 // pointing at `target` (absolute or drive-relative; junctions need an
 // absolute target). Parent directory must exist. Symlink creation needs

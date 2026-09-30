@@ -4,7 +4,10 @@
 // privileges or Developer Mode: those cases accept the documented privilege
 // error and skip.
 
+#include <cstdint>
+#include <cstring>
 #include <filesystem>
+#include <vector>
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -300,4 +303,117 @@ TEST("links: snapshot round-trip preserves kind and target", [] {
     CHECK(got.reparseKind == ReparseKind::Junction);
     CHECK(got.linkTarget == L"C:\\target");
     CHECK(got.isDirectory);
+});
+
+// ---------------------------------------------------------------------------
+// Truncated/malformed reparse payloads (Section 1).
+//
+// NOTE on test strategy: NTFS validates FSCTL_SET_REPARSE_POINT and rejects
+// every malformed Microsoft-tag buffer with ERROR_INVALID_REPARSE_DATA
+// (verified empirically: 8-byte tag-only, 20-byte zero header and oversized
+// subLen are all refused), so a truncated on-disk state cannot be fabricated
+// through documented APIs. The byte-level validation therefore lives in
+// ParseReparsePayload and is tested here with synthetic buffers; T1.4 covers
+// the public GetReparseKind/ReadLinkTarget path on real links.
+namespace {
+
+constexpr uint32_t kTagSymlink = 0xA000000Cu;
+constexpr uint32_t kTagMount = 0xA0000003u;
+
+// Raw payload: tag + dataLen + reserved + `total`-sized zero body.
+std::vector<uint8_t> TruncatedPayload(uint32_t tag, size_t total) {
+    std::vector<uint8_t> buf(total, 0);
+    if (total >= 4) memcpy(buf.data(), &tag, 4);
+    return buf;
+}
+
+// Valid fixed header for tag + caller-supplied name area appended after it:
+// symlink needs 20 bytes header (8 + 12), mount 16 bytes (8 + 8).
+std::vector<uint8_t> HeaderPayload(uint32_t tag, uint16_t subOff, uint16_t subLen,
+                                   uint16_t printOff, uint16_t printLen,
+                                   size_t nameBytes) {
+    const size_t fixed = (tag == kTagSymlink) ? 12 : 8;
+    std::vector<uint8_t> buf(8 + fixed + nameBytes, 0);
+    memcpy(buf.data(), &tag, 4);
+    uint16_t vals[4] = {subOff, subLen, printOff, printLen};
+    memcpy(buf.data() + 8, vals, 8);
+    if (tag == kTagSymlink) {
+        uint32_t flags = 0;
+        memcpy(buf.data() + 16, &flags, 4);
+    }
+    return buf;
+}
+
+bool ParseFailsUnknown(const std::vector<uint8_t>& buf, bool isDir) {
+    ReparseKind kind = ReparseKind::None;
+    std::wstring target = L"sentinel";
+    std::wstring err;
+    const bool ok = ParseReparsePayload(buf.data(), buf.size(), isDir, kind, target,
+                                        &err);
+    return !ok && kind == ReparseKind::Unknown && target.empty() && !err.empty();
+}
+
+} // namespace
+
+TEST("reparse: truncated symlink buffer is rejected, not overread", [] {
+    // Tag-only (8 bytes): header fields unreadable.
+    CHECK(ParseFailsUnknown(TruncatedPayload(kTagSymlink, 8), false));
+    // 19 bytes: one short of the 20-byte symlink fixed header.
+    CHECK(ParseFailsUnknown(TruncatedPayload(kTagSymlink, 19), false));
+    // Exactly 20 bytes with empty names: structurally valid, empty target.
+    {
+        ReparseKind kind = ReparseKind::None;
+        std::wstring target;
+        CHECK(ParseReparsePayload(TruncatedPayload(kTagSymlink, 20).data(), 20, false,
+                                  kind, target, nullptr));
+        CHECK(kind == ReparseKind::SymlinkFile);
+        CHECK(target.empty());
+    }
+});
+
+TEST("reparse: truncated mount buffer is rejected, not overread", [] {
+    CHECK(ParseFailsUnknown(TruncatedPayload(kTagMount, 8), true));
+    CHECK(ParseFailsUnknown(TruncatedPayload(kTagMount, 15), true));
+    {
+        ReparseKind kind = ReparseKind::None;
+        std::wstring target;
+        CHECK(ParseReparsePayload(TruncatedPayload(kTagMount, 16).data(), 16, true,
+                                  kind, target, nullptr));
+        CHECK(kind == ReparseKind::Junction);
+        CHECK(target.empty());
+    }
+});
+
+TEST("reparse: offsets escaping the payload are rejected", [] {
+    // Header claims subLen=1000 with only 4 payload bytes present.
+    CHECK(ParseFailsUnknown(HeaderPayload(kTagSymlink, 0, 1000, 0, 0, 4), false));
+    // PrintName fallback overread: sub empty, printLen=500, 4 bytes present.
+    CHECK(ParseFailsUnknown(HeaderPayload(kTagSymlink, 0, 0, 0, 500, 4), false));
+    // Same for mount points.
+    CHECK(ParseFailsUnknown(HeaderPayload(kTagMount, 0, 1000, 0, 0, 4), true));
+    // Odd (non-wchar-aligned) lengths are rejected too.
+    CHECK(ParseFailsUnknown(HeaderPayload(kTagSymlink, 0, 5, 0, 0, 8), false));
+    // A fully valid symlink payload parses: "C:\\t" as SubstituteName.
+    {
+        std::vector<uint8_t> buf = HeaderPayload(kTagSymlink, 0, 8, 8, 0, 8);
+        const wchar_t name[] = L"C:\\t";
+        memcpy(buf.data() + 20, name, 8);
+        ReparseKind kind = ReparseKind::None;
+        std::wstring target;
+        CHECK(ParseReparsePayload(buf.data(), buf.size(), false, kind, target,
+                                  nullptr));
+        CHECK(kind == ReparseKind::SymlinkFile);
+        CHECK(target == L"C:\\t");
+    }
+});
+
+TEST("reparse: real links still resolve kind and target (no regression)", [] {
+    const std::wstring root = MakeTempDir();
+    const std::wstring target = root + L"\\target";
+    const std::wstring link = root + L"\\j";
+    CHECK(fs::create_directory(target));
+    std::wstring err;
+    CHECK(CreateLink(link, target, ReparseKind::Junction, err));
+    CHECK(GetReparseKind(link, true) == ReparseKind::Junction);
+    CHECK(ReadLinkTarget(link) == target);
 });

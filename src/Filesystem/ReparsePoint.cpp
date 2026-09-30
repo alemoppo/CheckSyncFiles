@@ -1,5 +1,7 @@
 #include "ReparsePoint.h"
 
+#include <cstddef>
+#include <cstring>
 #include <vector>
 
 #include "PathUtil.h"
@@ -17,6 +19,11 @@ namespace {
 
 // Local copy of REPARSE_DATA_BUFFER: MinGW's winioctl.h only provides
 // REPARSE_GUID_DATA_BUFFER. The layout below is the stable documented ABI.
+// Reads of a GET payload NEVER dereference this struct directly: every field
+// access goes through ParseReparsePayload, which validates each offset and
+// length against the real `bytes` returned by DeviceIoControl (a truncated or
+// non-conformant payload yields Unknown, never an overread). The struct is
+// still used to CONSTRUCT the junction SET buffer (fully caller-controlled).
 struct ReparseBuffer {
     uint32_t tag;
     uint16_t dataLen;
@@ -77,10 +84,28 @@ bool ReadReparseBuffer(const std::wstring& abs, std::vector<uint8_t>& buf, DWORD
 
 const wchar_t kNtPrefix[] = L"\\??\\";
 
+// A [pathBase + off, pathBase + off + len) name slice must sit inside the
+// `bytes` actually returned, on wchar boundaries. Lengths are Naming
+// lengths in bytes (always even for UTF-16); odd or escaping values mean a
+// truncated/non-conformant payload.
+bool SliceInRange(size_t pathBase, uint16_t off, uint16_t len, size_t bytes) {
+    if ((off & 1) != 0 || (len & 1) != 0) return false;
+    const size_t o = off, l = len;
+    return o + l >= o && pathBase + o + l <= bytes;
+}
+
+bool RangesValid(size_t pathBase, size_t bytes, uint16_t subOff, uint16_t subLen,
+                 uint16_t printOff, uint16_t printLen) {
+    return SliceInRange(pathBase, subOff, subLen, bytes) &&
+           SliceInRange(pathBase, printOff, printLen, bytes);
+}
+
 // SubstituteName with any \??\ prefix stripped; PrintName fallback.
-std::wstring ExtractTarget(const wchar_t* base, USHORT subOff, USHORT subLen,
-                           USHORT printOff, USHORT printLen) {
-    auto slice = [&](USHORT off, USHORT len) {
+// Precondition: RangesValid for the same arguments (checked by
+// ParseReparsePayload); never called on unverified offsets.
+std::wstring ExtractTarget(const wchar_t* base, uint16_t subOff, uint16_t subLen,
+                           uint16_t printOff, uint16_t printLen) {
+    auto slice = [&](uint16_t off, uint16_t len) {
         return std::wstring(base + off / sizeof(wchar_t), len / sizeof(wchar_t));
     };
     std::wstring target = subLen > 0 ? slice(subOff, subLen) : slice(printOff, printLen);
@@ -88,7 +113,75 @@ std::wstring ExtractTarget(const wchar_t* base, USHORT subOff, USHORT subLen,
     return target;
 }
 
+void ReadU16(const uint8_t* data, size_t bytes, size_t at, uint16_t& out) {
+    out = 0;
+    if (at + sizeof(uint16_t) <= bytes) memcpy(&out, data + at, sizeof(uint16_t));
+}
+
 } // namespace
+
+bool ParseReparsePayload(const uint8_t* data, size_t bytes, bool isDirectory,
+                         ReparseKind& kindOut, std::wstring& targetOut,
+                         std::wstring* error) {
+    kindOut = ReparseKind::Unknown;
+    targetOut.clear();
+    if (!data || bytes < sizeof(uint32_t)) {
+        SetError(error, L"reparse payload troncato: tag illeggibile");
+        return false;
+    }
+    uint32_t tag = 0;
+    memcpy(&tag, data, sizeof(tag)); // alignment-safe: no struct dereference
+    if (tag == IO_REPARSE_TAG_SYMLINK) {
+        // tag(4) + dataLen(2) + reserved(2) + subOff/subLen/printOff/
+        // printLen/flags(12): nothing below is readable with fewer bytes.
+        constexpr size_t kFixed = 8 + 12;
+        static_assert(offsetof(ReparseBuffer, symlink) + 12 == kFixed,
+                      "symlink fixed header size");
+        if (bytes < kFixed) {
+            SetError(error, L"reparse payload troncato: header symlink incompleto");
+            return false;
+        }
+        uint16_t subOff, subLen, printOff, printLen;
+        ReadU16(data, bytes, 8, subOff);
+        ReadU16(data, bytes, 10, subLen);
+        ReadU16(data, bytes, 12, printOff);
+        ReadU16(data, bytes, 14, printLen);
+        if (!RangesValid(kFixed, bytes, subOff, subLen, printOff, printLen)) {
+            SetError(error, L"reparse payload non conforme: nomi fuori range");
+            return false;
+        }
+        kindOut = isDirectory ? ReparseKind::SymlinkDir : ReparseKind::SymlinkFile;
+        targetOut = ExtractTarget(reinterpret_cast<const wchar_t*>(data + kFixed), subOff,
+                                  subLen, printOff, printLen);
+        return true;
+    }
+    if (tag == IO_REPARSE_TAG_MOUNT_POINT) {
+        // tag(4) + dataLen(2) + reserved(2) + subOff/subLen/printOff/
+        // printLen(8).
+        constexpr size_t kFixed = 8 + 8;
+        static_assert(offsetof(ReparseBuffer, mount) + 8 == kFixed,
+                      "mount fixed header size");
+        if (bytes < kFixed) {
+            SetError(error, L"reparse payload troncato: header mount incompleto");
+            return false;
+        }
+        uint16_t subOff, subLen, printOff, printLen;
+        ReadU16(data, bytes, 8, subOff);
+        ReadU16(data, bytes, 10, subLen);
+        ReadU16(data, bytes, 12, printOff);
+        ReadU16(data, bytes, 14, printLen);
+        if (!RangesValid(kFixed, bytes, subOff, subLen, printOff, printLen)) {
+            SetError(error, L"reparse payload non conforme: nomi fuori range");
+            return false;
+        }
+        kindOut = ReparseKind::Junction;
+        targetOut = ExtractTarget(reinterpret_cast<const wchar_t*>(data + kFixed), subOff,
+                                  subLen, printOff, printLen);
+        return true;
+    }
+    kindOut = ReparseKind::Other; // the tag alone classifies: no field reads
+    return false;
+}
 
 ReparseKind GetReparseKind(const std::wstring& absPath, bool isDirectory,
                            std::wstring* error) {
@@ -100,19 +193,14 @@ ReparseKind GetReparseKind(const std::wstring& absPath, bool isDirectory,
         return GetLastError() == ERROR_NOT_A_REPARSE_POINT ? ReparseKind::None
                                                            : ReparseKind::Unknown;
     }
-    if (bytes < sizeof(uint32_t)) {
-        SetError(error, L"reparse point illeggibile: " + absPath);
-        return ReparseKind::None;
-    }
-    const auto* rb = reinterpret_cast<const ReparseBuffer*>(buf.data());
-    switch (rb->tag) {
-        case IO_REPARSE_TAG_SYMLINK:
-            return isDirectory ? ReparseKind::SymlinkDir : ReparseKind::SymlinkFile;
-        case IO_REPARSE_TAG_MOUNT_POINT:
-            return ReparseKind::Junction;
-        default:
-            return ReparseKind::Other;
-    }
+    // Every field read is validated against `bytes` inside
+    // ParseReparsePayload: truncated payloads yield Unknown, never an
+    // overread, and short-but-tagged payloads never reach the name fields.
+    ReparseKind kind = ReparseKind::Unknown;
+    std::wstring target;
+    if (bytes > buf.size()) bytes = static_cast<DWORD>(buf.size());
+    ParseReparsePayload(buf.data(), bytes, isDirectory, kind, target, error);
+    return kind;
 }
 
 std::wstring ReadLinkTarget(const std::wstring& absPath, ReparseKind* kindOut,
@@ -123,24 +211,24 @@ std::wstring ReadLinkTarget(const std::wstring& absPath, ReparseKind* kindOut,
         if (kindOut) *kindOut = ReparseKind::None;
         return {};
     }
-    const auto* rb = reinterpret_cast<const ReparseBuffer*>(buf.data());
-    if (rb->tag == IO_REPARSE_TAG_SYMLINK) {
-        const auto& s = rb->symlink;
-        if (kindOut) {
-            // File vs dir is the caller's enumeration knowledge; ReadLinkTarget
-            // alone cannot tell without following: default by tag only.
-            *kindOut = ReparseKind::SymlinkFile;
+    // Validated parse (same guarantees as GetReparseKind above). File vs dir
+    // stays the caller's enumeration knowledge: without it, default by tag
+    // only, exactly as before.
+    ReparseKind kind = ReparseKind::Unknown;
+    std::wstring target;
+    if (bytes > buf.size()) bytes = static_cast<DWORD>(buf.size());
+    if (!ParseReparsePayload(buf.data(), bytes, /*isDirectory=*/false, kind, target,
+                             nullptr)) {
+        if (kindOut) *kindOut = kind;
+        if (kind == ReparseKind::Other) {
+            SetError(error, L"reparse tag non supportato: " + absPath);
+        } else {
+            SetError(error, L"reparse point illeggibile: " + absPath);
         }
-        return ExtractTarget(s.path, s.subOff, s.subLen, s.printOff, s.printLen);
+        return {};
     }
-    if (rb->tag == IO_REPARSE_TAG_MOUNT_POINT) {
-        if (kindOut) *kindOut = ReparseKind::Junction;
-        const auto& m = rb->mount;
-        return ExtractTarget(m.path, m.subOff, m.subLen, m.printOff, m.printLen);
-    }
-    if (kindOut) *kindOut = ReparseKind::Other;
-    SetError(error, L"reparse tag non supportato: " + absPath);
-    return {};
+    if (kindOut) *kindOut = kind;
+    return target;
 }
 
 bool CreateLink(const std::wstring& linkPath, const std::wstring& target, ReparseKind kind,
